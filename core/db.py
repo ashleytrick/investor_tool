@@ -275,3 +275,16 @@ def get_engine(db_url: str) -> Engine:
     engine = create_engine(db_url, future=True)
     metadata.create_all(engine)
     return engine
+
+
+def upsert(conn, table: Table, pk_cols: list[str], values: dict) -> None:
+    """Idempotent insert-or-update keyed on the given primary-key columns."""
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    stmt = sqlite_insert(table).values(**values)
+    update_cols = {c: stmt.excluded[c] for c in values if c not in pk_cols}
+    if update_cols:
+        stmt = stmt.on_conflict_do_update(index_elements=pk_cols, set_=update_cols)
+    else:
+        stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
+    conn.execute(stmt)

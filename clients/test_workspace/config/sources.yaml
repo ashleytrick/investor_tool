@@ -1,0 +1,13 @@
+# Session 2 fixture: only the hand-curated seed CSV. Real workspaces add the
+# GitHub awesome-list and funding-announcement feeds here.
+public_lists:
+  - name: "Fixture Seed Funds"
+    path: "data/fixtures/funds_seed.csv"
+    parser: "csv"
+
+# Funding-announcement feeds are consumed in Stage 3 (Session 3).
+funding_announcement_feeds: []
+
+partner_signal_sources:
+  podcast_search_api: "listennotes"
+  substack_search: true

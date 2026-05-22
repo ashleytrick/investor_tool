@@ -18,8 +18,7 @@ from datetime import date, datetime, timezone
 # Make repo-root packages (core, schemas) importable when run as a script.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import delete, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import delete
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.csv_export import write_review_queue
@@ -32,6 +31,7 @@ from core.db import (
     partner_score_summaries,
     partners,
     signals,
+    upsert,
 )
 from core.lead_likelihood import compute_lead_likelihood
 from core.llm.client import MODEL_EMAIL, LLMClient
@@ -47,14 +47,6 @@ STAGE = "07_generate_emails"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _upsert(conn, table, pk_cols: list[str], values: dict) -> None:
-    """Idempotent upsert keyed on the given primary-key columns."""
-    stmt = sqlite_insert(table).values(**values)
-    update_cols = {c: stmt.excluded[c] for c in values if c not in pk_cols}
-    stmt = stmt.on_conflict_do_update(index_elements=pk_cols, set_=update_cols)
-    conn.execute(stmt)
 
 
 def _signal_recency_bonus(signal_date: date | None) -> float:
@@ -170,7 +162,7 @@ def main() -> int:
 
             # --- Persist fund + partner (idempotent upserts) ---
             with engine.begin() as conn:
-                _upsert(conn, funds, ["fund_id"], {
+                upsert(conn, funds, ["fund_id"], {
                     "fund_id": fund["fund_id"],
                     "name": fund["name"],
                     "domain": fund["domain"],
@@ -184,7 +176,7 @@ def main() -> int:
                     "source_urls": fund["source_urls"],
                     "last_updated": _now(),
                 })
-                _upsert(conn, partners, ["partner_id"], {
+                upsert(conn, partners, ["partner_id"], {
                     "partner_id": partner_id,
                     "fund_id": partner["fund_id"],
                     "name": partner["name"],
@@ -279,7 +271,7 @@ def main() -> int:
             )
 
             with engine.begin() as conn:
-                _upsert(conn, partner_score_summaries, ["partner_id"], {
+                upsert(conn, partner_score_summaries, ["partner_id"], {
                     "partner_id": partner_id,
                     "composite_fit_score": composite,
                     "axis_max_score": axis_max,
