@@ -1,0 +1,282 @@
+[
+  {
+    "source_url": "https://news.example/ledgerkit-seed",
+    "text": "LedgerKit, a fintech infrastructure startup building developer APIs for double-entry accounting, has raised a $2M seed round led by Northbeam Capital, with participation from Mercury Pier and several angels. Priya Anand from Northbeam led the round and will join LedgerKit's board.",
+    "_attribution": {
+      "company": "LedgerKit",
+      "round_type": "seed",
+      "round_size_usd": 2000000,
+      "lead_investor": "Northbeam Capital",
+      "all_investors": ["Northbeam Capital", "Mercury Pier"],
+      "attributed_partners": [{"name": "Priya Anand", "fund": "Northbeam Capital"}],
+      "sector_tags": ["fintech", "infrastructure", "developer tools"],
+      "announcement_date": "2026-04-12"
+    }
+  },
+  {
+    "source_url": "https://news.example/opsgrid-seed",
+    "text": "OpsGrid, a workflow automation platform for mid-market operations teams, closed a $2.5M seed round led by Tidewater Ventures. Tidewater Managing Partner Dana Cole led the investment.",
+    "_attribution": {
+      "company": "OpsGrid",
+      "round_type": "seed",
+      "round_size_usd": 2500000,
+      "lead_investor": "Tidewater Ventures",
+      "all_investors": ["Tidewater Ventures"],
+      "attributed_partners": [{"name": "Dana Cole", "fund": "Tidewater Ventures"}],
+      "sector_tags": ["B2B SaaS", "operations"],
+      "announcement_date": "2026-03-04"
+    }
+  },
+  {
+    "source_url": "https://news.example/gridforge-seed",
+    "text": "GridForge has raised a $1.5M seed round to build grid-management software for utility cooperatives. The round was led by Foundry North, with Kwame Boateng championing the investment, alongside checks from two climate-focused angels.",
+    "_attribution": {
+      "company": "GridForge",
+      "round_type": "seed",
+      "round_size_usd": 1500000,
+      "lead_investor": "Foundry North",
+      "all_investors": ["Foundry North"],
+      "attributed_partners": [{"name": "Kwame Boateng", "fund": "Foundry North"}],
+      "sector_tags": ["climate", "grid", "utilities"],
+      "announcement_date": "2026-02-20"
+    }
+  },
+  {
+    "source_url": "https://news.example/photonix-preseed",
+    "text": "Photonix, a startup developing integrated photonic sensors for industrial inspection, announced a $500K pre-seed round led by Quanta Labs Fund. Dr. Sofia Reyes of Quanta led the investment.",
+    "_attribution": {
+      "company": "Photonix",
+      "round_type": "pre-seed",
+      "round_size_usd": 500000,
+      "lead_investor": "Quanta Labs Fund",
+      "all_investors": ["Quanta Labs Fund"],
+      "attributed_partners": [{"name": "Sofia Reyes", "fund": "Quanta Labs Fund"}],
+      "sector_tags": ["deep tech", "photonics", "hardware"],
+      "announcement_date": "2026-01-15"
+    }
+  },
+  {
+    "source_url": "https://news.example/paywall-seed",
+    "text": "Payments reconciliation startup Paywall has raised $1.5M in seed funding led by Northbeam Capital. Northbeam Partner Marcus Lindqvist led the round.",
+    "_attribution": {
+      "company": "Paywall",
+      "round_type": "seed",
+      "round_size_usd": 1500000,
+      "lead_investor": "Northbeam Capital",
+      "all_investors": ["Northbeam Capital", "Operator Angels"],
+      "attributed_partners": [{"name": "Marcus Lindqvist", "fund": "Northbeam Capital"}],
+      "sector_tags": ["fintech", "payments", "reconciliation"],
+      "announcement_date": "2025-11-08"
+    }
+  },
+  {
+    "source_url": "https://news.example/tablerun-seed",
+    "text": "Tablerun, a vertical SaaS company for restaurant back-office operations, raised a $3M seed round led by Tidewater Ventures alongside a number of strategic angels. Tidewater Partner Renee Park led the deal.",
+    "_attribution": {
+      "company": "Tablerun",
+      "round_type": "seed",
+      "round_size_usd": 3000000,
+      "lead_investor": "Tidewater Ventures",
+      "all_investors": ["Tidewater Ventures"],
+      "attributed_partners": [{"name": "Renee Park", "fund": "Tidewater Ventures"}],
+      "sector_tags": ["B2B SaaS", "vertical", "restaurant"],
+      "announcement_date": "2025-09-22"
+    }
+  },
+  {
+    "source_url": "https://news.example/shiftly-seed",
+    "text": "Shiftly, a workforce scheduling platform, closed a $2M seed led by Tidewater Ventures. No partner named.",
+    "_attribution": {
+      "company": "Shiftly",
+      "round_type": "seed",
+      "round_size_usd": 2000000,
+      "lead_investor": "Tidewater Ventures",
+      "all_investors": ["Tidewater Ventures"],
+      "attributed_partners": [],
+      "sector_tags": ["B2B SaaS", "workforce"],
+      "announcement_date": "2025-08-11"
+    }
+  },
+  {
+    "source_url": "https://news.example/carbonline-seed",
+    "text": "Carbonline raised a $2M seed round to commercialize industrial carbon capture instrumentation. Foundry North led the round.",
+    "_attribution": {
+      "company": "Carbonline",
+      "round_type": "seed",
+      "round_size_usd": 2000000,
+      "lead_investor": "Foundry North",
+      "all_investors": ["Foundry North"],
+      "attributed_partners": [],
+      "sector_tags": ["climate", "industrial", "hardware"],
+      "announcement_date": "2026-05-01"
+    }
+  },
+  {
+    "source_url": "https://news.example/comply-seed",
+    "text": "Comply.io, a regulatory reporting startup, raised a $1.8M seed led by Northbeam Capital and joined by Generic Capital.",
+    "_attribution": {
+      "company": "Comply.io",
+      "round_type": "seed",
+      "round_size_usd": 1800000,
+      "lead_investor": "Northbeam Capital",
+      "all_investors": ["Northbeam Capital", "Generic Capital"],
+      "attributed_partners": [],
+      "sector_tags": ["fintech", "compliance"],
+      "announcement_date": "2025-10-30"
+    }
+  },
+  {
+    "source_url": "https://news.example/brightline-seriesb",
+    "text": "Brightline announced a $30M Series B led by Meridian Capital.",
+    "_attribution": {
+      "company": "Brightline",
+      "round_type": "Series B",
+      "round_size_usd": 30000000,
+      "lead_investor": "Meridian Capital",
+      "all_investors": ["Meridian Capital"],
+      "attributed_partners": [],
+      "sector_tags": ["enterprise software"],
+      "announcement_date": "2026-03-29"
+    }
+  },
+  {
+    "source_url": "https://news.example/photogenix-seed",
+    "text": "Photogenix raised a $1.2M seed led by Skyrise Ventures.",
+    "_attribution": {
+      "company": "Photogenix",
+      "round_type": "seed",
+      "round_size_usd": 1200000,
+      "lead_investor": "Skyrise Ventures",
+      "all_investors": ["Skyrise Ventures"],
+      "attributed_partners": [],
+      "sector_tags": ["consumer"],
+      "announcement_date": "2026-02-02"
+    }
+  },
+  {
+    "source_url": "https://news.example/breaker-seed",
+    "text": "Breaker, a fintech for SMB lending, raised a $2M seed led by Anchor Bay Capital.",
+    "_attribution": {
+      "company": "Breaker",
+      "round_type": "seed",
+      "round_size_usd": 2000000,
+      "lead_investor": "Anchor Bay Capital",
+      "all_investors": ["Anchor Bay Capital"],
+      "attributed_partners": [],
+      "sector_tags": ["fintech", "lending"],
+      "announcement_date": "2025-12-12"
+    }
+  },
+  {
+    "source_url": "https://news.example/mainline-seriesa",
+    "text": "Mainline AI raised a $12M Series A led by Halo Partners.",
+    "_attribution": {
+      "company": "Mainline AI",
+      "round_type": "Series A",
+      "round_size_usd": 12000000,
+      "lead_investor": "Halo Partners",
+      "all_investors": ["Halo Partners"],
+      "attributed_partners": [],
+      "sector_tags": ["AI", "infrastructure"],
+      "announcement_date": "2026-01-25"
+    }
+  },
+  {
+    "source_url": "https://news.example/argosy-seed",
+    "text": "Argosy Systems closed a $1M seed round led by Pinetree Ventures.",
+    "_attribution": {
+      "company": "Argosy Systems",
+      "round_type": "seed",
+      "round_size_usd": 1000000,
+      "lead_investor": "Pinetree Ventures",
+      "all_investors": ["Pinetree Ventures"],
+      "attributed_partners": [],
+      "sector_tags": ["enterprise software"],
+      "announcement_date": "2025-11-15"
+    }
+  },
+  {
+    "source_url": "https://news.example/dockwise-seriesa",
+    "text": "Dockwise Logistics raised a $20M Series A led by Cumulus Capital.",
+    "_attribution": {
+      "company": "Dockwise Logistics",
+      "round_type": "Series A",
+      "round_size_usd": 20000000,
+      "lead_investor": "Cumulus Capital",
+      "all_investors": ["Cumulus Capital"],
+      "attributed_partners": [],
+      "sector_tags": ["logistics"],
+      "announcement_date": "2026-04-30"
+    }
+  },
+  {
+    "source_url": "https://news.example/relay-seed",
+    "text": "Relay Health raised a $1.5M seed led by Beacon Labs.",
+    "_attribution": {
+      "company": "Relay Health",
+      "round_type": "seed",
+      "round_size_usd": 1500000,
+      "lead_investor": "Beacon Labs",
+      "all_investors": ["Beacon Labs"],
+      "attributed_partners": [],
+      "sector_tags": ["healthcare"],
+      "announcement_date": "2025-08-30"
+    }
+  },
+  {
+    "source_url": "https://news.example/hearthstone-seed",
+    "text": "Hearthstone Energy closed a $2.5M seed round led by Foundry North.",
+    "_attribution": {
+      "company": "Hearthstone Energy",
+      "round_type": "seed",
+      "round_size_usd": 2500000,
+      "lead_investor": "Foundry North",
+      "all_investors": ["Foundry North"],
+      "attributed_partners": [],
+      "sector_tags": ["climate", "energy"],
+      "announcement_date": "2025-07-18"
+    }
+  },
+  {
+    "source_url": "https://news.example/corelattice-preseed",
+    "text": "CoreLattice raised $400K in pre-seed funding from Quanta Labs Fund.",
+    "_attribution": {
+      "company": "CoreLattice",
+      "round_type": "pre-seed",
+      "round_size_usd": 400000,
+      "lead_investor": "Quanta Labs Fund",
+      "all_investors": ["Quanta Labs Fund"],
+      "attributed_partners": [],
+      "sector_tags": ["deep tech", "materials"],
+      "announcement_date": "2025-12-01"
+    }
+  },
+  {
+    "source_url": "https://news.example/lumonix-seriesa",
+    "text": "Lumonix raised a $15M Series A led by Stellar Crest.",
+    "_attribution": {
+      "company": "Lumonix",
+      "round_type": "Series A",
+      "round_size_usd": 15000000,
+      "lead_investor": "Stellar Crest",
+      "all_investors": ["Stellar Crest"],
+      "attributed_partners": [],
+      "sector_tags": ["AI"],
+      "announcement_date": "2026-04-02"
+    }
+  },
+  {
+    "source_url": "https://news.example/feldspar-seed",
+    "text": "Feldspar Bio raised a $2M seed led by Marrow Capital.",
+    "_attribution": {
+      "company": "Feldspar Bio",
+      "round_type": "seed",
+      "round_size_usd": 2000000,
+      "lead_investor": "Marrow Capital",
+      "all_investors": ["Marrow Capital"],
+      "attributed_partners": [],
+      "sector_tags": ["biotech"],
+      "announcement_date": "2025-10-05"
+    }
+  }
+]

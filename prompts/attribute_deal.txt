@@ -1,0 +1,18 @@
+Extract structured deal data from this funding announcement.
+
+Required JSON output:
+{
+  "company": "name",
+  "round_type": "seed, series A, etc",
+  "round_size_usd": integer or null,
+  "lead_investor": "fund name or null",
+  "all_investors": [list of fund names],
+  "attributed_partners": [{"name": "...", "fund": "..."}],
+  "sector_tags": [list],
+  "announcement_date": "YYYY-MM-DD"
+}
+
+Only attribute partners when the announcement explicitly names them as leading or championing. Use only what is in the announcement.
+
+ANNOUNCEMENT:
+{ANNOUNCEMENT_TEXT}
