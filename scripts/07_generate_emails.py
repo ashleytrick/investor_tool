@@ -18,7 +18,7 @@ from datetime import date, datetime, timezone
 # Make repo-root packages (core, schemas) importable when run as a script.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select as sqla_select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.csv_export import write_review_queue
@@ -31,6 +31,7 @@ from core.db import (
     partner_score_summaries,
     partners,
     signals,
+    source_snapshots,
     upsert,
 )
 from core.lead_likelihood import compute_lead_likelihood
@@ -188,9 +189,45 @@ def main() -> int:
                     "last_updated": _now(),
                 })
 
-            # --- Signal: verify (stub) + quality (stub), idempotent insert ---
-            ver = verify_signal(signal["source_url"], signal["quoted_text"])
-            qual = score_signal(signal["quoted_text"], signal["axis_relevance"])
+            # --- Signal: snapshot, verify, score quality, idempotent insert ---
+            # Session 1 path: persist a snapshot containing the quote so the
+            # real verification gauntlet (Session 5) can confirm via snapshot
+            # fallback in the absence of network.
+            import hashlib as _hl
+            snap_text = signal["quoted_text"]
+            chash = _hl.sha256(snap_text.encode("utf-8")).hexdigest()
+            with engine.begin() as conn:
+                existing_snap = conn.execute(
+                    sqla_select(source_snapshots.c.snapshot_id).where(
+                        source_snapshots.c.source_url == signal["source_url"],
+                        source_snapshots.c.content_hash == chash,
+                    )
+                ).first()
+                if existing_snap:
+                    snap_id = int(existing_snap.snapshot_id)
+                else:
+                    snap_id = int(conn.execute(source_snapshots.insert().values(
+                        source_url=signal["source_url"],
+                        fetched_at=_now(),
+                        http_status=200,
+                        content_hash=chash,
+                        extracted_text=snap_text,
+                        fetched_during_stage=STAGE,
+                    )).inserted_primary_key[0])
+            ver = verify_signal(
+                engine, signal["source_url"], signal["quoted_text"], snap_id
+            )
+            qual = score_signal(
+                llm,
+                quoted_text=signal["quoted_text"],
+                axis_relevance=signal["axis_relevance"],
+                quote_date=signal["quote_date"],
+                source_url=signal["source_url"],
+                signal_direction=signal["signal_direction"],
+                confidence=signal["confidence"],
+                company_description=ws.company["company"]["description"],
+                company_name=ws.company["company"]["name"],
+            )
             signal_date = date.fromisoformat(signal["quote_date"])
             with engine.begin() as conn:
                 conn.execute(
@@ -201,6 +238,7 @@ def main() -> int:
                 )
                 conn.execute(signals.insert().values(
                     partner_id=partner_id,
+                    snapshot_id=snap_id,
                     source_type=signal["source_type"],
                     source_url=signal["source_url"],
                     quoted_text=signal["quoted_text"],

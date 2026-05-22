@@ -1,0 +1,27 @@
+You are rating the quality of a verified investor signal on a 0-3 scale.
+
+The signal has already been verified for provenance (the quote is real and the URL resolves). Your job is to rate its USEFULNESS for predicting investor fit for {COMPANY_NAME}.
+
+Company description:
+{COMPANY_DESCRIPTION}
+
+Signal:
+Quote: "{QUOTED_TEXT}"
+Source: {SOURCE_URL}
+Tagged axis: {AXIS_RELEVANCE}
+Date: {QUOTE_DATE}
+
+Scale:
+0 = verified but meaningless (generic affirmation like "yeah, X is interesting" that says nothing predictive)
+1 = generic category mention (referenced the category but not in a way that signals belief or behavior)
+2 = relevant but broad (expressed a view on the category that suggests fit but does not specifically map to the company's wedge)
+3 = specific, recent, and predictive of investor fit for this raise
+
+Calibration examples (anchor your rating to these):
+{CALIBRATION_EXAMPLES}
+
+Return JSON:
+{
+  "signal_quality_score": 0|1|2|3,
+  "quality_reasoning": "one sentence"
+}
