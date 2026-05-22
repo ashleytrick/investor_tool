@@ -1,0 +1,39 @@
+# PLACEHOLDER fixture data for the Session 1 vertical slice.
+# Each axis measures investor PSYCHOLOGY/BELIEF, not a sector label.
+axes:
+  - id: axis_1
+    name: "Regulated-market wedge believer"
+    description: "Believes regulated-market wedges beat pure consumer adoption as a path to defensibility."
+    positive_signals:
+      - "regulation as moat"
+      - "compliance is a wedge"
+    negative_signals:
+      - "regulation kills startups"
+    weight: 1.0
+  - id: axis_2
+    name: "Infrastructure-over-application bias"
+    description: "Believes the durable value in fintech accrues to infrastructure and APIs, not end-user apps."
+    positive_signals:
+      - "picks and shovels"
+      - "API-first"
+    negative_signals:
+      - "brand wins fintech"
+    weight: 1.0
+  - id: axis_3
+    name: "Sales-led over product-led at seed"
+    description: "Believes a design-partner / sales-led motion is the right way to build B2B fintech at seed, not product-led growth."
+    positive_signals:
+      - "design partners"
+      - "founder-led sales"
+    negative_signals:
+      - "PLG everywhere"
+    weight: 1.0
+  - id: axis_4
+    name: "Timing-driven category conviction"
+    description: "Believes regulatory and policy shifts create forced-buy timing windows worth underwriting."
+    positive_signals:
+      - "policy tailwind"
+      - "forced buy"
+    negative_signals:
+      - "timing is unknowable"
+    weight: 1.0

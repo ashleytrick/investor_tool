@@ -1,0 +1,79 @@
+# PLACEHOLDER fixture data for the Session 1 vertical slice.
+# Fictional company. Replace with real data before any real run.
+company:
+  name: "Tendril"
+  founder_name: "Dana Okafor"
+  founder_email: "dana@tendril.example"
+  one_liner: "Automated regulatory reporting for fintech companies operating in regulated markets."
+  description: |
+    Tendril turns the messy, manual work of regulatory reporting into an API.
+    Fintechs operating under banking, lending, and payments regulation spend
+    months wiring up compliance reporting; Tendril ships it in days. We have
+    4 paying design partners and $180K ARR, growing on the back of new
+    state-level reporting mandates.
+  current_traction:
+    headline_metric: "$180K ARR"
+    secondary_metrics:
+      - "4 paying design partners signed"
+      - "Net revenue retention 128%"
+  stage: "SEED"
+  target_check_size_usd:
+    min: 250000
+    max: 1500000
+  target_geographies:
+    - "United States"
+  adjacent_companies:
+    - "Vanta"
+    - "Sardine"
+  anchor_funds:
+    - "Northbeam Capital"
+  meeting_ask:
+    duration_minutes: 30
+    format: "video call"
+    preferred_scheduling_link: "https://cal.example/dana-tendril"
+
+raise_context:
+  round: "Seed"
+  amount: "$3M"
+  instrument: "priced"
+  status: "actively in market"
+  timing: "target first close in 8 weeks"
+  use_of_funds:
+    - "Ship self-serve onboarding for the top 3 reporting regimes"
+    - "Hire 2 compliance engineers and 1 founding AE"
+  why_this_round_is_fundable_now: "New state reporting mandates are forcing fintechs to buy rather than build."
+  what_changes_after_this_round: "Tendril moves from design-partner motion to repeatable self-serve sales."
+  strongest_raise_proof: "128% net revenue retention across 4 design partners in a category where churn is normally high."
+  round_hook:
+    strongest_reason_to_meet_now: "Reporting mandates landing this quarter create a forced-buy window we are positioned to capture."
+    investor_consequence_of_waiting: "Allocation in the priced round closes at first close in 8 weeks."
+    round_momentum_proof: "First checks soft-circled from two operator angels in payments compliance."
+  notable_existing_investors_or_non_dilutive: "Pre-seed led by two payments-compliance operators."
+
+round_fit:
+  must_have:
+    - "invests at this stage"
+    - "can write or lead target check size"
+    - "has made at least one new investment in last 12 to 18 months"
+  nice_to_have:
+    - "has led comparable rounds"
+    - "has reserves for follow-on"
+    - "partner-level conviction in category"
+  disqualifiers:
+    - "growth-only investor"
+    - "pre-seed-only when raising seed (or seed-only when raising A)"
+    - "follow-on capital only, never leads"
+    - "not currently deploying capital"
+    - "check size constraint mismatched to this round"
+
+founder_voice:
+  style: "Direct, serious, high-conviction, not hypey. Few words, no buzzwords."
+  banned_phrases:
+    - "would love"
+    - "excited to"
+    - "game-changing"
+    - "synergy"
+  preferred_phrases:
+    - "forced buy"
+    - "ships in days"
+  example_emails_path: "prompts/examples/"

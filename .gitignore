@@ -1,0 +1,9 @@
+.env
+clients/*/.env
+__pycache__/
+*.pyc
+.venv/
+*.db
+clients/*/data/pipeline.db
+clients/*/exports/*.csv
+.uv/
