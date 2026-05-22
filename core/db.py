@@ -93,6 +93,11 @@ partners = Table(
     Column("employment_verification_date", Date),
     Column("warm_path_available", Boolean, default=None),
     Column("warm_path_contact", Text),
+    # Stage 4 writes the LLM-derived partial reachability score + JSON evidence.
+    # Stage 6 combines this with deterministic checks to produce the final
+    # cold_reachability_score in partner_score_summaries.
+    Column("cold_reachability_partial_score", Float),
+    Column("cold_reachability_partial_evidence", Text),
     Column("last_updated", DateTime),
 )
 
@@ -274,7 +279,27 @@ def get_engine(db_url: str) -> Engine:
     """Create the engine and ensure all tables exist (idempotent)."""
     engine = create_engine(db_url, future=True)
     metadata.create_all(engine)
+    # Defensive: a pre-existing SQLite db may lack columns added in later
+    # sessions. metadata.create_all does not ALTER. Sync any drift here.
+    _sync_columns_with_metadata(engine)
     return engine
+
+
+def _sync_columns_with_metadata(engine: Engine) -> None:
+    """SQLite: ADD COLUMN for any metadata column that is missing on disk."""
+    for table in metadata.sorted_tables:
+        with engine.begin() as conn:
+            existing = {
+                row[1] for row in conn.exec_driver_sql(
+                    f"PRAGMA table_info({table.name})"
+                )
+            }
+            for col in table.columns:
+                if col.name not in existing:
+                    sql_type = col.type.compile(dialect=engine.dialect)
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sql_type}"
+                    )
 
 
 def upsert(conn, table: Table, pk_cols: list[str], values: dict) -> None:

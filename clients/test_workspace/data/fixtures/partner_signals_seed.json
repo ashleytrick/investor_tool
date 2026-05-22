@@ -1,0 +1,259 @@
+{
+  "_comment": "Per-partner fixture content. `sources` is the raw text the live LLM would see; `_extraction` is the canned PartnerSignalsOutput used in stub mode.",
+  "northbeam.example_priya_anand": {
+    "sources": [
+      {
+        "source_type": "podcast",
+        "source_url": "https://distributionpod.example/episodes/priya-anand-regulated-markets",
+        "quote_date": "2026-02-18",
+        "text": "On the Distribution podcast Priya Anand discussed where she invests at seed. Quote: 'Compliance reporting is the wedge nobody wants to build but everyone regulated has to buy eventually.' She also said Northbeam looks for fintech infrastructure that survives regulatory scrutiny."
+      },
+      {
+        "source_type": "blog",
+        "source_url": "https://northbeam.example/notes/picks-and-shovels",
+        "quote_date": "2026-04-05",
+        "text": "In a Northbeam blog post Priya wrote: 'We invest in the picks and shovels of regulated finance - the APIs that make compliance a feature, not a project.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "Compliance reporting is the wedge nobody wants to build but everyone regulated has to buy eventually.",
+          "source_url": "https://distributionpod.example/episodes/priya-anand-regulated-markets",
+          "source_type": "podcast",
+          "quote_date": "2026-02-18",
+          "axis_relevance": ["axis_1", "axis_2"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        },
+        {
+          "quoted_text": "We invest in the picks and shovels of regulated finance - the APIs that make compliance a feature, not a project.",
+          "source_url": "https://northbeam.example/notes/picks-and-shovels",
+          "source_type": "blog",
+          "quote_date": "2026-04-05",
+          "axis_relevance": ["axis_2", "axis_1"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Active podcast appearance in 2026-02; recent fund blog post in 2026-04.", "source_url": "https://distributionpod.example/episodes/priya-anand-regulated-markets", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 8.0,
+      "cold_reachability_reasoning": "Recent public output and explicit willingness to discuss thesis in podcast format."
+    }
+  },
+  "northbeam.example_marcus_lindqvist": {
+    "sources": [
+      {
+        "source_type": "podcast",
+        "source_url": "https://devfinpod.example/marcus-lindqvist",
+        "quote_date": "2026-03-10",
+        "text": "Marcus Lindqvist on the DevFin podcast: 'Reconciliation infrastructure is the most boring and most valuable thing in fintech right now - APIs that do not lose pennies.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "Reconciliation infrastructure is the most boring and most valuable thing in fintech right now - APIs that do not lose pennies.",
+          "source_url": "https://devfinpod.example/marcus-lindqvist",
+          "source_type": "podcast",
+          "quote_date": "2026-03-10",
+          "axis_relevance": ["axis_2"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Public podcast appearance in 2026-03.", "source_url": "https://devfinpod.example/marcus-lindqvist", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 6.0,
+      "cold_reachability_reasoning": "Some public output; less prolific than Anand."
+    }
+  },
+  "tidewater.example_dana_cole": {
+    "sources": [
+      {
+        "source_type": "blog",
+        "source_url": "https://tidewater.example/notes/design-partners-not-plg",
+        "quote_date": "2026-01-22",
+        "text": "Dana Cole wrote in a Tidewater post: 'B2B founders at seed get more signal from five design partners doing real work than from a thousand sign-ups.'"
+      },
+      {
+        "source_type": "podcast",
+        "source_url": "https://opspod.example/dana-cole",
+        "quote_date": "2025-12-05",
+        "text": "On the Ops Podcast Dana said: 'We back founder-led sales because that is the only honest signal at seed.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "B2B founders at seed get more signal from five design partners doing real work than from a thousand sign-ups.",
+          "source_url": "https://tidewater.example/notes/design-partners-not-plg",
+          "source_type": "blog",
+          "quote_date": "2026-01-22",
+          "axis_relevance": ["axis_3"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        },
+        {
+          "quoted_text": "We back founder-led sales because that is the only honest signal at seed.",
+          "source_url": "https://opspod.example/dana-cole",
+          "source_type": "podcast",
+          "quote_date": "2025-12-05",
+          "axis_relevance": ["axis_3"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Recent blog and podcast appearances in last 6 months.", "source_url": "https://opspod.example/dana-cole", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 7.5,
+      "cold_reachability_reasoning": "Consistent recent public output across multiple formats."
+    }
+  },
+  "tidewater.example_renee_park": {
+    "sources": [
+      {
+        "source_type": "substack",
+        "source_url": "https://reneep.example/posts/founder-sales",
+        "quote_date": "2026-02-28",
+        "text": "Renee Park published: 'If a seed founder is not doing sales themselves, I worry they do not understand the buyer.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "If a seed founder is not doing sales themselves, I worry they do not understand the buyer.",
+          "source_url": "https://reneep.example/posts/founder-sales",
+          "source_type": "social",
+          "quote_date": "2026-02-28",
+          "axis_relevance": ["axis_3"],
+          "signal_direction": "positive",
+          "confidence": "medium"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Substack post in 2026-02.", "source_url": "https://reneep.example/posts/founder-sales", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 5.5,
+      "cold_reachability_reasoning": "Limited but recent public footprint."
+    }
+  },
+  "quantalabs.example_sofia_reyes": {
+    "sources": [
+      {
+        "source_type": "podcast",
+        "source_url": "https://deeptechcast.example/sofia",
+        "quote_date": "2025-11-20",
+        "text": "Sofia Reyes on DeepTechCast: 'Hard tech timing is everything - you are either three years too early or three years too late, and getting the window right matters more than the team.'"
+      },
+      {
+        "source_type": "blog",
+        "source_url": "https://quantalabs.example/notes/why-pre-seed",
+        "quote_date": "2026-03-01",
+        "text": "Quanta Labs post by Sofia: 'The interesting deep-tech work is happening at the photonics-software interface - infrastructure, not application.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "Hard tech timing is everything - you are either three years too early or three years too late, and getting the window right matters more than the team.",
+          "source_url": "https://deeptechcast.example/sofia",
+          "source_type": "podcast",
+          "quote_date": "2025-11-20",
+          "axis_relevance": ["axis_4"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        },
+        {
+          "quoted_text": "The interesting deep-tech work is happening at the photonics-software interface - infrastructure, not application.",
+          "source_url": "https://quantalabs.example/notes/why-pre-seed",
+          "source_type": "blog",
+          "quote_date": "2026-03-01",
+          "axis_relevance": ["axis_2"],
+          "signal_direction": "positive",
+          "confidence": "medium"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Two recent public posts in 6 months.", "source_url": "https://quantalabs.example/notes/why-pre-seed", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 6.5,
+      "cold_reachability_reasoning": "Moderate public footprint; pre-seed deep tech is niche but reachable."
+    }
+  },
+  "foundrynorth.example_kwame_boateng": {
+    "sources": [
+      {
+        "source_type": "podcast",
+        "source_url": "https://climatepod.example/kwame",
+        "quote_date": "2026-04-18",
+        "text": "Kwame Boateng on the Climate Podcast: 'Climate is a policy-shaped market - when subsidies and mandates land, they create forced-buy windows worth underwriting.'"
+      },
+      {
+        "source_type": "blog",
+        "source_url": "https://foundrynorth.example/notes/grid-software",
+        "quote_date": "2026-02-10",
+        "text": "Foundry North post by Kwame: 'Grid software needs to be built with regulation as a feature, not a constraint.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "Climate is a policy-shaped market - when subsidies and mandates land, they create forced-buy windows worth underwriting.",
+          "source_url": "https://climatepod.example/kwame",
+          "source_type": "podcast",
+          "quote_date": "2026-04-18",
+          "axis_relevance": ["axis_4"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        },
+        {
+          "quoted_text": "Grid software needs to be built with regulation as a feature, not a constraint.",
+          "source_url": "https://foundrynorth.example/notes/grid-software",
+          "source_type": "blog",
+          "quote_date": "2026-02-10",
+          "axis_relevance": ["axis_1"],
+          "signal_direction": "positive",
+          "confidence": "high"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Two recent public posts in last 4 months.", "source_url": "https://climatepod.example/kwame", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 8.0,
+      "cold_reachability_reasoning": "Active public footprint in climate-policy discourse."
+    }
+  },
+  "foundrynorth.example_ingrid_solberg": {
+    "sources": [
+      {
+        "source_type": "substack",
+        "source_url": "https://ingrids.example/posts/industrial-timing",
+        "quote_date": "2025-10-15",
+        "text": "Ingrid Solberg published: 'The decarbonization customers who matter are the ones forced to buy by upcoming compliance deadlines.'"
+      }
+    ],
+    "_extraction": {
+      "signals": [
+        {
+          "quoted_text": "The decarbonization customers who matter are the ones forced to buy by upcoming compliance deadlines.",
+          "source_url": "https://ingrids.example/posts/industrial-timing",
+          "source_type": "social",
+          "quote_date": "2025-10-15",
+          "axis_relevance": ["axis_4", "axis_1"],
+          "signal_direction": "positive",
+          "confidence": "medium"
+        }
+      ],
+      "reachability_signals": [
+        {"evidence": "Substack post in 2025-10.", "source_url": "https://ingrids.example/posts/industrial-timing", "direction": "positive"}
+      ],
+      "cold_reachability_partial_score": 6.0,
+      "cold_reachability_reasoning": "Sparse but present public output."
+    }
+  }
+}
