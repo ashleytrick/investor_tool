@@ -601,6 +601,11 @@ def _now() -> datetime:
 
 
 READY_TO_SEND_DAILY_CEILING = 25
+# Brief Gate 5.5: before scaling beyond mid-priority into top-25, a Green
+# calibration cohort must exist within the last 60 days. --skip-calibration
+# --reason "..." overrides for calibration runs themselves and emergencies.
+TOP_BEFORE_CALIBRATION_REQUIRED = 10
+CALIBRATION_WINDOW_DAYS = 60
 
 
 def main() -> int:
@@ -614,13 +619,19 @@ def main() -> int:
              "single run (Brief Rule 16 hard ceiling). Requires --reason.",
     )
     parser.add_argument(
+        "--skip-calibration", action="store_true",
+        help="Bypass the Gate 5.5 calibration check (you scaled before having "
+             "a Green calibration in the last 60 days). Requires --reason.",
+    )
+    parser.add_argument(
         "--reason", default=None,
-        help="Required with --approve-bulk-ready: justification logged on the "
-             "run record.",
+        help="Required with --approve-bulk-ready or --skip-calibration.",
     )
     args = parser.parse_args()
-    if args.approve_bulk_ready and not args.reason:
-        parser.error("--approve-bulk-ready requires --reason \"...\"")
+    if (args.approve_bulk_ready or args.skip_calibration) and not args.reason:
+        parser.error(
+            "--approve-bulk-ready / --skip-calibration require --reason \"...\""
+        )
 
     ws = load_workspace(args.workspace)
     print_banner(ws, stage=STAGE)
@@ -682,6 +693,34 @@ def main() -> int:
                     "lead_fund_id": d.lead_fund_id,
                 })
 
+    # Brief Gate 5.5: scaling beyond the mid-tier (--top > 10) without a
+    # recent Green calibration is the brief's most-warned-against move.
+    # Refuse unless --skip-calibration --reason "...".
+    if args.top > TOP_BEFORE_CALIBRATION_REQUIRED and not args.skip_calibration:
+        from datetime import timedelta as _td
+        from core.db import calibration_cohorts as _cc
+        from sqlalchemy import select as _select, desc as _desc
+        cutoff = datetime.now(timezone.utc) - _td(days=CALIBRATION_WINDOW_DAYS)
+        with engine.begin() as conn:
+            green = conn.execute(
+                _select(_cc).where(
+                    _cc.c.outcome == "green",
+                    _cc.c.completed_at >= cutoff,
+                ).order_by(_desc(_cc.c.completed_at)).limit(1)
+            ).first()
+        if not green:
+            print(
+                f"[stage 7] GATE 5.5: --top={args.top} > "
+                f"{TOP_BEFORE_CALIBRATION_REQUIRED} requires a Green "
+                f"calibration cohort within the last {CALIBRATION_WINDOW_DAYS} "
+                f"days. None found.\n"
+                f"  Run a calibration first: "
+                f"uv run scripts/calibration.py --start\n"
+                f"  Or bypass with --skip-calibration --reason \"...\" "
+                f"(logged on the run)."
+            )
+            return 2
+
     # Brief Rule 16 hard ceiling: refuse to mark more than 25 partners as
     # ready_to_send in a single run without explicit approval. recommended_to_send
     # is set by Stage 6; outreach_status="ready_to_send" is the user-visible
@@ -709,6 +748,12 @@ def main() -> int:
             print(
                 f"[stage 7] bulk-ready approved by user: "
                 f"{len(rec_in_batch)} records / reason={args.reason!r}"
+            )
+        if args.skip_calibration:
+            run.note(f"CALIBRATION_SKIPPED reason={args.reason!r}")
+            print(
+                f"[stage 7] calibration check skipped by user: "
+                f"reason={args.reason!r}"
             )
         recommended_drafts: list[dict] = []
         all_drafts: list[dict] = []

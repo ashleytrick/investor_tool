@@ -84,6 +84,8 @@ specific high-blast-radius actions:
 
 ## Operator CLIs (no SQL required)
 
+Workspace setup + day-to-day:
+
 - `scripts/init_workspace.py NAME` — scaffold a new `clients/NAME/` with template
   config + example stubs.
 - `scripts/status.py` — single-pane view: counts per stage, last-run timestamps,
@@ -97,6 +99,32 @@ specific high-blast-radius actions:
 - `jobs/apply_axis_suggestion.py --list | --suggestion-id N | --all-above LEVEL`
   — review and apply axis-weight suggestions. Keeps the 10 most-recent
   `axes.yaml.bak.*` backups, rotates older ones.
+
+Meeting prep + reply handling:
+
+- `scripts/prep_brief.py --partner-id X [--out path.md]` — one-page markdown
+  brief for a partner: fund, scores, top quotes, partner-led deals,
+  recommended email, conversion hypothesis, likely objection (and whether
+  it's preempted in the body), reusable deck-request + follow-up replies.
+- `scripts/classify_reply.py --partner-id X --text "..."|--file reply.eml|--stdin`
+  — LLM (or stub heuristic) classifies a reply into the 9 `reply_type`
+  values; ALWAYS asks for operator confirmation before recording the outcome
+  (the brief explicitly warns against unconfirmed automated classification).
+- `scripts/calibration.py --start|--status|--complete --outcome green|yellow|red
+  --reason "..."` — Gate 5.5 discipline-as-code. `--start` picks mid-priority
+  partners (rank 5-15 by `send_now_priority`). Stage 7 refuses `--top > 10`
+  without a Green cohort in the last 60 days unless you pass
+  `--skip-calibration --reason "..."`.
+
+Sending without leaving the loop:
+
+- `scripts/set_partner_email.py --partner-id X --email "..."` — populate the
+  `email` field. `--from-csv path.csv` for bulk.
+- `scripts/create_gmail_drafts.py` — for each top-N recommended partner with
+  an email on file, create a Gmail draft (NOT send). One-time GCP OAuth
+  setup: drop `.gmail_credentials.json` into the workspace dir, first run
+  prompts for browser consent. Operator opens Gmail Drafts, reviews, hits
+  send. Idempotent: drafts already pushed are skipped unless `--regenerate`.
 
 ## Known limitations
 
@@ -117,8 +145,10 @@ specific high-blast-radius actions:
   ingestion are built but unexercised in this build (fixture mode supplies
   local HTML/text). First real run should use a throwaway target list and
   validate the verification rate falls in the brief's 50-80% band.
-- **Background jobs (Session 9).** Attio outcome sync, monthly learning
-  report, and axis-weight-suggestion applier are not yet built.
+- **Background jobs.** Attio outcome sync runs against real Attio only.
+  Monthly learning report + axis-suggestion applier are built and tested.
+- **Gmail draft integration** is untested live in this build environment
+  (no browser for OAuth). Code path is built; first real run validates.
 
 ## Build status
 

@@ -93,6 +93,9 @@ partners = Table(
     Column("employment_verification_date", Date),
     Column("warm_path_available", Boolean, default=None),
     Column("warm_path_contact", Text),
+    # Partner email -- used by create_gmail_drafts.py. Populated manually via
+    # scripts/set_partner_email.py or downstream from real enrichment.
+    Column("email", Text),
     # Stage 4 writes the LLM-derived partial reachability score + JSON evidence.
     # Stage 6 combines this with deterministic checks to produce the final
     # cold_reachability_score in partner_score_summaries.
@@ -205,6 +208,9 @@ email_drafts = Table(
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
     Column("written_to_csv_at", DateTime),
+    # Gmail draft id once create_gmail_drafts.py has run; idempotent guard.
+    Column("pushed_to_gmail_at", DateTime),
+    Column("gmail_draft_id", Text),
 )
 
 followup_drafts = Table(
@@ -261,6 +267,16 @@ outcomes = Table(
     Column("meeting_date", Date),
     Column("meeting_outcome", Text),
     Column("synced_from_attio_at", DateTime),
+)
+
+calibration_cohorts = Table(
+    "calibration_cohorts", metadata,
+    Column("cohort_id", Integer, primary_key=True, autoincrement=True),
+    Column("started_at", DateTime, nullable=False),
+    Column("partner_ids", Text, nullable=False),  # JSON list
+    Column("outcome", Text),  # "green", "yellow", "red", or NULL while in flight
+    Column("reason", Text),
+    Column("completed_at", DateTime),
 )
 
 axis_weight_suggestions = Table(

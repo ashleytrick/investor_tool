@@ -311,6 +311,135 @@ def test_jobs_produce_suggestions_and_apply():
         assert "already approved" in res.stdout
 
 
+def test_operator_clis():
+    """The four new operator CLIs work end-to-end on the fixture workspace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+            ("06_score_candidates.py", ()),
+            ("07_generate_emails.py", ("--top", "5")),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # prep_brief: renders markdown with all expected sections
+        out_path = ws_dst / "prep.md"
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "prep_brief.py"),
+             "--workspace", ws, "--partner-id",
+             "northbeam.example_priya_anand", "--out", str(out_path)],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        md = out_path.read_text()
+        for must in ("# Prep brief:", "## Fit scores", "## Top verified quotes",
+                     "## What we sent", "### Why we think this converts"):
+            assert must in md, f"prep_brief missing section: {must!r}"
+
+        # classify_reply: heuristic produces a valid outcome and writes it
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "classify_reply.py"),
+             "--workspace", ws,
+             "--partner-id", "northbeam.example_priya_anand",
+             "--yes", "--text", "Thanks but can you send the deck first?"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        assert "asked_for_deck" in res.stdout
+        c = sqlite3.connect(db)
+        n_outcomes = c.execute(
+            "select count(*) from outcomes where partner_id="
+            "'northbeam.example_priya_anand' and reply_type='asked_for_deck'"
+        ).fetchone()[0]
+        assert n_outcomes == 1
+
+        # calibration: start a cohort, then Stage 7 --top 25 must refuse
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "calibration.py"),
+             "--workspace", ws, "--start", "--n", "3"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        n_pending = c.execute(
+            "select count(*) from calibration_cohorts where outcome is null"
+        ).fetchone()[0]
+        assert n_pending == 1
+
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "07_generate_emails.py"),
+             "--workspace", ws, "--top", "25"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        assert "GATE 5.5" in res.stdout
+
+        # bypass with --skip-calibration --reason succeeds
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "07_generate_emails.py"),
+             "--workspace", ws, "--top", "25",
+             "--skip-calibration", "--reason", "smoke test bypass"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        note = c.execute(
+            "select error_summary from runs where stage='07_generate_emails' "
+            "order by run_id desc limit 1"
+        ).fetchone()[0]
+        assert note and "CALIBRATION_SKIPPED" in note
+
+        # complete the cohort Green, --top 25 now passes without --skip
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "calibration.py"),
+             "--workspace", ws, "--complete", "--outcome", "green",
+             "--reason", "smoke test"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "07_generate_emails.py"),
+             "--workspace", ws, "--top", "25"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+
+        # set_partner_email then create_gmail_drafts skip cleanly without creds
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_partner_email.py"),
+             "--workspace", ws,
+             "--partner-id", "northbeam.example_priya_anand",
+             "--email", "priya@northbeam.example"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        email = c.execute(
+            "select email from partners where partner_id="
+            "'northbeam.example_priya_anand'"
+        ).fetchone()[0]
+        assert email == "priya@northbeam.example"
+
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "create_gmail_drafts.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0  # graceful skip
+        assert "skipping" in res.stdout
+        c.close()
+
+
 def test_manual_override_skip_without_force():
     """Stage 6 must skip a partner with manual_score_override=True unless
     --force-rescore --reason is passed."""
