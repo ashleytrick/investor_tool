@@ -48,6 +48,7 @@ from core.db import (
     axis_weight_suggestions,
     email_drafts,
     get_engine,
+    learning_runs,
     outcomes,
     partner_score_summaries,
     scores,
@@ -58,12 +59,35 @@ STAGE = "monthly_learning_report"
 WEIGHT_DELTA_THRESHOLD = 0.5  # axis-score mean diff needed to suggest a change
 WEIGHT_STEP = 0.2             # how much to nudge weight per suggestion
 MIN_SAMPLE_FOR_SUGGESTION = 2 # minimum total (booked + not_booked) per axis
+# Finding 68: per-side minimum stays at 1 to keep small workspaces useful,
+# BUT (a) confidence is "low" when sample_size < 30, and (b) Finding 67's
+# --accept-low-confidence gate refuses to APPLY low-confidence single
+# suggestions silently. The protection is at the apply-side, not the
+# generate-side.
+MIN_PER_SIDE = 1
 WEIGHT_CLAMP = (0.1, 2.0)
 NO_RESPONSE_MATURE_DAYS = 14  # how long to wait before counting "no_response" as terminal
 
-CROSS_WORKSPACE_STATS_PATH = (
-    pathlib.Path(__file__).resolve().parent.parent / "core" / "cross_workspace_stats.json"
-)
+def _cross_workspace_stats_path() -> pathlib.Path:
+    """Where the anonymized aggregate lives. Finding 61: moved OUT of
+    core/ so writes don't churn the code repo. Order of precedence:
+      1. INVESTOR_CROSS_WORKSPACE_STATS env var (operator override)
+      2. XDG_DATA_HOME/investor-outreach/cross_workspace_stats.json
+      3. ~/.local/share/investor-outreach/cross_workspace_stats.json
+    Caller must already have established opt-in.
+    """
+    import os
+    env_path = os.environ.get("INVESTOR_CROSS_WORKSPACE_STATS")
+    if env_path:
+        return pathlib.Path(env_path)
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return pathlib.Path(xdg) / "investor-outreach" / "cross_workspace_stats.json"
+    return (
+        pathlib.Path.home()
+        / ".local" / "share" / "investor-outreach"
+        / "cross_workspace_stats.json"
+    )
 
 
 def _now() -> datetime:
@@ -174,13 +198,37 @@ def _atomic_merge_stats(path: pathlib.Path, wid: str, entry: dict) -> None:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
-def _seed_outcomes(ws, engine) -> int:
-    """Replace outcomes rows for each fixture partner. Returns rows written."""
+def _seed_outcomes(ws, engine, force: bool = False) -> int:
+    """Replace outcomes rows for each fixture partner. Returns rows written.
+
+    Finding 70: refuse to seed if the workspace already has outcomes
+    that aren't in the seed file. Otherwise an operator copying a fixture
+    workspace would pollute real outcome data with synthetic seed rows.
+    --force-seed bypass exists for the legitimate "reset my test workspace"
+    case.
+    """
     path = ws.fixtures_dir / "outcomes_seed.json"
     if not path.exists():
         print(f"[learning] --seed-fixture-outcomes: {path} not found; skipping seed")
         return 0
     seed = json.loads(path.read_text(encoding="utf-8"))
+    seed_pids = {row["partner_id"] for row in seed}
+    with engine.begin() as conn:
+        existing_pids = {
+            r.partner_id for r in conn.execute(
+                select(outcomes.c.partner_id).distinct()
+            )
+        }
+    foreign = existing_pids - seed_pids
+    if foreign and not force:
+        print(
+            f"[learning] REFUSED to seed: workspace already has outcomes for "
+            f"{len(foreign)} partner(s) NOT in outcomes_seed.json (e.g. "
+            f"{sorted(foreign)[:3]}). Looks like real data; refuse to "
+            f"overwrite with fixtures. Pass --force-seed if this is a "
+            f"deliberate reset of a test workspace."
+        )
+        return 0
     written = 0
     with engine.begin() as conn:
         for row in seed:
@@ -206,7 +254,15 @@ def main() -> int:
     parser.add_argument(
         "--seed-fixture-outcomes", action="store_true",
         help="Seed outcomes from data/fixtures/outcomes_seed.json first "
-             "(testing only; production runs consume real Attio outcomes).",
+             "(testing only; production runs consume real Attio outcomes). "
+             "Refuses by default if real outcomes already exist in the "
+             "workspace; pass --force-seed if you really want to reset.",
+    )
+    parser.add_argument(
+        "--force-seed", action="store_true",
+        help="Allow --seed-fixture-outcomes to proceed even when the "
+             "workspace already has outcomes that aren't in the seed file. "
+             "Use only for test-workspace resets.",
     )
     args = parser.parse_args()
 
@@ -215,7 +271,7 @@ def main() -> int:
     engine = get_engine(ws.db_url)
 
     if args.seed_fixture_outcomes:
-        _seed_outcomes(ws, engine)
+        _seed_outcomes(ws, engine, force=args.force_seed)
 
     with RunLogger(engine, ws.name, STAGE) as run:
         # ---- load per-partner state ----
@@ -301,7 +357,14 @@ def main() -> int:
                 if n_total < MIN_SAMPLE_FOR_SUGGESTION:
                     continue
                 # Need at least one partner on each side to compute a diff.
-                if not booked_scores or not not_booked_scores:
+                # Finding 68: at least MIN_PER_SIDE on each side. With just
+                # one booked and one not-booked, the diff is anecdote, not
+                # signal -- the resulting "low confidence" suggestion is
+                # still actionable and tempts the operator to apply it.
+                if (
+                    len(booked_scores) < MIN_PER_SIDE
+                    or len(not_booked_scores) < MIN_PER_SIDE
+                ):
                     continue
                 mean_b = mean(booked_scores)
                 mean_n = mean(not_booked_scores)
@@ -352,34 +415,57 @@ def main() -> int:
                 print(f"[learning] {label}={key}: reply_rate={rate:.0%} ({r}/{t})")
             return rates
 
+        # Finding 63: only count outcomes whose partner has a CURRENT
+        # recommended draft. An outcome with no matching draft means we
+        # can't legitimately credit a strategy / reachability bucket -- the
+        # send context is gone (Stage 7 re-ran, partner was removed, etc.).
+        outcomes_for_learning = {
+            pid: o for pid, o in latest_outcomes.items()
+            if pid in strategies
+        }
+        excluded_no_draft = len(latest_outcomes) - len(outcomes_for_learning)
+        if excluded_no_draft:
+            print(
+                f"[learning] excluded {excluded_no_draft} outcome(s) with no "
+                f"current recommended draft (Finding 63)"
+            )
+
         strat_table: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-        for pid, outcome in latest_outcomes.items():
-            draft = strategies.get(pid)
-            if not draft:
-                continue
+        for pid, outcome in outcomes_for_learning.items():
+            draft = strategies[pid]  # guaranteed by filter above
             strat_table[draft.strategy][1] += 1
             if _replied(outcome):
                 strat_table[draft.strategy][0] += 1
         strat_rates = _bucket_report("strategy", strat_table)
 
+        # Finding 65: "unknown" reachability bucket is excluded from learning
+        # output. It's not a real bucket -- it just means we have no
+        # reachability data for that partner -- and including it pollutes
+        # the rates.
         reach_table: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-        for pid, outcome in latest_outcomes.items():
+        for pid, outcome in outcomes_for_learning.items():
             summary = summaries.get(pid)
             if not summary:
                 continue
-            reach_table[_bucket_reach(summary.cold_reachability_score)][1] += 1
+            bucket = _bucket_reach(summary.cold_reachability_score)
+            if bucket == "unknown":
+                continue
+            reach_table[bucket][1] += 1
             if _replied(outcome):
-                reach_table[_bucket_reach(summary.cold_reachability_score)][0] += 1
+                reach_table[bucket][0] += 1
         reach_rates = _bucket_report("reachability", reach_table)
 
         var_table: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-        for pid, outcome in latest_outcomes.items():
+        for pid, outcome in outcomes_for_learning.items():
             summary = summaries.get(pid)
             if not summary:
                 continue
-            var_table[_bucket_variance(summary.axis_score_variance)][1] += 1
+            bucket = _bucket_variance(summary.axis_score_variance)
+            if bucket == "unknown":
+                continue
+            var_table[bucket][1] += 1
             if _replied(outcome):
-                var_table[_bucket_variance(summary.axis_score_variance)][0] += 1
+                var_table[bucket][0] += 1
         var_rates = _bucket_report("variance", var_table)
 
         # ---- cross-workspace stats (opt-in only) ----
@@ -392,11 +478,25 @@ def main() -> int:
                 "sample_size": total,
                 "updated_at": _now().isoformat(),
             }
-            _atomic_merge_stats(CROSS_WORKSPACE_STATS_PATH, wid, entry)
+            _atomic_merge_stats(_cross_workspace_stats_path(), wid, entry)
             print(
                 f"[learning] cross-workspace stats updated "
                 f"(workspace_hash={wid}, anonymized aggregates only)"
             )
+
+        # Finding 66: persist the learning-run audit so trends are
+        # inspectable, not just printed-and-gone.
+        with engine.begin() as conn:
+            conn.execute(learning_runs.insert().values(
+                generated_at=_now(),
+                terminal_outcomes=len(terminal_outcomes),
+                excluded_pending=excluded_pending,
+                excluded_no_draft=excluded_no_draft,
+                strategy_rates=json.dumps(strat_rates),
+                reachability_rates=json.dumps(reach_rates),
+                variance_rates=json.dumps(var_rates),
+                suggestions_written=suggestions_written,
+            ))
 
         run.succeeded = suggestions_written
         run.note(f"suggestions_written={suggestions_written}")

@@ -280,14 +280,26 @@ def test_jobs_produce_suggestions_and_apply():
         original_text = axes_yaml.read_text()
         assert f"weight: {current_w}" in original_text or "weight: 1.0" in original_text
 
-        # apply_axis_suggestion mutates + backs up + marks approved
+        # apply_axis_suggestion mutates + backs up + marks approved.
+        # Fixture-generated suggestions are confidence=low (n=2); apply
+        # path now requires --accept-low-confidence (Finding 67).
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "jobs" / "apply_axis_suggestion.py"),
-             "--workspace", ws, "--suggestion-id", str(sid)],
+             "--workspace", ws, "--suggestion-id", str(sid),
+             "--accept-low-confidence"],
             capture_output=True, text=True, env=env, timeout=60,
         )
         assert res.returncode == 0
         assert "backup=" in res.stdout
+
+        # Re-running on the same now-approved suggestion is a no-op.
+        res_again = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "apply_axis_suggestion.py"),
+             "--workspace", ws, "--suggestion-id", str(sid)],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res_again.returncode == 0
+        assert "already approved" in res_again.stdout
 
         # Backup file present
         backups = list((ws_dst / "config").glob("axes.yaml.bak.*"))

@@ -131,6 +131,12 @@ def main() -> int:
     g.add_argument("--all-above", choices=("low", "medium", "high"),
                    help="Apply every pending suggestion at this confidence "
                         "level or higher.")
+    parser.add_argument(
+        "--accept-low-confidence", action="store_true",
+        help="Required to apply a confidence=low suggestion. "
+             "Finding 67: low-confidence suggestions are operator-discretion "
+             "and shouldn't be applied silently.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -199,6 +205,26 @@ def main() -> int:
             run.failed = 1
             run.log_error(str(args.suggestion_id), "not_found",
                           "no such suggestion")
+            return 2
+        # Finding 67: applying a confidence=low suggestion via --suggestion-id
+        # requires --accept-low-confidence so the operator can't bulk-paste
+        # IDs without realizing they came from sparse data. Already-approved
+        # suggestions short-circuit to no-op via _apply_one, so we skip the
+        # gate in that case (re-running on an applied suggestion isn't an
+        # action the operator's gating their own consent against).
+        if (
+            not row.approved
+            and row.confidence == "low"
+            and not args.accept_low_confidence
+        ):
+            msg = (
+                f"REFUSED: suggestion_id={args.suggestion_id} has "
+                f"confidence='low' (sample_size={row.sample_size}). "
+                f"Re-run with --accept-low-confidence to override."
+            )
+            print(f"[apply] {msg}")
+            run.note(msg)
+            run.failed = 1
             return 2
         run.processed = 1
         if _apply_one(engine, ws, row, run):

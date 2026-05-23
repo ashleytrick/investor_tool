@@ -281,6 +281,20 @@ calibration_cohorts = Table(
     Column("completed_at", DateTime),
 )
 
+learning_runs = Table(
+    "learning_runs", metadata,
+    Column("run_id", Integer, primary_key=True, autoincrement=True),
+    Column("generated_at", DateTime, nullable=False),
+    Column("terminal_outcomes", Integer),
+    Column("excluded_pending", Integer),
+    Column("excluded_no_draft", Integer),
+    Column("strategy_rates", Text),        # JSON: {strategy -> reply_rate}
+    Column("reachability_rates", Text),    # JSON: {bucket -> reply_rate}
+    Column("variance_rates", Text),        # JSON: {bucket -> reply_rate}
+    Column("suggestions_written", Integer),
+)
+
+
 axis_weight_suggestions = Table(
     "axis_weight_suggestions", metadata,
     Column("suggestion_id", Integer, primary_key=True, autoincrement=True),
