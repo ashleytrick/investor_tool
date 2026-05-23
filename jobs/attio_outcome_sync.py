@@ -115,10 +115,13 @@ def main() -> int:
         ).isoformat()
 
         try:
-            records = client.query_records(
+            # Paginated pull -- the previous single-page limit=100 was a
+            # silent ceiling: any workspace with >100 modified people in
+            # the lookback dropped outcomes and poisoned the learning loop.
+            records = client.query_records_all(
                 person_object,
                 {"last_modified_at": {"$gte": cutoff}},
-                limit=100,
+                page_size=100,
             )
         except AttioError as exc:
             print(f"[outcome_sync] Attio query failed: {exc}")
@@ -126,6 +129,7 @@ def main() -> int:
             run.log_error("__query__", "AttioError", str(exc))
             client.close()
             return 2
+        print(f"[outcome_sync] pulled {len(records)} modified record(s) from Attio")
 
         for rec in records:
             run.processed += 1

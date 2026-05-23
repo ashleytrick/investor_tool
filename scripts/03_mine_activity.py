@@ -139,6 +139,7 @@ def resolve_partner_id(
 
 def recompute_fund_activity(engine) -> None:
     """Idempotent: set last_known_activity_date + is_active from deal_attributions."""
+    from core.dates import within_days
     today = date.today()
     with engine.begin() as conn:
         for fid, in conn.execute(select(funds.c.fund_id)):
@@ -148,10 +149,9 @@ def recompute_fund_activity(engine) -> None:
                 .order_by(deal_attributions.c.announcement_date.desc())
                 .limit(1)
             ).scalar_one_or_none()
-            is_active = (
-                max_date is not None
-                and (today - max_date).days <= ACTIVE_WINDOW_DAYS
-            )
+            # within_days rejects future dates; bad announcement_date parsing
+            # can no longer mark a fund "active" via a 2027 ghost date.
+            is_active = within_days(max_date, ACTIVE_WINDOW_DAYS, today)
             conn.execute(
                 funds.update().where(funds.c.fund_id == fid).values(
                     last_known_activity_date=max_date,

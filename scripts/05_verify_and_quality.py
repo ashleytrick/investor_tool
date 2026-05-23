@@ -34,7 +34,21 @@ def main() -> int:
     add_workspace_arg(parser)
     parser.add_argument("--force", action="store_true",
                         help="Re-verify and re-score every signal, not just unprocessed.")
+    parser.add_argument(
+        "--allow-verification-rate-outside-band", action="store_true",
+        help="Bypass the 50-80% live-mode verification-rate gate. Requires "
+             "--reason. Use after you've reviewed why verification is "
+             "drifting (LLM hallucinated quotes, URL rot, snapshot misses).",
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help="Required with --allow-verification-rate-outside-band.",
+    )
     args = parser.parse_args()
+    if args.allow_verification_rate_outside_band and not args.reason:
+        parser.error(
+            "--allow-verification-rate-outside-band requires --reason \"...\""
+        )
 
     ws = load_workspace(args.workspace)
     print_banner(ws, stage=STAGE)
@@ -120,14 +134,40 @@ def main() -> int:
             f"({pct:.0f}%) | quality>=2: {quality2_plus} | "
             f"methods: {method_counts}"
         )
-        if 50 <= pct <= 80:
-            print("[stage 5] verification rate within 50-80% expected band for real data")
-        else:
+
+        # Verification-rate gate is BINDING in live mode. The brief's 50-80%
+        # band catches the two real failure modes on real data: LLM
+        # hallucinating quotes (rate too low) and snapshot-only matches that
+        # never actually validate against the live page (rate too high but
+        # via the wrong method).
+        in_band = 50 <= pct <= 80
+        sample_too_small = run.processed < 10
+        if in_band:
+            print("[stage 5] verification rate within 50-80% expected band")
+        elif llm.stub or sample_too_small:
             print(
-                "[stage 5] verification rate outside 50-80% band. "
-                "Expected for fixture runs (hand-authored snapshots all match); "
-                "recalibrate Stage 4 prompts before scaling real data."
+                "[stage 5] verification rate outside 50-80% band -- "
+                "expected for fixture runs (clean snapshots) or small "
+                f"samples (n={run.processed}); not enforced."
             )
+        elif args.allow_verification_rate_outside_band:
+            note = (
+                f"verification rate {pct:.0f}% outside 50-80% band; "
+                f"approved bypass: {args.reason!r}"
+            )
+            print(f"[stage 5] {note}")
+            run.note(note)
+        else:
+            msg = (
+                f"FAIL: verification rate {pct:.0f}% outside 50-80% band on "
+                f"live data (n={run.processed}). Recalibrate Stage 4 prompts "
+                f"OR pass --allow-verification-rate-outside-band --reason ..."
+            )
+            print(f"[stage 5] {msg}")
+            run.note(msg)
+            run.failed = max(run.failed, 1)
+            print(f"[stage 5] llm stub mode: {llm.stub}")
+            return 2
         print(f"[stage 5] llm stub mode: {llm.stub}")
 
     return 0

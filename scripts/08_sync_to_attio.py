@@ -271,6 +271,7 @@ def main() -> int:
                     partners.c.warm_path_available,
                     partners.c.warm_path_contact,
                     partners.c.fund_id,
+                    partners.c.email.label("partner_email"),
                     partners.c.attio_record_id.label("known_attio_id"),
                 )
                 .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
@@ -328,16 +329,48 @@ def main() -> int:
                     }]
                 payload = {**base_payload, **custom_payload}
 
-                # Find existing record per match strategy.
-                match = find_partner_record(
-                    client, person_object,
-                    email=None,
-                    linkedin_url=p.linkedin_url,
-                    name=p.partner_name,
-                    company_record_id=fund_attio_id,
-                )
-                attio_id = None
+                # Match cascade for an existing Attio record:
+                #   0. partners.attio_record_id (from a prior sync) -> GET it
+                #      directly. This is the strongest signal -- if the
+                #      cascade below fails (LinkedIn URL changed, name typo,
+                #      company link broken), we'd otherwise create a
+                #      duplicate. Finding #1 fix.
+                #   1. email
+                #   2. linkedin_url query
+                #   3. name + company-link query
+                match = None
                 op = None
+                if p.known_attio_id:
+                    try:
+                        rec = client.get_record(person_object, p.known_attio_id)
+                        if rec:
+                            match = rec
+                    except AttioError as exc:
+                        # Stale local id -- record may have been deleted in
+                        # Attio. Clear the local link and fall through to
+                        # the cascade.
+                        log_sync(
+                            engine, object_type="person",
+                            local_id=p.partner_id,
+                            attio_record_id=p.known_attio_id,
+                            operation="known_id_stale", success=False,
+                            error_message=str(exc),
+                        )
+                        with engine.begin() as conn:
+                            conn.execute(
+                                partners.update()
+                                .where(partners.c.partner_id == p.partner_id)
+                                .values(attio_record_id=None)
+                            )
+                if match is None:
+                    match = find_partner_record(
+                        client, person_object,
+                        email=p.partner_email,
+                        linkedin_url=p.linkedin_url,
+                        name=p.partner_name,
+                        company_record_id=fund_attio_id,
+                    )
+                attio_id = None
                 if match and match.get("_conflict"):
                     log_sync(engine, object_type="person", local_id=p.partner_id,
                              attio_record_id=None, operation="skip_conflict",

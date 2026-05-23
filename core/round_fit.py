@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from typing import Optional
 
 # ----- stage matching -----
@@ -230,7 +230,6 @@ def compute_round_fit(
 
 
 def is_within_months(d: Optional[date], months: int, today: Optional[date] = None) -> bool:
-    if d is None:
-        return False
-    today = today or date.today()
-    return (today - d) <= timedelta(days=int(months * 30.5))
+    """Within `months` AND not in the future (date.dates helper guards both)."""
+    from core.dates import within_days
+    return within_days(d, int(months * 30.5), today)

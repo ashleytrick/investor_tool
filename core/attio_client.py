@@ -131,14 +131,48 @@ class AttioClient:
         object_slug: str,
         filter_body: dict,
         limit: int = 1,
+        offset: int = 0,
     ) -> list[dict]:
+        body = {"filter": filter_body, "limit": limit}
+        if offset:
+            body["offset"] = offset
         result = self._request(
             "POST",
             f"/objects/{object_slug}/records/query",
-            json_body={"filter": filter_body, "limit": limit},
+            json_body=body,
         )
         data = result.get("data", []) if isinstance(result, dict) else result
         return data if isinstance(data, list) else []
+
+    def query_records_all(
+        self,
+        object_slug: str,
+        filter_body: dict,
+        page_size: int = 100,
+        max_pages: int = 100,
+    ) -> list[dict]:
+        """Paginated wrapper: pulls until a page returns fewer than page_size
+        rows, or until max_pages is hit (defensive). Brief Rule 14 forbids
+        silent truncation; outcome sync was previously capped at one page.
+        """
+        out: list[dict] = []
+        for page in range(max_pages):
+            chunk = self.query_records(
+                object_slug, filter_body,
+                limit=page_size, offset=page * page_size,
+            )
+            out.extend(chunk)
+            if len(chunk) < page_size:
+                break
+        else:
+            # Hit max_pages without seeing a short page -- likely more data.
+            # Raise so the caller logs it loudly instead of silently
+            # dropping outcomes.
+            raise AttioError(
+                f"query_records_all hit max_pages={max_pages} for "
+                f"{object_slug!r}; results probably truncated"
+            )
+        return out
 
     def get_record(self, object_slug: str, record_id: str) -> dict:
         result = self._request(

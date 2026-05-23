@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from typing import Optional
+
+from core.dates import within_days
 
 LEAD_WINDOW_DAYS = 730  # 24 months
 
@@ -33,10 +35,9 @@ def _title_seniority(title: Optional[str]) -> int:
 
 
 def _is_recent(d: Optional[date], today: Optional[date] = None) -> bool:
-    if d is None:
-        return False
-    today = today or date.today()
-    return (today - d) <= timedelta(days=LEAD_WINDOW_DAYS)
+    """A date is recent only if it's within LEAD_WINDOW_DAYS AND not in the
+    future. Future dates from bad parsing must NOT inflate lead_likelihood."""
+    return within_days(d, LEAD_WINDOW_DAYS, today)
 
 
 @dataclass

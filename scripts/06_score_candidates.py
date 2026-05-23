@@ -188,9 +188,12 @@ def composite_and_spikiness(
 # ------- send_now_priority -------
 
 def signal_recency_bonus(most_recent: date | None, today: date) -> float:
-    if most_recent is None:
+    # days_since() returns None for missing/future dates, so neither inflates
+    # the recency bonus.
+    from core.dates import days_since
+    days = days_since(most_recent, today)
+    if days is None:
         return 0.0
-    days = (today - most_recent).days
     if days <= SIGNAL_RECENCY_90_BONUS_DAYS:
         return 2.0
     if days <= SIGNAL_RECENCY_180_BONUS_DAYS:
@@ -257,7 +260,9 @@ def evaluate_recommended(
             "fewer than 2 distinct verified quality>=2 evidence sources "
             "(need 2 distinct source_types or 1 thesis + 1 deal pattern)"
         )
-    if most_recent_signal_date is None or (today - most_recent_signal_date).days > 540:
+    # within_days() = past-and-bounded; future-dated quotes don't sneak past.
+    from core.dates import within_days as _within
+    if not _within(most_recent_signal_date, 540, today):
         fails.append("no verified quality>=2 evidence within last 18 months")
     if employment_status not in ("verified_current", "likely_current"):
         fails.append(f"employment_status={employment_status!r} not current")
@@ -415,9 +420,12 @@ def main() -> int:
                     continue
 
                 fund_deals = deals_by_fund.get(p.fund_id, [])
+                # Bound on BOTH sides: future-dated deals (bad parsing) must
+                # not count as recent fund activity.
                 fund_deals_18mo = [
                     d for d in fund_deals
-                    if d.get("announcement_date") and d["announcement_date"] >= cutoff_18mo
+                    if d.get("announcement_date")
+                    and cutoff_18mo <= d["announcement_date"] <= today
                 ]
                 fund_has_led_recently = len(fund_deals_18mo) > 0
 
@@ -463,9 +471,12 @@ def main() -> int:
                 # Stage 2 enrichment persists contact-info presence.
                 most_recent = max((s["date"] for s in p_signals if s.get("date")),
                                   default=None)
+                # Past-only counting: future-dated signals don't pad the
+                # 12-month post count or the recency bonus.
+                from core.dates import days_since, within_days
                 post_count_12mo = sum(
                     1 for s in p_signals
-                    if s.get("date") and (today - s["date"]).days <= 365
+                    if within_days(s.get("date"), 365, today)
                 )
                 if post_count_12mo >= 3:
                     posts_pts = 2.0
@@ -473,11 +484,12 @@ def main() -> int:
                     posts_pts = 1.0
                 else:
                     posts_pts = 0.0
-                if most_recent is None:
+                _mr = days_since(most_recent, today)
+                if _mr is None:
                     recency_pts = 0.0
-                elif (today - most_recent).days <= 90:
+                elif _mr <= 90:
                     recency_pts = 2.0
-                elif (today - most_recent).days <= 180:
+                elif _mr <= 180:
                     recency_pts = 1.0
                 else:
                     recency_pts = 0.0

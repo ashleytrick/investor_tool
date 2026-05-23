@@ -162,8 +162,8 @@ def main() -> int:
                     f"({profile.get('messagesTotal', '?')} messages total)"
                 )
                 print(
-                    f"[connect_gmail] re-run with --force to switch accounts, "
-                    f"or --disconnect to unlink."
+                    "[connect_gmail] re-run with --force to switch accounts, "
+                    "or --disconnect to unlink."
                 )
                 run.note(f"already linked: {profile.get('emailAddress')}")
                 run.succeeded = 1
@@ -192,8 +192,8 @@ def main() -> int:
             f"Token saved to {token_path.name}."
         )
         print(
-            f"[connect_gmail] next: "
-            f"uv run scripts/create_gmail_drafts.py"
+            "[connect_gmail] next: "
+            "uv run scripts/create_gmail_drafts.py"
         )
         run.note(f"linked {profile.get('emailAddress')}")
         run.succeeded = 1
