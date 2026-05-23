@@ -206,17 +206,20 @@ def compute_send_now_priority(
     round_fit_score: float,
     lead_likelihood_score: float,
     composite_fit_score: float | None,
-    cold_reachability_score: float,
+    cold_reachability_score: float | None,
     spiky_belief_score: float,
     recency_bonus: float,
     major_kill: bool,
 ) -> float:
     comp = composite_fit_score if composite_fit_score is not None else 0.0
+    reachability = (
+        cold_reachability_score if cold_reachability_score is not None else 0.0
+    )
     return (
         round_fit_score * 2.0
         + lead_likelihood_score * 1.5
         + comp * 1.0
-        + cold_reachability_score * 0.5
+        + reachability * 0.5
         + recency_bonus
         + spiky_belief_score
         - (10.0 if major_kill else 0.0)
@@ -268,7 +271,9 @@ def evaluate_recommended(
         fails.append(f"employment_status={employment_status!r} not current")
     if major_kill:
         fails.append("major kill signal present")
-    if cold_reachability_score is not None and cold_reachability_score < 5.0:
+    if cold_reachability_score is None:
+        fails.append("cold_reachability_score is unknown")
+    elif cold_reachability_score < 5.0:
         fails.append(
             f"cold_reachability_score ({cold_reachability_score:.1f}) < 5.0"
         )
@@ -536,7 +541,7 @@ def main() -> int:
                     round_fit_score=rf.round_fit_score,
                     lead_likelihood_score=ll.lead_likelihood_score,
                     composite_fit_score=composite,
-                    cold_reachability_score=cold_reachability or 5.0,
+                    cold_reachability_score=cold_reachability,
                     spiky_belief_score=spiky,
                     recency_bonus=recency_bonus,
                     major_kill=major_kill,
