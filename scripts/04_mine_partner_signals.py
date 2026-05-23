@@ -22,7 +22,7 @@ import hashlib
 import json
 import pathlib
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 

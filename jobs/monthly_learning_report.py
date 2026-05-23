@@ -206,11 +206,9 @@ def main() -> int:
                 n_total = len(booked_scores) + len(not_booked_scores)
                 if n_total < MIN_SAMPLE_FOR_SUGGESTION:
                     continue
-                if not booked_scores or not_booked_scores == []:
-                    # Need at least one on each side to compute diff. Without
-                    # both sides we can't tell which way to nudge.
-                    if not booked_scores or not not_booked_scores:
-                        continue
+                # Need at least one partner on each side to compute a diff.
+                if not booked_scores or not not_booked_scores:
+                    continue
                 mean_b = mean(booked_scores)
                 mean_n = mean(not_booked_scores)
                 diff = mean_b - mean_n

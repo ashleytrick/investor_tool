@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import get_engine, signals
