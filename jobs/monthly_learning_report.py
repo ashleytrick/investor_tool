@@ -59,6 +59,7 @@ WEIGHT_DELTA_THRESHOLD = 0.5  # axis-score mean diff needed to suggest a change
 WEIGHT_STEP = 0.2             # how much to nudge weight per suggestion
 MIN_SAMPLE_FOR_SUGGESTION = 2 # minimum total (booked + not_booked) per axis
 WEIGHT_CLAMP = (0.1, 2.0)
+NO_RESPONSE_MATURE_DAYS = 14  # how long to wait before counting "no_response" as terminal
 
 CROSS_WORKSPACE_STATS_PATH = (
     pathlib.Path(__file__).resolve().parent.parent / "core" / "cross_workspace_stats.json"
@@ -102,6 +103,31 @@ def _replied(outcome) -> bool:
     return bool(outcome.reply_type) and outcome.reply_type != "no_response"
 
 
+def _is_terminal_outcome(outcome, today_dt) -> bool:
+    """True iff this outcome is mature enough to count in axis learning.
+
+    Finding 1: previously every non-booked outcome went into not_booked_scores
+    even when the partner was just 'sent' or 'recently sent / no_response'.
+    That biased weight suggestions against partners who just hadn't replied
+    yet. Now we count:
+      - booked (always terminal)
+      - any reply_type that isn't no_response (passed, asked_for_deck, etc.)
+      - reply_type=no_response only after NO_RESPONSE_MATURE_DAYS have passed
+    """
+    if outcome.meeting_booked:
+        return True
+    rt = outcome.reply_type
+    if rt and rt != "no_response":
+        return True
+    if rt == "no_response":
+        sync = outcome.synced_from_attio_at
+        if sync is None:
+            return False
+        age_days = (today_dt - sync).days if hasattr(today_dt - sync, "days") else 0
+        return age_days >= NO_RESPONSE_MATURE_DAYS
+    return False
+
+
 def _is_opted_in(ws) -> bool:
     """Cross-workspace learning is opt-in via learning.yaml or attio.yaml."""
     learning_path = ws.config_dir / "learning.yaml"
@@ -112,6 +138,40 @@ def _is_opted_in(ws) -> bool:
     attio = ws.attio or {}
     attio_inner = attio.get("attio") or attio
     return bool((attio_inner.get("learning") or {}).get("cross_workspace_opt_in"))
+
+
+def _atomic_merge_stats(path: pathlib.Path, wid: str, entry: dict) -> None:
+    """Read-modify-write the shared cross_workspace_stats.json under a
+    POSIX advisory lock so concurrent opted-in workspaces don't lose
+    each other's updates. Writes via tmp + replace() for atomicity.
+    """
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Use an explicit lockfile so we can lock even before the data file
+    # exists, and so reads/writes don't fight over the same fd.
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            existing: dict = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    existing = {}
+            existing.setdefault("contributors", [])
+            if wid not in existing["contributors"]:
+                existing["contributors"].append(wid)
+            existing.setdefault("workspace_stats", {})[wid] = entry
+            existing["last_updated"] = _now().isoformat()
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(existing, indent=2, sort_keys=False),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def _seed_outcomes(ws, engine) -> int:
@@ -191,6 +251,31 @@ def main() -> int:
             return 0
 
         # ---- by axis: mean booked vs not-booked -> suggestions ----
+        # Finding 2: clear stale unapproved suggestions before generating new
+        # ones. Otherwise re-running monthly piles up duplicate pending
+        # suggestions and `apply_axis_suggestion --all-above` applies them
+        # repeatedly (compounding the 0.2 nudge each time).
+        with engine.begin() as conn:
+            conn.execute(
+                axis_weight_suggestions.delete().where(
+                    axis_weight_suggestions.c.approved.is_(None)
+                )
+            )
+        # Finding 1: only count TERMINAL outcomes (booked, or replied
+        # non-trivially, or `no_response` aged >= NO_RESPONSE_MATURE_DAYS).
+        # SQLite returns naive datetimes; strip tzinfo so subtraction works.
+        today_dt = _now().replace(tzinfo=None)
+        terminal_outcomes = {
+            pid: o for pid, o in latest_outcomes.items()
+            if _is_terminal_outcome(o, today_dt)
+        }
+        excluded_pending = len(latest_outcomes) - len(terminal_outcomes)
+        if excluded_pending:
+            print(
+                f"[learning] excluded {excluded_pending} outcome(s) still "
+                f"pending (sent / fresh no_response) from axis learning"
+            )
+
         axes_cfg = (ws.axes or {}).get("axes") or []
         weights = {a["id"]: float(a.get("weight", 1.0)) for a in axes_cfg}
         suggestions_written = 0
@@ -199,7 +284,7 @@ def main() -> int:
                 ax_id = ax["id"]
                 booked_scores: list[float] = []
                 not_booked_scores: list[float] = []
-                for pid, outcome in latest_outcomes.items():
+                for pid, outcome in terminal_outcomes.items():
                     s = axis_scores.get(pid, {}).get(ax_id)
                     if s is None:
                         continue
@@ -292,29 +377,15 @@ def main() -> int:
 
         # ---- cross-workspace stats (opt-in only) ----
         if _is_opted_in(ws):
-            existing: dict = {}
-            if CROSS_WORKSPACE_STATS_PATH.exists():
-                try:
-                    existing = json.loads(
-                        CROSS_WORKSPACE_STATS_PATH.read_text(encoding="utf-8")
-                    )
-                except json.JSONDecodeError:
-                    existing = {}
             wid = hashlib.sha256(ws.name.encode("utf-8")).hexdigest()[:12]
-            existing.setdefault("contributors", [])
-            if wid not in existing["contributors"]:
-                existing["contributors"].append(wid)
-            existing.setdefault("workspace_stats", {})[wid] = {
+            entry = {
                 "strategy_to_reply_rate": strat_rates,
                 "reachability_bucket_to_reply_rate": reach_rates,
                 "variance_bucket_to_reply_rate": var_rates,
                 "sample_size": total,
                 "updated_at": _now().isoformat(),
             }
-            existing["last_updated"] = _now().isoformat()
-            CROSS_WORKSPACE_STATS_PATH.write_text(
-                json.dumps(existing, indent=2), encoding="utf-8"
-            )
+            _atomic_merge_stats(CROSS_WORKSPACE_STATS_PATH, wid, entry)
             print(
                 f"[learning] cross-workspace stats updated "
                 f"(workspace_hash={wid}, anonymized aggregates only)"

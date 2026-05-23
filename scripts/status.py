@@ -207,11 +207,20 @@ def main() -> int:
 
     # Recommended next command.
     print()
+    # Finding 10: don't suggest moving forward if a recent run failed.
+    # The operator needs to triage that first.
+    failed_stage = None
+    for st in expected:
+        r = last_by_stage.get(st)
+        if r and (r.records_failed or 0) > 0:
+            failed_stage = st
+            # don't break -- last in `expected` is the most-recent-in-pipeline
     next_cmd = _suggest_next(
         n_funds=n_funds, n_partners=n_partners, n_signals=n_signals,
         n_verified=n_verified, n_summaries=n_summaries,
         n_drafts=n_drafts, csv_exists=csv_path.exists(),
         n_pending_suggestions=n_pending_suggestions,
+        failed_stage=failed_stage,
     )
     print(f"== Suggested next ==\n  {next_cmd}")
     return 0
@@ -219,7 +228,15 @@ def main() -> int:
 
 def _suggest_next(*, n_funds, n_partners, n_signals, n_verified,
                   n_summaries, n_drafts, csv_exists,
-                  n_pending_suggestions) -> str:
+                  n_pending_suggestions, failed_stage=None) -> str:
+    # Finding 10: surface failure first; refuse to "suggest next stage" when
+    # the most recent run of a stage failed.
+    if failed_stage:
+        return (
+            f"FIX FIRST: stage {failed_stage} has records_failed > 0 in its "
+            f"latest run. Read the error_summary above + recent_errors before "
+            f"continuing."
+        )
     if n_funds == 0:
         return "uv run scripts/01_aggregate_sources.py"
     if n_partners == 0:

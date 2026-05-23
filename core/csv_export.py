@@ -44,12 +44,26 @@ CSV_COLUMNS: list[str] = [
 
 
 def write_review_queue(exports_dir: Path, rows: list[dict]) -> Path:
-    """Overwrite review_queue.csv with the given rows. Missing keys -> empty."""
+    """Atomically overwrite review_queue.csv with the given rows.
+
+    Write to a sibling .tmp, fsync, then replace() -- POSIX-atomic. A crash
+    mid-write previously could leave the operator's primary artifact half-
+    written; now either the new CSV lands fully or the previous CSV stays
+    intact.
+    """
     exports_dir.mkdir(parents=True, exist_ok=True)
     out_path = exports_dir / "review_queue.csv"
-    with out_path.open("w", newline="", encoding="utf-8") as fh:
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow({col: row.get(col, "") for col in CSV_COLUMNS})
+        fh.flush()
+        try:
+            import os as _os
+            _os.fsync(fh.fileno())
+        except OSError:
+            pass  # filesystems without fsync support (rare)
+    tmp_path.replace(out_path)
     return out_path

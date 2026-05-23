@@ -80,6 +80,24 @@ def _validate_choices(*, status, reply_type, meeting_outcome):
         )
 
 
+def _validate_meeting_consistency(
+    *, meeting_booked, meeting_date, meeting_outcome, status, reply_type
+):
+    """Finding 9: refuse outputs that would lie to the monthly learning
+    report. meeting_date or meeting_outcome implies meeting_booked.
+    status='meeting_booked' or reply_type='booked' also imply it."""
+    implied_by_date = bool(meeting_date) or bool(meeting_outcome)
+    implied_by_status = status == "meeting_booked" or reply_type == "booked"
+    if (implied_by_date or implied_by_status) and not meeting_booked:
+        raise SystemExit(
+            "meeting_booked=False contradicts one of: "
+            f"meeting_date={meeting_date!r}, "
+            f"meeting_outcome={meeting_outcome!r}, "
+            f"status={status!r}, reply_type={reply_type!r}. "
+            "Pass --meeting-booked if a meeting was actually booked."
+        )
+
+
 def _insert(conn, *, partner_id, status, reply_type, meeting_booked,
             meeting_date, meeting_outcome):
     conn.execute(outcomes.insert().values(
@@ -149,21 +167,30 @@ def main() -> int:
                             )
                             continue
                         try:
+                            _status = (row.get("status") or "").strip() or None
+                            _rt = (row.get("reply_type") or "").strip() or None
+                            _mo = (row.get("meeting_outcome") or "").strip() or None
+                            _mb = (row.get("meeting_booked") or "").strip().lower() in (
+                                "true", "1", "yes",
+                            )
+                            _md = _parse_date(
+                                (row.get("meeting_date") or "").strip() or None
+                            )
                             _validate_choices(
-                                status=(row.get("status") or "").strip() or None,
-                                reply_type=(row.get("reply_type") or "").strip() or None,
-                                meeting_outcome=(row.get("meeting_outcome") or "").strip() or None,
+                                status=_status, reply_type=_rt, meeting_outcome=_mo,
+                            )
+                            _validate_meeting_consistency(
+                                meeting_booked=_mb,
+                                meeting_date=_md,
+                                meeting_outcome=_mo,
+                                status=_status,
+                                reply_type=_rt,
                             )
                             _insert(
-                                conn,
-                                partner_id=pid,
-                                status=(row.get("status") or "").strip() or None,
-                                reply_type=(row.get("reply_type") or "").strip() or None,
-                                meeting_booked=(row.get("meeting_booked") or "").strip().lower() in ("true", "1", "yes"),
-                                meeting_date=_parse_date(
-                                    (row.get("meeting_date") or "").strip() or None
-                                ),
-                                meeting_outcome=(row.get("meeting_outcome") or "").strip() or None,
+                                conn, partner_id=pid,
+                                status=_status, reply_type=_rt,
+                                meeting_booked=_mb, meeting_date=_md,
+                                meeting_outcome=_mo,
                             )
                             run.succeeded += 1
                         except SystemExit as exc:
@@ -173,7 +200,9 @@ def main() -> int:
                 f"[record_outcome] from-csv: processed={run.processed} "
                 f"ok={run.succeeded} failed={run.failed} skipped={run.skipped}"
             )
-            return 0
+            # Finding 4: non-zero exit when batch had any failures so
+            # automation can't treat partial CSV imports as green.
+            return 2 if run.failed else 0
 
         # Single-record path.
         if args.partner_id not in known:
@@ -185,6 +214,13 @@ def main() -> int:
             status=args.status,
             reply_type=args.reply_type,
             meeting_outcome=args.meeting_outcome,
+        )
+        _validate_meeting_consistency(
+            meeting_booked=args.meeting_booked,
+            meeting_date=_parse_date(args.meeting_date),
+            meeting_outcome=args.meeting_outcome,
+            status=args.status,
+            reply_type=args.reply_type,
         )
         with engine.begin() as conn:
             _insert(

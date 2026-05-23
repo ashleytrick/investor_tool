@@ -223,8 +223,28 @@ def main() -> int:
         }
 
         # ---- 1) Upsert funds as companies ----
+        # Finding 6: brief Stage 8 says "for each active fund". Plus any
+        # fund that has a top-N recommended partner being synced this run
+        # -- otherwise the person->company link from step 2 dangles.
         with engine.begin() as conn:
-            fund_rows = list(conn.execute(select(funds)))
+            top_partner_fund_ids = [
+                r.fund_id for r in conn.execute(
+                    select(partners.c.fund_id)
+                    .join(
+                        partner_score_summaries,
+                        partner_score_summaries.c.partner_id == partners.c.partner_id,
+                    )
+                    .where(partner_score_summaries.c.recommended_to_send.is_(True))
+                    .order_by(partner_score_summaries.c.send_now_priority.desc())
+                    .limit(args.top)
+                )
+            ]
+            fund_rows = list(conn.execute(
+                select(funds).where(
+                    (funds.c.is_active.is_(True))
+                    | (funds.c.fund_id.in_(top_partner_fund_ids or [""]))
+                )
+            ))
         fund_attio_ids: dict[str, str] = {}
         for f in fund_rows:
             run.processed += 1
@@ -414,6 +434,9 @@ def main() -> int:
         client.close()
         print(f"[stage 8] synced {run.succeeded} record(s); "
               f"failed={run.failed} skipped={run.skipped}")
+        # Finding 7: automation must see partial sync failure as red, not green.
+        if run.failed:
+            return 2
 
     return 0
 
