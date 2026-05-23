@@ -14,11 +14,14 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
+    Index,
     Integer,
     MetaData,
     Table,
     Text,
     create_engine,
+    event,
 )
 from sqlalchemy.engine import Engine
 
@@ -41,16 +44,23 @@ runs = Table(
     Column("estimated_cost_usd", Float),
     Column("elapsed_seconds", Integer),
     Column("error_summary", Text),
+    # status.py orders by (workspace, stage, started_at desc) for "last run per
+    # stage"; this index keeps that query bounded as runs grow into the 1000s.
+    Index("ix_runs_workspace_stage_started", "workspace", "stage", "started_at"),
 )
 
 run_errors = Table(
     "run_errors", metadata,
     Column("error_id", Integer, primary_key=True, autoincrement=True),
-    Column("run_id", Integer),
+    # CASCADE: when a run row is deleted, its errors go with it. Operators
+    # almost never delete runs, but in tests / a manual rebuild this keeps
+    # run_errors from accumulating orphan rows.
+    Column("run_id", Integer, ForeignKey("runs.run_id", ondelete="CASCADE")),
     Column("record_id", Text),
     Column("error_type", Text),
     Column("error_message", Text),
     Column("occurred_at", DateTime),
+    Index("ix_run_errors_run_id", "run_id"),
 )
 
 force_refresh_log = Table(
@@ -62,6 +72,7 @@ force_refresh_log = Table(
     Column("new_value", Text),
     Column("reason", Text),
     Column("refreshed_at", DateTime),
+    Index("ix_force_refresh_log_partner_id", "partner_id"),
 )
 
 funds = Table(
@@ -84,7 +95,9 @@ partners = Table(
     "partners", metadata,
     Column("partner_id", Text, primary_key=True),
     Column("attio_record_id", Text),
-    Column("fund_id", Text),
+    # No CASCADE on partners.fund_id: removing a fund shouldn't silently
+    # nuke its partner rows. Just declare the relationship.
+    Column("fund_id", Text, ForeignKey("funds.fund_id")),
     Column("name", Text, nullable=False),
     Column("title", Text),
     Column("linkedin_url", Text),
@@ -104,6 +117,7 @@ partners = Table(
     Column("cold_reachability_partial_score", Float),
     Column("cold_reachability_partial_evidence", Text),
     Column("last_updated", DateTime),
+    Index("ix_partners_fund_id", "fund_id"),
 )
 
 source_snapshots = Table(
@@ -115,13 +129,26 @@ source_snapshots = Table(
     Column("content_hash", Text),
     Column("extracted_text", Text),
     Column("fetched_during_stage", Text),
+    # Stage 3 dedups by (source_url, content_hash) in application code. The
+    # unique index makes that contract enforceable: a future caller can't
+    # accidentally re-insert the same content. NULL content_hash is allowed
+    # for pre-hash rows (multiple NULLs coexist under SQLite UNIQUE semantics).
+    Index(
+        "ux_source_snapshots_url_hash",
+        "source_url", "content_hash",
+        unique=True,
+    ),
+    Index("ix_source_snapshots_source_url", "source_url"),
 )
 
 signals = Table(
     "signals", metadata,
     Column("signal_id", Integer, primary_key=True, autoincrement=True),
-    Column("partner_id", Text),
-    Column("snapshot_id", Integer),
+    # Signals are evidence -- do not cascade-delete with the partner. If a
+    # partner is removed, the signals stay as historical record (operator
+    # can audit "we used to think axis_3 mattered, here's the evidence").
+    Column("partner_id", Text, ForeignKey("partners.partner_id")),
+    Column("snapshot_id", Integer, ForeignKey("source_snapshots.snapshot_id")),
     Column("source_type", Text),
     Column("source_url", Text, nullable=False),
     Column("quoted_text", Text, nullable=False),
@@ -134,6 +161,10 @@ signals = Table(
     Column("signal_quality_score", Integer),
     Column("quality_reasoning", Text),
     Column("captured_at", DateTime),
+    Index("ix_signals_partner_id", "partner_id"),
+    # Stage 6/7 filter "verified=1 AND signal_quality_score>=2" repeatedly;
+    # this composite index keeps that bounded on workspaces with many signals.
+    Index("ix_signals_verified_quality", "verified", "signal_quality_score"),
 )
 
 deal_attributions = Table(
@@ -143,28 +174,45 @@ deal_attributions = Table(
     Column("round_type", Text),
     Column("round_size_usd", Integer),
     Column("announcement_date", Date),
-    Column("lead_fund_id", Text),
-    Column("attributed_partner_id", Text),
+    Column("lead_fund_id", Text, ForeignKey("funds.fund_id")),
+    Column("attributed_partner_id", Text, ForeignKey("partners.partner_id")),
     Column("source_url", Text),
     # Sector tags persisted from the Stage 3 LLM output (JSON list).
     # Surfaced by Stage 6 round_fit for recent_relevant_deals scoring.
     Column("sector_tags", Text),
     Column("captured_at", DateTime),
+    Index("ix_deal_attributions_lead_fund_id", "lead_fund_id"),
+    Index("ix_deal_attributions_attributed_partner_id", "attributed_partner_id"),
 )
 
 scores = Table(
     "scores", metadata,
-    Column("partner_id", Text, primary_key=True),
+    # CASCADE: removing a partner removes their per-axis scores.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
     Column("axis_id", Text, primary_key=True),
     Column("score", Float),
     Column("supporting_signal_ids", Text),
     Column("confidence", Text),
+    # NOTE: scored_at is in the PK by historical accident -- a different
+    # timestamp creates a new row. Stage 6 deletes-then-inserts per partner
+    # so duplicates don't accumulate; leaving the PK shape unchanged to
+    # avoid a destructive migration on operator dbs. Documented so a future
+    # change can drop it intentionally.
     Column("scored_at", DateTime, primary_key=True),
 )
 
 partner_score_summaries = Table(
     "partner_score_summaries", metadata,
-    Column("partner_id", Text, primary_key=True),
+    # CASCADE: removing a partner removes their summary row.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
     Column("composite_fit_score", Float),
     Column("axis_max_score", Float),
     Column("axis_score_variance", Float),
@@ -189,12 +237,19 @@ partner_score_summaries = Table(
     Column("recommended_to_send", Boolean),
     Column("recommendation_reasoning", Text),
     Column("scored_at", DateTime),
+    # Stage 7 orders by send_now_priority DESC LIMIT N every run.
+    Index("ix_pss_send_now_priority", "send_now_priority"),
 )
 
 email_drafts = Table(
     "email_drafts", metadata,
     Column("draft_id", Integer, primary_key=True, autoincrement=True),
-    Column("partner_id", Text),
+    # CASCADE: drafts belong to the partner; removing the partner removes
+    # their drafts.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+    ),
     Column("batch_id", Text),
     Column("strategy", Text),
     Column("subject", Text),
@@ -213,24 +268,36 @@ email_drafts = Table(
     # Gmail draft id once create_gmail_drafts.py has run; idempotent guard.
     Column("pushed_to_gmail_at", DateTime),
     Column("gmail_draft_id", Text),
+    # Stage 7 does `DELETE FROM email_drafts WHERE partner_id = ?` for every
+    # partner in the batch; this index keeps that bounded.
+    Index("ix_email_drafts_partner_id", "partner_id"),
+    Index("ix_email_drafts_batch_id", "batch_id"),
 )
 
 followup_drafts = Table(
     "followup_drafts", metadata,
     Column("followup_id", Integer, primary_key=True, autoincrement=True),
-    Column("partner_id", Text),
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+    ),
     Column("body", Text),
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
+    Index("ix_followup_drafts_partner_id", "partner_id"),
 )
 
 deck_request_responses = Table(
     "deck_request_responses", metadata,
     Column("response_id", Integer, primary_key=True, autoincrement=True),
-    Column("partner_id", Text),
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+    ),
     Column("body", Text),
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
+    Index("ix_deck_request_responses_partner_id", "partner_id"),
 )
 
 batch_qa_reports = Table(
@@ -245,6 +312,7 @@ batch_qa_reports = Table(
     Column("passed", Boolean),
     Column("failure_reasons", Text),
     Column("generated_at", DateTime),
+    Index("ix_batch_qa_reports_batch_id", "batch_id"),
 )
 
 attio_sync_log = Table(
@@ -257,18 +325,22 @@ attio_sync_log = Table(
     Column("success", Boolean),
     Column("error_message", Text),
     Column("synced_at", DateTime),
+    Index("ix_attio_sync_log_local_id", "local_id"),
 )
 
 outcomes = Table(
     "outcomes", metadata,
     Column("outcome_id", Integer, primary_key=True, autoincrement=True),
-    Column("partner_id", Text),
+    # Outcomes are events -- do not cascade. If a partner is removed, the
+    # outcome history stays for audit.
+    Column("partner_id", Text, ForeignKey("partners.partner_id")),
     Column("outreach_status", Text),
     Column("reply_type", Text),
     Column("meeting_booked", Boolean),
     Column("meeting_date", Date),
     Column("meeting_outcome", Text),
     Column("synced_from_attio_at", DateTime),
+    Index("ix_outcomes_partner_id", "partner_id"),
 )
 
 calibration_cohorts = Table(
@@ -279,6 +351,9 @@ calibration_cohorts = Table(
     Column("outcome", Text),  # "green", "yellow", "red", or NULL while in flight
     Column("reason", Text),
     Column("completed_at", DateTime),
+    # Stage 7's Gate 5.5 query: WHERE outcome='green' AND completed_at >= cutoff
+    # ORDER BY completed_at DESC LIMIT 1
+    Index("ix_calibration_cohorts_outcome_completed", "outcome", "completed_at"),
 )
 
 learning_runs = Table(
@@ -307,7 +382,19 @@ axis_weight_suggestions = Table(
     Column("sample_size", Integer),
     Column("approved", Boolean, default=None),
     Column("approved_at", DateTime),
+    Index("ix_axis_weight_suggestions_approved", "approved"),
 )
+
+
+def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
+    """SQLite ships with FK checking OFF by default per connection. Without
+    this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
+    are inert (the schema records the relationship but the engine never
+    enforces it). Set the pragma at every connect so cascades fire and
+    orphan inserts are rejected."""
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
+    cur.close()
 
 
 def get_engine(db_url: str) -> Engine:
@@ -321,9 +408,16 @@ def get_engine(db_url: str) -> Engine:
         db_path = pathlib.Path(db_url[len("sqlite:///"):])
         db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(db_url, future=True)
+    if engine.dialect.name == "sqlite":
+        event.listen(engine, "connect", _enable_sqlite_foreign_keys)
     metadata.create_all(engine)
     # Defensive: a pre-existing SQLite db may lack columns added in later
     # sessions. metadata.create_all does not ALTER. Sync any drift here.
+    # NOTE: it also doesn't ALTER to add FK constraints -- ForeignKey
+    # declarations only apply to freshly-created tables. Operator dbs from
+    # earlier sessions retain their FK-less schema until the table is
+    # dropped + recreated. Indexes added here ARE picked up on existing
+    # tables because metadata.create_all emits CREATE INDEX IF NOT EXISTS.
     _sync_columns_with_metadata(engine)
     return engine
 

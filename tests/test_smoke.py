@@ -27,6 +27,10 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Allow `from core.db import ...` in tests that exercise the library directly
+# (test_db_integrity_invariants does). The pipeline scripts add this themselves,
+# but pytest is launched from the repo root and doesn't inherit the same path.
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def _run(script: str, *args: str, cwd: Path) -> subprocess.CompletedProcess:
@@ -526,3 +530,129 @@ def test_manual_override_skip_without_force():
         ).fetchone()[0]
         assert flag2 == 1
         c.close()
+
+
+def test_db_integrity_invariants():
+    """DB-level guarantees that are easy to assert and easy to regress:
+      - FK enforcement is ON (orphan inserts rejected).
+      - Hot-path indexes exist.
+      - source_snapshots UNIQUE (source_url, content_hash) holds.
+      - Stage 6 invalidates orphan partner_score_summaries when a partner
+        loses all qualifying signals (Batch 1 fix; previously only verified
+        indirectly via row counts in the full pipeline).
+      - upsert() refuses non-PK pk_cols.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+            ("06_score_candidates.py", ()),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        c.execute("PRAGMA foreign_keys = ON")
+
+        # --- hot-path indexes exist (delete-by-partner, send_now_priority
+        # ordering, verified+quality scans, etc.) ---
+        index_rows = c.execute(
+            "select name, tbl_name from sqlite_master where type='index' "
+            "and (name like 'ix_%' or name like 'ux_%')"
+        ).fetchall()
+        index_names = {r[0] for r in index_rows}
+        for needed in (
+            "ix_signals_partner_id",
+            "ix_signals_verified_quality",
+            "ix_pss_send_now_priority",
+            "ix_email_drafts_partner_id",
+            "ix_runs_workspace_stage_started",
+            "ux_source_snapshots_url_hash",
+        ):
+            assert needed in index_names, (
+                f"missing index {needed!r}; got {sorted(index_names)}"
+            )
+
+        # --- FK enforcement is active: orphan insert rejected ---
+        try:
+            c.execute(
+                "insert into partner_score_summaries (partner_id) "
+                "values ('totally-not-a-real-partner-id')"
+            )
+            c.commit()
+            assert False, "expected FK constraint violation on orphan insert"
+        except sqlite3.IntegrityError:
+            pass  # expected
+
+        # --- UNIQUE (source_url, content_hash) enforced ---
+        row = c.execute(
+            "select source_url, content_hash from source_snapshots "
+            "where content_hash is not null limit 1"
+        ).fetchone()
+        assert row is not None, "no source_snapshots to test UNIQUE against"
+        url, h = row
+        try:
+            c.execute(
+                "insert into source_snapshots (source_url, fetched_at, "
+                "content_hash) values (?, datetime('now'), ?)",
+                (url, h),
+            )
+            c.commit()
+            assert False, "expected UNIQUE constraint violation on duplicate hash"
+        except sqlite3.IntegrityError:
+            pass  # expected
+
+        # --- Batch 1: orphan partner_score_summaries gets invalidated when
+        # the partner loses all qualifying signals on the next Stage 6 run.
+        # Pick a partner who currently HAS a summary, blank their signals,
+        # re-run Stage 6, expect their summary row gone.
+        pid_row = c.execute(
+            "select partner_id from partner_score_summaries limit 1"
+        ).fetchone()
+        assert pid_row is not None
+        target_pid = pid_row[0]
+        c.execute(
+            "delete from signals where partner_id = ?", (target_pid,)
+        )
+        c.commit()
+        c.close()
+
+        _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        remaining = c.execute(
+            "select count(*) from partner_score_summaries where partner_id = ?",
+            (target_pid,),
+        ).fetchone()[0]
+        assert remaining == 0, (
+            f"partner_score_summaries for {target_pid!r} not invalidated "
+            f"after their signals were removed (Batch 1 regression)"
+        )
+        # Per-axis scores for the same partner are also cleaned up.
+        score_count = c.execute(
+            "select count(*) from scores where partner_id = ?", (target_pid,),
+        ).fetchone()[0]
+        assert score_count == 0, (
+            f"scores rows for {target_pid!r} not cleaned up alongside summary"
+        )
+        c.close()
+
+        # --- upsert() guard rejects pk_cols that aren't the actual PK ---
+        from core.db import get_engine, upsert, funds
+        engine = get_engine(f"sqlite:///{db}")
+        with engine.begin() as conn:
+            try:
+                upsert(conn, funds, ["name"], {"name": "Should Fail"})
+                assert False, "upsert() should refuse non-PK pk_cols"
+            except ValueError as exc:
+                assert "primary_key" in str(exc)
