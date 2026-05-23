@@ -116,6 +116,20 @@ def main() -> int:
                     f"at {rec.pushed_to_gmail_at}. Use --regenerate to force."
                 )
                 continue
+            # Refuse to push an empty draft. The schema permits NULL on body
+            # / subject (no NOT NULL on email_drafts) and Gmail's API would
+            # reject the request with a cryptic "Invalid request" -- catch
+            # it here so the operator sees which partner is bad.
+            if not (rec.subject or "").strip() or not (rec.body or "").strip():
+                run.failed += 1
+                msg = (
+                    f"recommended draft has empty subject or body "
+                    f"(subject={rec.subject!r}, "
+                    f"body_len={len(rec.body or '')})"
+                )
+                run.log_error(row.partner_id, "empty_draft", msg)
+                print(f"[gmail_drafts] {row.partner_id}: FAILED -- {msg}")
+                continue
             try:
                 draft_id, url = gmail.create_draft(
                     to_email=row.email,

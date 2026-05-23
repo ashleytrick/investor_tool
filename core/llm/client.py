@@ -129,9 +129,15 @@ def _extract_json(text: str) -> dict:
     """Pull a JSON object out of model text, tolerating code fences."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.split("```", 2)[1]
-        if cleaned.lstrip().lower().startswith("json"):
-            cleaned = cleaned.lstrip()[4:]
+        # A well-formed fence has at least an opening and closing ```; a
+        # malformed single-fence response (model truncated mid-output) used
+        # to IndexError here. Fall through to the substring scan instead so
+        # we still try to recover a JSON object.
+        parts = cleaned.split("```", 2)
+        if len(parts) >= 2:
+            cleaned = parts[1]
+            if cleaned.lstrip().lower().startswith("json"):
+                cleaned = cleaned.lstrip()[4:]
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end < start:

@@ -63,7 +63,14 @@ def write_review_queue(exports_dir: Path, rows: list[dict]) -> Path:
         try:
             import os as _os
             _os.fsync(fh.fileno())
-        except OSError:
-            pass  # filesystems without fsync support (rare)
+        except OSError as exc:
+            # Don't swallow silently: an fsync failure here usually means
+            # disk-full or permission trouble, and the operator deserves to
+            # see it. The atomic rename still happens; we just surface that
+            # durability is not guaranteed on this filesystem write.
+            print(
+                f"[csv_export] WARN: fsync({tmp_path.name}) failed: {exc}. "
+                f"CSV was written but may not be flushed to disk yet."
+            )
     tmp_path.replace(out_path)
     return out_path

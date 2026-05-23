@@ -656,3 +656,22 @@ def test_db_integrity_invariants():
                 assert False, "upsert() should refuse non-PK pk_cols"
             except ValueError as exc:
                 assert "primary_key" in str(exc)
+
+
+def test_extract_json_tolerates_malformed_fences():
+    """_extract_json must not IndexError on a single-fence response
+    (Batch 7: model truncation used to crash the JSON extractor)."""
+    from core.llm.client import _extract_json
+
+    # Well-formed: opening + closing fence
+    assert _extract_json('```json\n{"a": 1}\n```')["a"] == 1
+    # Truncated: only an opening fence -- previously IndexError on split.
+    assert _extract_json('```json\n{"a": 2}')["a"] == 2
+    # No fence at all
+    assert _extract_json('  {"a": 3}  ')["a"] == 3
+    # Embedded prose around the JSON
+    assert _extract_json('Sure thing! {"a": 4} hope that helps.')["a"] == 4
+    # No JSON at all -> ValueError, NOT IndexError
+    import pytest
+    with pytest.raises(ValueError):
+        _extract_json("```\nno json here at all\n```")
