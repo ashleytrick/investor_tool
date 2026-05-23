@@ -94,6 +94,8 @@ def main() -> int:
 
     with RunLogger(engine, ws.name, STAGE) as run:
         if args.list:
+            # Findings 50, 55: show the FROZEN values + freshness so the
+            # operator can see WHAT they pinned and how stale it is.
             with engine.begin() as conn:
                 summary_rows = list(conn.execute(
                     select(
@@ -101,6 +103,11 @@ def main() -> int:
                         partner_score_summaries.c.manual_score_override,
                         partner_score_summaries.c.manual_recommended_override,
                         partner_score_summaries.c.manual_override_reason,
+                        partner_score_summaries.c.composite_fit_score,
+                        partner_score_summaries.c.round_fit_score,
+                        partner_score_summaries.c.lead_likelihood_score,
+                        partner_score_summaries.c.recommended_to_send,
+                        partner_score_summaries.c.scored_at,
                     ).where(
                         (partner_score_summaries.c.manual_score_override.is_(True))
                         | (partner_score_summaries.c.manual_recommended_override.is_(True))
@@ -120,8 +127,22 @@ def main() -> int:
                     flags.append("score")
                 if r.manual_recommended_override:
                     flags.append("recommended")
+                age = "?"
+                if r.scored_at:
+                    try:
+                        delta = datetime.now(timezone.utc) - r.scored_at.replace(
+                            tzinfo=timezone.utc
+                        )
+                        age = f"{delta.days}d ago"
+                    except (AttributeError, TypeError):
+                        age = str(r.scored_at)
                 print(
                     f"[overrides] {r.partner_id}: {'+'.join(flags)} | "
+                    f"frozen composite={r.composite_fit_score} "
+                    f"round_fit={r.round_fit_score} "
+                    f"lead={r.lead_likelihood_score} "
+                    f"recommended={r.recommended_to_send} | "
+                    f"scored_at={age} | "
                     f"reason={r.manual_override_reason!r}"
                 )
             for r in warm_rows:
@@ -159,7 +180,22 @@ def main() -> int:
             return 0
 
         if args.clear:
+            # Finding 49: confirm the partner actually exists before claiming
+            # success. A typo would previously affect zero rows and still
+            # exit 0.
             with engine.begin() as conn:
+                exists = conn.execute(
+                    select(partners.c.partner_id).where(
+                        partners.c.partner_id == pid
+                    )
+                ).first()
+                if not exists:
+                    print(
+                        f"[overrides] partner {pid!r} not found; nothing cleared."
+                    )
+                    run.failed = 1
+                    run.log_error(pid, "not_found", "no such partner")
+                    return 2
                 conn.execute(
                     partner_score_summaries.update()
                     .where(partner_score_summaries.c.partner_id == pid)

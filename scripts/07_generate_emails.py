@@ -978,7 +978,15 @@ def main() -> int:
         qa = evaluate_batch(recommended_drafts, all_drafts)
 
         # ---- persistence ----
-        partner_ids_in_batch = [r.partner_id for r in rows]
+        # Stale-state invalidation (Findings 11, 115, 116):
+        # Only delete prior drafts for partners we ACTUALLY generated new
+        # output for. If LLM generation crashed for partner X mid-batch,
+        # X's old drafts must not be wiped without replacement -- otherwise
+        # a flaky LLM run silently erases the operator's prior usable
+        # batch for those partners.
+        partner_ids_in_batch = [
+            ctx["partner_id"] for ctx, _output, _ in partner_outputs
+        ]
         with engine.begin() as conn:
             for pid in partner_ids_in_batch:
                 conn.execute(delete(email_drafts).where(email_drafts.c.partner_id == pid))

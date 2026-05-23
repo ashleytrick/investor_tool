@@ -411,6 +411,30 @@ def main() -> int:
             try:
                 p_signals = verified_signals_by_partner.get(p.partner_id, [])
                 if not p_signals:
+                    # Stale-state invalidation (Findings 1 + 3): if a partner
+                    # has no qualifying signals, remove their stale summary
+                    # + scores so downstream stages don't carry yesterday's
+                    # decision forward. Preserve rows that the operator has
+                    # explicitly pinned with a manual override.
+                    if existing and not (
+                        existing_score_override or existing_rec_override
+                    ):
+                        with engine.begin() as conn:
+                            conn.execute(
+                                partner_score_summaries.delete().where(
+                                    partner_score_summaries.c.partner_id
+                                    == p.partner_id
+                                )
+                            )
+                            conn.execute(
+                                scores.delete().where(
+                                    scores.c.partner_id == p.partner_id
+                                )
+                            )
+                        run.note(
+                            f"invalidated stale summary for {p.partner_id} "
+                            f"(no current verified quality>=2 signals)"
+                        )
                     run.skipped += 1
                     continue
                 fund = fund_rows.get(p.fund_id)
