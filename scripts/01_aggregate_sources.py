@@ -20,6 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
+from core.validate_config import preflight_or_exit
 from core.db import funds, get_engine, upsert
 from core.http_client import HttpClient
 from core.ids import fund_id_for, normalize_domain
@@ -67,6 +68,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    preflight_or_exit(ws, stage=STAGE)
     print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     public_lists = ws.sources.get("public_lists") or []

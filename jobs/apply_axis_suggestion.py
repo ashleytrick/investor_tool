@@ -34,6 +34,7 @@ from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import axis_weight_suggestions, get_engine
 from core.runs import RunLogger
+from core.validate_config import preflight_or_exit
 
 STAGE = "apply_axis_suggestion"
 BACKUP_KEEP = 10  # rotate; keep this many most-recent axes.yaml backups
@@ -140,6 +141,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    preflight_or_exit(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     print_banner(ws, stage=STAGE)
 

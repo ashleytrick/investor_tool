@@ -30,6 +30,7 @@ from sqlalchemy import delete, select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
+from core.validate_config import preflight_or_exit
 from core.db import (
     deal_attributions,
     force_refresh_log,
@@ -308,6 +309,7 @@ def main() -> int:
         parser.error("--force-rescore requires --reason \"...\"")
 
     ws = load_workspace(args.workspace)
+    preflight_or_exit(ws, stage=STAGE)
     print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)

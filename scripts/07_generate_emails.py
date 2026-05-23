@@ -44,6 +44,7 @@ from sqlalchemy import delete, select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
+from core.validate_config import preflight_or_exit
 from core.csv_export import write_review_queue
 from core.db import (
     batch_qa_reports,
@@ -702,6 +703,12 @@ def main() -> int:
         )
 
     ws = load_workspace(args.workspace)
+    # Examples anchor the LIVE LLM prompt. Stub mode doesn't call the LLM,
+    # so we only require examples when ANTHROPIC_API_KEY is set.
+    preflight_or_exit(
+        ws, stage=STAGE,
+        require_examples=bool(ws.env("ANTHROPIC_API_KEY")),
+    )
     print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)

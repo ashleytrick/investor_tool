@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
+from core.validate_config import preflight_or_exit
 from core.db import get_engine, signals
 from core.llm.client import LLMClient
 from core.runs import RunLogger
@@ -51,6 +52,7 @@ def main() -> int:
         )
 
     ws = load_workspace(args.workspace)
+    preflight_or_exit(ws, stage=STAGE)
     print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)

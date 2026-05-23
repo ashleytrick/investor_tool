@@ -16,6 +16,7 @@ from sqlalchemy import desc, func, select
 
 from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
+from core.validate_config import validate_workspace_config
 from core.db import (
     axis_weight_suggestions,
     deal_attributions,
@@ -48,6 +49,13 @@ def main() -> int:
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
     print_banner(ws, stage="status")
+    # status.py never refuses -- the operator runs it to diagnose, so surface
+    # validation issues as warnings instead of an exit-2.
+    config_issues = validate_workspace_config(ws)
+    if config_issues:
+        print(f"\n[status] CONFIG WARNINGS ({len(config_issues)}):")
+        for s in config_issues:
+            print(f"  - {s}")
     csv_path = ws.exports_dir / "review_queue.csv"
 
     with engine.begin() as conn:
