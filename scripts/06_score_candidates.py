@@ -332,12 +332,17 @@ def main() -> int:
         # Per-fund deals (for round_fit recent_relevant_deals + has_led_recently).
         deals_by_fund: dict[str, list[dict]] = {}
         for d in conn.execute(select(deal_attributions)):
+            tags_raw = d.sector_tags
+            try:
+                sector_tags = json.loads(tags_raw) if tags_raw else []
+            except (TypeError, ValueError):
+                sector_tags = []
             deals_by_fund.setdefault(d.lead_fund_id, []).append({
                 "company": d.company,
                 "round_type": d.round_type,
                 "round_size_usd": d.round_size_usd,
                 "announcement_date": d.announcement_date,
-                "sector_tags": [],  # not stored in deal_attributions yet; Stage 3 limitation
+                "sector_tags": sector_tags,
                 "source_url": d.source_url,
             })
         # Per-partner attributed deals (for lead_likelihood).
@@ -448,15 +453,35 @@ def main() -> int:
                     cs, ws.axes
                 )
 
-                # Stage 4: cold_reachability = partial + recent-signal bonus.
+                # cold_reachability_score: combines Stage-4 LLM partial (weight
+                # 0.6 -> max contribution 6.0) with deterministic components:
+                # post count in last 12mo (up to 2.0) and recency of last post
+                # (up to 2.0). Max 10.0. Brief Step 4 also lists a contact-info
+                # component derived from fund-site scraping; that lands when
+                # Stage 2 enrichment persists contact-info presence.
                 most_recent = max((s["date"] for s in p_signals if s.get("date")),
                                   default=None)
-                recent_bonus_for_reach = 1.0 if (
-                    most_recent and (today - most_recent).days <= 180
-                ) else 0.0
+                post_count_12mo = sum(
+                    1 for s in p_signals
+                    if s.get("date") and (today - s["date"]).days <= 365
+                )
+                if post_count_12mo >= 3:
+                    posts_pts = 2.0
+                elif post_count_12mo >= 1:
+                    posts_pts = 1.0
+                else:
+                    posts_pts = 0.0
+                if most_recent is None:
+                    recency_pts = 0.0
+                elif (today - most_recent).days <= 90:
+                    recency_pts = 2.0
+                elif (today - most_recent).days <= 180:
+                    recency_pts = 1.0
+                else:
+                    recency_pts = 0.0
                 partial = p.cold_reachability_partial_score
                 cold_reachability = (
-                    max(0.0, min(10.0, float(partial) + recent_bonus_for_reach))
+                    max(0.0, min(10.0, float(partial) * 0.6 + posts_pts + recency_pts))
                     if partial is not None else None
                 )
 

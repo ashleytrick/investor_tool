@@ -141,6 +141,7 @@ def main() -> int:
                     stub_response=ann.get("_attribution"),
                 )
                 lead_fund_id = match_fund(deal.lead_investor, funds_by_name)
+                sector_tags_json = json.dumps(deal.sector_tags or [])
                 rows: list[dict] = []
                 for ap in deal.attributed_partners:
                     ap_fund_id = match_fund(ap.fund, funds_by_name)
@@ -156,6 +157,7 @@ def main() -> int:
                             "lead_fund_id": lead_fund_id,
                             "attributed_partner_id": pid,
                             "source_url": source_url,
+                            "sector_tags": sector_tags_json,
                             "captured_at": _now(),
                         })
                 if not rows and lead_fund_id:
@@ -167,6 +169,7 @@ def main() -> int:
                         "lead_fund_id": lead_fund_id,
                         "attributed_partner_id": None,
                         "source_url": source_url,
+                        "sector_tags": sector_tags_json,
                         "captured_at": _now(),
                     })
                 if not rows:

@@ -141,6 +141,9 @@ deal_attributions = Table(
     Column("lead_fund_id", Text),
     Column("attributed_partner_id", Text),
     Column("source_url", Text),
+    # Sector tags persisted from the Stage 3 LLM output (JSON list).
+    # Surfaced by Stage 6 round_fit for recent_relevant_deals scoring.
+    Column("sector_tags", Text),
     Column("captured_at", DateTime),
 )
 
