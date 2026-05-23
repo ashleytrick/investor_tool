@@ -234,13 +234,17 @@ def main() -> int:
                     )
                     for p in enrichment.current_partners:
                         pid = partner_id_for(fund["domain"], p.name)
+                        # Team page is a single-source recent observation, so
+                        # this counts as "likely_current" per the brief's
+                        # employment confidence ladder. LinkedIn cross-check
+                        # (-> "verified_current") is a later session.
                         upsert(conn, partners, ["partner_id"], {
                             "partner_id": pid,
                             "fund_id": fund["fund_id"],
                             "name": p.name,
                             "title": p.title,
                             "bio": p.bio_snippet,
-                            "employment_status": "uncertain",
+                            "employment_status": "likely_current",
                             "last_updated": _now(),
                         })
                 run.succeeded += 1

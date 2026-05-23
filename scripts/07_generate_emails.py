@@ -254,8 +254,8 @@ def main() -> int:
                 ))
 
             # --- Deterministic-ish scoring (stubs return canned values) ---
-            rf = compute_round_fit(fund, partner, ws.company)
-            ll = compute_lead_likelihood(partner, [])
+            rf = compute_round_fit(fund, partner, [], False, ws.company)
+            ll = compute_lead_likelihood(partner, [], None)
             # Canned 4-axis composite for the slice (Session 6 builds the real one).
             axis_scores = [8.0, 7.0, 5.0, 6.0]
             composite = sum(axis_scores) / len(axis_scores)
