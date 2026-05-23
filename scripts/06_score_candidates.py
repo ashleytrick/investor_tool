@@ -31,6 +31,7 @@ from sqlalchemy import delete, select
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import (
     deal_attributions,
+    force_refresh_log,
     funds,
     get_engine,
     partner_score_summaries,
@@ -39,6 +40,18 @@ from core.db import (
     signals,
     upsert,
 )
+
+# Fields preserved when manual_score_override is set on a partner.
+SCORE_PROTECTED_FIELDS = {
+    "composite_fit_score", "axis_max_score", "axis_score_variance",
+    "spiky_belief_score", "round_fit_score", "round_fit_reasoning",
+    "lead_likelihood_score", "lead_likelihood_signals",
+    "cold_reachability_score", "send_now_priority",
+}
+# Fields preserved when manual_recommended_override is set.
+RECOMMENDED_PROTECTED_FIELDS = {
+    "recommended_to_send", "recommendation_reasoning",
+}
 from core.lead_likelihood import compute_lead_likelihood
 from core.llm.client import MODEL_BATCH, LLMClient
 from core.round_fit import compute_round_fit
@@ -269,7 +282,24 @@ def evaluate_recommended(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 6 candidate scoring.")
     add_workspace_arg(parser)
+    parser.add_argument(
+        "--force-rescore", action="store_true",
+        help="Bypass manual_score_override / manual_recommended_override and "
+             "overwrite affected fields. Requires --reason.",
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help="Required with --force-rescore: justification logged per field "
+             "change in force_refresh_log.",
+    )
+    parser.add_argument(
+        "--partner-id", action="append", default=None,
+        help="Limit scoring to a specific partner_id (repeatable). Pairs well "
+             "with --force-rescore for targeted refresh.",
+    )
     args = parser.parse_args()
+    if args.force_rescore and not args.reason:
+        parser.error("--force-rescore requires --reason \"...\"")
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
@@ -327,11 +357,45 @@ def main() -> int:
 
     cutoff_18mo = today - timedelta(days=ACTIVITY_WINDOW_DAYS)
 
+    partner_id_filter = set(args.partner_id) if args.partner_id else None
+
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
         recommended_count = 0
         for p in partner_rows:
             run.processed += 1
+            if partner_id_filter and p.partner_id not in partner_id_filter:
+                run.skipped += 1
+                continue
+
+            # Manual override gate: routine runs never overwrite a partner whose
+            # user-set flags are True. --force-rescore --reason bypasses this and
+            # logs every changed field to force_refresh_log.
+            with engine.begin() as conn:
+                existing = conn.execute(
+                    select(partner_score_summaries).where(
+                        partner_score_summaries.c.partner_id == p.partner_id
+                    )
+                ).first()
+            existing_score_override = bool(
+                existing and existing.manual_score_override
+            )
+            existing_rec_override = bool(
+                existing and existing.manual_recommended_override
+            )
+            if (
+                (existing_score_override or existing_rec_override)
+                and not args.force_rescore
+            ):
+                run.skipped += 1
+                print(
+                    f"[stage 6] {p.partner_id}: manual override set "
+                    f"(score={existing_score_override}, "
+                    f"recommended={existing_rec_override}); "
+                    "skipping. Use --force-rescore --reason \"...\" to overwrite."
+                )
+                continue
+
             try:
                 p_signals = verified_signals_by_partner.get(p.partner_id, [])
                 if not p_signals:
@@ -437,34 +501,59 @@ def main() -> int:
                 if recommended:
                     recommended_count += 1
 
-                # ---- persist ----
+                # ---- build values dict; preserve overridden fields/flags ----
+                new_values = {
+                    "partner_id": p.partner_id,
+                    "composite_fit_score": composite,
+                    "axis_max_score": axis_max,
+                    "axis_score_variance": variance,
+                    "spiky_belief_score": spiky,
+                    "score_confidence": score_conf,
+                    "verified_signal_count": len(p_signals),
+                    "quality_2_plus_signal_count": len(p_signals),
+                    "distinct_source_type_count": distinct_source_types,
+                    "most_recent_signal_date": most_recent,
+                    "major_kill_signal_present": major_kill,
+                    "kill_signal_summary": kill_summary,
+                    "cold_reachability_score": cold_reachability,
+                    "round_fit_score": rf.round_fit_score,
+                    "round_fit_reasoning": rf.round_fit_reasoning,
+                    "lead_likelihood_score": ll.lead_likelihood_score,
+                    "lead_likelihood_signals": ll.lead_likelihood_signals,
+                    "send_now_priority": send_now,
+                    "employment_status": p.employment_status,
+                    "recommended_to_send": recommended,
+                    "recommendation_reasoning": rec_reason,
+                    "scored_at": _now(),
+                }
+                # Manual override flags + reason are preserved from existing
+                # row (never silently reset by routine OR forced runs).
+                new_values["manual_score_override"] = existing_score_override
+                new_values["manual_recommended_override"] = existing_rec_override
+                new_values["manual_override_reason"] = (
+                    existing.manual_override_reason if existing else None
+                )
+                # If --force-rescore reached an overridden record, log every
+                # changed field to force_refresh_log before the upsert.
+                if args.force_rescore and existing and (
+                    existing_score_override or existing_rec_override
+                ):
+                    with engine.begin() as conn:
+                        for field, new_v in new_values.items():
+                            if field == "scored_at":
+                                continue
+                            old_v = getattr(existing, field, None)
+                            if old_v != new_v:
+                                conn.execute(force_refresh_log.insert().values(
+                                    partner_id=p.partner_id,
+                                    field_name=field,
+                                    old_value=str(old_v),
+                                    new_value=str(new_v),
+                                    reason=args.reason,
+                                    refreshed_at=_now(),
+                                ))
                 with engine.begin() as conn:
-                    upsert(conn, partner_score_summaries, ["partner_id"], {
-                        "partner_id": p.partner_id,
-                        "composite_fit_score": composite,
-                        "axis_max_score": axis_max,
-                        "axis_score_variance": variance,
-                        "spiky_belief_score": spiky,
-                        "score_confidence": score_conf,
-                        "verified_signal_count": len(p_signals),
-                        "quality_2_plus_signal_count": len(p_signals),
-                        "distinct_source_type_count": distinct_source_types,
-                        "most_recent_signal_date": most_recent,
-                        "major_kill_signal_present": major_kill,
-                        "kill_signal_summary": kill_summary,
-                        "cold_reachability_score": cold_reachability,
-                        "round_fit_score": rf.round_fit_score,
-                        "round_fit_reasoning": rf.round_fit_reasoning,
-                        "lead_likelihood_score": ll.lead_likelihood_score,
-                        "lead_likelihood_signals": ll.lead_likelihood_signals,
-                        "send_now_priority": send_now,
-                        "employment_status": p.employment_status,
-                        "manual_score_override": False,
-                        "manual_recommended_override": False,
-                        "recommended_to_send": recommended,
-                        "recommendation_reasoning": rec_reason,
-                        "scored_at": _now(),
-                    })
+                    upsert(conn, partner_score_summaries, ["partner_id"], new_values)
                     # Replace per-axis scores for this partner.
                     conn.execute(delete(scores).where(scores.c.partner_id == p.partner_id))
                     for ax_id, ax_data in cs.axis_scores.items():

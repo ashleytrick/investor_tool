@@ -31,6 +31,7 @@ class RunLogger:
         self._llm_usage: LLMUsage | None = None
         self._t0 = 0.0
         self._errors: list[tuple] = []
+        self._notes: list[str] = []  # informational; joined into error_summary
 
     def __enter__(self) -> "RunLogger":
         self._t0 = time.monotonic()
@@ -48,6 +49,12 @@ class RunLogger:
     def attach_llm_usage(self, usage: LLMUsage) -> None:
         self._llm_usage = usage
 
+    def note(self, msg: str) -> None:
+        """Add an informational note. Persisted in the run's error_summary
+        alongside any errors so audit fields (e.g. bulk-ready approvals) are
+        captured even when the run otherwise succeeds."""
+        self._notes.append(msg)
+
     def log_error(self, record_id: str, error_type: str, message: str) -> None:
         self._errors.append((record_id, error_type, message))
         with self.engine.begin() as conn:
@@ -64,12 +71,15 @@ class RunLogger:
     def __exit__(self, exc_type, exc, tb) -> bool:
         elapsed = int(time.monotonic() - self._t0)
         usage = self._llm_usage or LLMUsage()
-        error_summary = None
+        parts: list[str] = []
         if exc is not None:
-            error_summary = f"{exc_type.__name__}: {exc}"
-            self.log_error("__run__", "fatal", error_summary)
+            err = f"{exc_type.__name__}: {exc}"
+            parts.append(err)
+            self.log_error("__run__", "fatal", err)
         elif self._errors:
-            error_summary = f"{len(self._errors)} record error(s)"
+            parts.append(f"{len(self._errors)} record error(s)")
+        parts.extend(self._notes)
+        error_summary = "; ".join(parts) if parts else None
 
         with self.engine.begin() as conn:
             conn.execute(

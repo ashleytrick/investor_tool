@@ -599,12 +599,27 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+READY_TO_SEND_DAILY_CEILING = 25
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 7 email generation + CSV write.")
     add_workspace_arg(parser)
     parser.add_argument("--top", type=int, default=25,
                         help="Top-N partners by send_now_priority (Gate 5 uses 5).")
+    parser.add_argument(
+        "--approve-bulk-ready", action="store_true",
+        help="Required to mark more than 25 partners as ready_to_send in a "
+             "single run (Brief Rule 16 hard ceiling). Requires --reason.",
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help="Required with --approve-bulk-ready: justification logged on the "
+             "run record.",
+    )
     args = parser.parse_args()
+    if args.approve_bulk_ready and not args.reason:
+        parser.error("--approve-bulk-ready requires --reason \"...\"")
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
@@ -665,8 +680,34 @@ def main() -> int:
                     "lead_fund_id": d.lead_fund_id,
                 })
 
+    # Brief Rule 16 hard ceiling: refuse to mark more than 25 partners as
+    # ready_to_send in a single run without explicit approval. recommended_to_send
+    # is set by Stage 6; outreach_status="ready_to_send" is the user-visible
+    # mark in the CSV.
+    rec_in_batch = [r for r in rows if r.recommended_to_send]
+    if (
+        len(rec_in_batch) > READY_TO_SEND_DAILY_CEILING
+        and not args.approve_bulk_ready
+    ):
+        print(
+            f"[stage 7] HARD CEILING: {len(rec_in_batch)} partners would be "
+            f"marked ready_to_send (> {READY_TO_SEND_DAILY_CEILING}). "
+            f"Re-run with --approve-bulk-ready --reason \"...\" to override."
+        )
+        return 2
+
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
+        if args.approve_bulk_ready:
+            # Log the approval into the runs row's audit summary (Criterion 15).
+            run.note(
+                f"BULK_READY_APPROVED count={len(rec_in_batch)} "
+                f"reason={args.reason!r}"
+            )
+            print(
+                f"[stage 7] bulk-ready approved by user: "
+                f"{len(rec_in_batch)} records / reason={args.reason!r}"
+            )
         recommended_drafts: list[dict] = []
         all_drafts: list[dict] = []
         partner_outputs: list[tuple[dict, EmailOutput, list[str]]] = []
