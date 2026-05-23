@@ -170,6 +170,7 @@ def main() -> int:
                     "meeting_date": _date(values, "meeting_date"),
                     "meeting_outcome": _option_title(values, "meeting_outcome"),
                     "synced_from_attio_at": _now(),
+                    "source": "attio",
                 }
                 # Finding 34: dedupe vs the latest outcome row for this
                 # partner. If nothing meaningful has changed since the last

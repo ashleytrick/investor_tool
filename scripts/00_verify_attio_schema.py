@@ -31,11 +31,23 @@ STAGE = "00_verify_attio_schema"
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 0 Attio schema verification.")
     add_workspace_arg(parser)
+    parser.add_argument(
+        "--allow-skip", action="store_true",
+        help="Treat 'attio.yaml present but ATTIO_API_KEY missing' as a "
+             "clean skip (exit 0). Default is to FAIL: if the operator "
+             "explicitly invoked schema verification on a workspace that "
+             "intends to use Attio, the key absence is a configuration "
+             "problem, not a no-op.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    # When --allow-skip is set, the operator explicitly accepts that a
+    # missing key is a no-op. Don't let preflight refuse on that very
+    # condition; the in-body skip-vs-fail check below is the authority.
     preflight_or_exit(
-        ws, stage=STAGE, require_attio=bool(ws.attio),
+        ws, stage=STAGE,
+        require_attio=bool(ws.attio) and not args.allow_skip,
     )
     print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
@@ -44,15 +56,31 @@ def main() -> int:
 
     with RunLogger(engine, ws.name, STAGE) as run:
         if not attio_cfg:
+            # No attio.yaml at all -> clean no-op (this workspace is CSV-only).
             print(f"[stage 0] no attio.yaml in workspace {ws.name!r}; skipping")
             run.skipped = 1
             return 0
         try:
             client = AttioClient.from_workspace(ws)
         except AttioNotConfigured as exc:
-            print(f"[stage 0] {exc}; skipping")
-            run.skipped = 1
-            return 0
+            # attio.yaml is configured but the key is missing. Default to
+            # FAIL so the operator who ran Stage 0 expecting a real check
+            # doesn't get a misleading green light. --allow-skip restores
+            # the prior cron-friendly behavior.
+            if args.allow_skip:
+                print(f"[stage 0] {exc}; --allow-skip in effect, skipping")
+                run.skipped = 1
+                return 0
+            msg = (
+                f"REFUSED: attio.yaml is configured for this workspace but "
+                f"ATTIO_API_KEY is not resolvable ({exc}). Set the key (or "
+                f"re-run with --allow-skip if you want this to be a no-op "
+                f"in cron)."
+            )
+            print(f"[stage 0] {msg}")
+            run.note(msg)
+            run.failed = 1
+            return 2
 
         objects = attio_cfg.get("objects") or {"funds": "companies", "partners": "people"}
         # Finding 40: base attributes Stage 8 actually writes (name, domains

@@ -177,23 +177,41 @@ def main() -> int:
                     ).order_by(axis_weight_suggestions.c.suggestion_id)
                 ))
             applied = 0
+            failed = 0
             for row in pending:
                 run.processed += 1
                 rank = CONFIDENCE_RANK.get(row.confidence, -1)
                 if rank < min_rank:
                     run.skipped += 1
                     continue
+                # Finding 67: even in --all-above mode, low-confidence
+                # suggestions need explicit operator opt-in.
+                if (
+                    row.confidence == "low"
+                    and not args.accept_low_confidence
+                ):
+                    run.skipped += 1
+                    print(
+                        f"[apply] skip suggestion_id={row.suggestion_id} "
+                        f"(confidence=low; pass --accept-low-confidence to "
+                        f"include low-confidence suggestions in --all-above)"
+                    )
+                    continue
                 if _apply_one(engine, ws, row, run):
                     applied += 1
                     run.succeeded += 1
                 else:
+                    failed += 1
                     run.failed += 1
             _rotate_backups(ws.config_dir)
             print(
                 f"[apply] applied {applied}/{len(pending)} pending suggestions "
-                f"at confidence>={args.all_above}"
+                f"at confidence>={args.all_above} "
+                f"(failed={failed})"
             )
-            return 0
+            # Previously this returned 0 unconditionally. Non-zero exit when
+            # any application failed so cron / wrapping scripts notice.
+            return 2 if failed else 0
 
         # ---- --suggestion-id mode (single) ----
         with engine.begin() as conn:

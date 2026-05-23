@@ -60,7 +60,13 @@ Selection rules (in priority order):
 
 STEP 2: GENERATE EACH VARIANT
 
-For each chosen strategy, load the corresponding example file as a style anchor. Match its directness, density, and voice. Do not copy wording.
+For each chosen strategy, use the matching example below as a STYLE ANCHOR. Match its directness, density, and voice. Do not copy wording.
+
+STRATEGY EXAMPLES (style anchors, one per strategy, headed by `--- strategy_name ---`):
+
+{EXAMPLES_BLOCK}
+
+(end of examples)
 
 Critical framing: the investor signal is a DOORWAY, not the argument. Do not make the email about the partner's quote or portfolio. Make the email about why the company and round are relevant to the partner now. The signal opens the door; the round hook and proof carry the meeting ask.
 

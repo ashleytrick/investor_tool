@@ -426,6 +426,25 @@ EMAIL_BANK: dict[str, dict] = {
 
 # ------- live LLM prompt assembly (built but exercised only when key present) -------
 
+def _read_example_files(examples_dir) -> str:
+    """Concatenate every prompts/examples/*.md into one block for the live
+    prompt. The base prompt previously said 'load the corresponding example
+    file as a style anchor', but the LLM has no filesystem access -- it was
+    being told to use anchors that were never sent. Each file is wrapped in
+    a header so the model can see which strategy it belongs to."""
+    from pathlib import Path
+    examples_dir = Path(examples_dir)
+    if not examples_dir.exists():
+        return "(no example files available)"
+    chunks: list[str] = []
+    for path in sorted(examples_dir.glob("*.md")):
+        body = path.read_text(encoding="utf-8").strip()
+        if not body:
+            continue
+        chunks.append(f"--- {path.stem} ---\n{body}")
+    return "\n\n".join(chunks) if chunks else "(no example files available)"
+
+
 def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
                       composite_score, round_fit_score, round_fit_reasoning,
                       lead_likelihood_score, axes_summary, fund_kill_signals,
@@ -484,6 +503,10 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
         .replace("{FOUNDER_BANNED_PHRASES}", ", ".join(
             (company_cfg.get("founder_voice") or {}).get("banned_phrases", [])
         ))
+        # Inject the actual file contents AND keep the legacy {EXAMPLES_DIR}
+        # token for backward-compatibility with any custom prompts that still
+        # reference the directory path.
+        .replace("{EXAMPLES_BLOCK}", _read_example_files(examples_dir))
         .replace("{EXAMPLES_DIR}", str(examples_dir))
         .replace("{MEETING_DURATION}", str(c.get("meeting_ask", {}).get("duration_minutes", 30)))
         .replace("{MEETING_FORMAT}", c.get("meeting_ask", {}).get("format", "video call"))
@@ -891,8 +914,16 @@ def main() -> int:
                 p_deals = deals_by_partner.get(partner_id, [])
 
                 # ---- strategy eligibility ----
-                has_q3 = any(s["quality"] >= 3 for s in p_signals)
-                has_q2 = any(s["quality"] >= 2 for s in p_signals)
+                # signal_led / contrarian_thesis_led need a partner quote
+                # the email can riff on positively. A negative-direction
+                # quote ("regulation kills startups") at quality=3 does NOT
+                # unlock signal_led -- it's evidence of MISFIT, not signal.
+                positive_signals = [
+                    s for s in p_signals
+                    if (s.get("direction") or "").lower() == "positive"
+                ]
+                has_q3 = any(s["quality"] >= 3 for s in positive_signals)
+                has_q2 = any(s["quality"] >= 2 for s in positive_signals)
                 # Loose single-keyword match is too generous (e.g. "infrastructure"
                 # matches both Foundry-style climate-infra and Northbeam-style
                 # fintech-infra). Require >=2 target-sector keyword hits.
@@ -903,13 +934,13 @@ def main() -> int:
                 # partner_led_in_target: partner has a named-lead deal at a fund
                 # whose thesis is target-adjacent.
                 partner_led_in_target = bool(p_deals) and fund_adjacent
-                # market_shift_led eligibility: partner has signal tagged with
-                # an axis whose name/description signals timing-driven
-                # category conviction (resolved from axes.yaml; previously
-                # hardcoded to axis_4).
+                # market_shift_led eligibility: partner has POSITIVE-direction
+                # signal tagged with an axis whose name/description signals
+                # timing-driven category conviction (resolved from axes.yaml;
+                # previously hardcoded to axis_4 and ignored direction).
                 market_window_match = bool(market_shift_axes) and any(
                     set(s.get("axes") or []) & market_shift_axes
-                    for s in p_signals
+                    for s in positive_signals
                 )
                 # Finding 11: traction_led requires BOTH the company having
                 # current traction in config AND THIS partner having a

@@ -74,7 +74,14 @@ def _now() -> datetime:
 # ------- composite scoring (LLM + stub) -------
 
 def _stub_axis_scores(verified_signals: list[dict], axes_cfg: dict) -> dict:
-    """Deterministic per-axis stub used when the LLM client is offline."""
+    """Deterministic per-axis stub used when the LLM client is offline.
+
+    Signal direction matters: a 'negative' quote on an axis is evidence the
+    partner DOES NOT hold that belief, so it should LOWER the axis score, not
+    raise it. The previous version counted all signals as positive evidence,
+    so an anti-fit quote tagged to the regulated-market axis would bump the
+    score for that axis by 0.5-1.0.
+    """
     by_axis: dict[str, dict] = {}
     for ax in axes_cfg.get("axes", []):
         ax_id = ax["id"]
@@ -87,17 +94,25 @@ def _stub_axis_scores(verified_signals: list[dict], axes_cfg: dict) -> dict:
                 "reasoning": "no verified quality>=2 signals on this axis",
             }
             continue
-        q3 = sum(1 for s in relevant if s["quality"] == 3)
-        q2 = sum(1 for s in relevant if s["quality"] == 2)
+        pos = [s for s in relevant if (s.get("direction") or "").lower() == "positive"]
+        neg = [s for s in relevant if (s.get("direction") or "").lower() == "negative"]
+        q3 = sum(1 for s in pos if s["quality"] == 3)
+        q2 = sum(1 for s in pos if s["quality"] == 2)
+        q3_neg = sum(1 for s in neg if s["quality"] == 3)
+        q2_neg = sum(1 for s in neg if s["quality"] == 2)
+        # Start at 6 (neutral). Positive signals raise it; negative signals
+        # subtract proportionally. Clamp to [0, 10] so a partner with
+        # several anti-fit quotes lands at 0, not below.
         score = 6.0 + min(3, q3) + (0.5 if q2 else 0.0)
-        score = min(10.0, score)
-        confidence = "high" if len(relevant) >= 2 else ("medium" if q3 else "low")
+        score -= min(3, q3_neg) + (0.5 if q2_neg else 0.0)
+        score = max(0.0, min(10.0, score))
+        confidence = "high" if len(relevant) >= 2 else ("medium" if (q3 or q3_neg) else "low")
         by_axis[ax_id] = {
             "score": float(score),
             "supporting_signal_ids": [s["id"] for s in relevant],
             "confidence": confidence,
             "reasoning": (
-                f"stub: {q3} quality-3 + {q2} quality-2 signal(s) "
+                f"stub: pos={q3}xQ3+{q2}xQ2, neg={q3_neg}xQ3+{q2_neg}xQ2 "
                 f"tagged on this axis"
             ),
         }
@@ -537,6 +552,13 @@ def main() -> int:
                 # Major kill signal aggregation. components.get() rather than
                 # bracket access so a future shape change in compute_round_fit
                 # doesn't KeyError here.
+                # fund.kill_signals (Stage 2 LLM extraction) was previously
+                # stored but never consulted by Stage 6 -- a fund whose
+                # extracted thesis said "pre-seed only" would NOT trigger
+                # major_kill unless round_fit also caught it. Treat any
+                # non-empty extracted kill_signals string as a kill.
+                fund_kill_signals_str = (fund.kill_signals or "").strip()
+                fund_has_kill = bool(fund_kill_signals_str)
                 major_kill = (
                     rf.disqualifier_present
                     or (p.employment_status == "left_fund")
@@ -544,8 +566,16 @@ def main() -> int:
                         not fund.is_active
                         and rf.components.get("active_fund", 0) == 0
                     )
+                    or fund_has_kill
                 )
-                kill_summary = "; ".join(rf.triggered_disqualifiers) if major_kill else ""
+                kill_summary_parts: list[str] = []
+                if rf.triggered_disqualifiers:
+                    kill_summary_parts.extend(rf.triggered_disqualifiers)
+                if fund_has_kill:
+                    kill_summary_parts.append(
+                        f"fund kill_signals: {fund_kill_signals_str}"
+                    )
+                kill_summary = "; ".join(kill_summary_parts) if major_kill else ""
 
                 recency_bonus = signal_recency_bonus(most_recent, today)
                 # Previously: `cold_reachability or 5.0` -- unknown reachability

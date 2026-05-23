@@ -243,6 +243,7 @@ def _seed_outcomes(ws, engine, force: bool = False) -> int:
                 meeting_booked=bool(row.get("meeting_booked")),
                 meeting_outcome=row.get("meeting_outcome"),
                 synced_from_attio_at=_now(),
+                source="fixture",
             ))
             written += 1
     print(f"[learning] seeded {written} fixture outcome(s)")
@@ -265,6 +266,12 @@ def main() -> int:
              "workspace already has outcomes that aren't in the seed file. "
              "Use only for test-workspace resets.",
     )
+    parser.add_argument(
+        "--include-fixture-outcomes", action="store_true",
+        help="Include outcomes with source='fixture' in the learning report. "
+             "Default is to EXCLUDE them so a real workspace that was "
+             "scaffolded from a fixture seed doesn't train on toy data.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -281,13 +288,31 @@ def main() -> int:
             # Finding 35: pick latest outcome per partner by EVENT timestamp
             # (synced_from_attio_at), with outcome_id as tiebreak. Outcome_id
             # alone was wrong when CSV imports + Attio syncs interleaved.
+            # By default we exclude rows with source='fixture' so a real
+            # workspace that was scaffolded from a fixture seed doesn't
+            # silently train on toy data. --include-fixture-outcomes
+            # reverts to the prior behavior.
+            outcome_stmt = select(outcomes).order_by(
+                outcomes.c.synced_from_attio_at, outcomes.c.outcome_id
+            )
             latest_outcomes: dict[str, object] = {}
-            for o in conn.execute(
-                select(outcomes).order_by(
-                    outcomes.c.synced_from_attio_at, outcomes.c.outcome_id
-                )
-            ):
+            excluded_fixture = 0
+            for o in conn.execute(outcome_stmt):
+                if (
+                    o.source == "fixture"
+                    and not args.include_fixture_outcomes
+                ):
+                    excluded_fixture += 1
+                    continue
                 latest_outcomes[o.partner_id] = o
+            if excluded_fixture:
+                msg = (
+                    f"excluded {excluded_fixture} outcome row(s) with "
+                    f"source='fixture' (pass --include-fixture-outcomes "
+                    f"to include them)"
+                )
+                print(f"[learning] {msg}")
+                run.note(msg)
             axis_scores: dict[str, dict[str, float]] = defaultdict(dict)
             for s in conn.execute(select(scores)):
                 axis_scores[s.partner_id][s.axis_id] = s.score

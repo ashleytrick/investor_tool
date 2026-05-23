@@ -212,6 +212,7 @@ def main() -> int:
                 reply_type=result.reply_type,
                 meeting_booked=bool(result.meeting_booked),
                 synced_from_attio_at=_now(),
+                source="manual",
             ))
         run.succeeded = 1
         run.note(

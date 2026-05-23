@@ -340,7 +340,14 @@ outcomes = Table(
     Column("meeting_date", Date),
     Column("meeting_outcome", Text),
     Column("synced_from_attio_at", DateTime),
+    # Distinguishes where the row came from: "attio" (outcome_sync),
+    # "manual" (record_outcome / classify_reply), or "fixture" (seeded by
+    # monthly_learning_report --seed-fixture-outcomes). Lets the learning
+    # report refuse to train on fixture rows if it later runs in a real
+    # workspace that was scaffolded from a fixture seed.
+    Column("source", Text),
     Index("ix_outcomes_partner_id", "partner_id"),
+    Index("ix_outcomes_source", "source"),
 )
 
 calibration_cohorts = Table(

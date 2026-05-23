@@ -108,6 +108,7 @@ def _insert(conn, *, partner_id, status, reply_type, meeting_booked,
         meeting_date=meeting_date,
         meeting_outcome=meeting_outcome,
         synced_from_attio_at=_now(),
+        source="manual",
     ))
 
 

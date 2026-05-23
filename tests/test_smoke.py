@@ -259,10 +259,15 @@ def test_jobs_produce_suggestions_and_apply():
         assert res.returncode == 0
         assert "skipping" in res.stdout
 
-        # monthly_learning_report with seed -> at least 1 suggestion
+        # monthly_learning_report with seed -> at least 1 suggestion.
+        # --include-fixture-outcomes is required because the seeded rows
+        # are tagged source='fixture' and the learning report excludes
+        # those by default (so a real workspace scaffolded from fixtures
+        # doesn't silently train on toy data).
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "jobs" / "monthly_learning_report.py"),
-             "--workspace", ws, "--seed-fixture-outcomes"],
+             "--workspace", ws, "--seed-fixture-outcomes",
+             "--include-fixture-outcomes"],
             capture_output=True, text=True, env=env, timeout=60,
         )
         assert res.returncode == 0
@@ -815,3 +820,157 @@ def test_batch_qa_passing_still_publishes_csv():
         ).fetchone()[0]
         assert passed == 1, "batch_qa_reports.passed should be 1 on happy path"
         c.close()
+
+
+def test_negative_signal_lowers_axis_score_and_blocks_strategy():
+    """Batch 8: signal_direction='negative' must (a) lower the stub axis
+    score instead of raising it, and (b) NOT make signal_led eligible.
+    Previously a negative quality-3 quote on axis_1 would push the axis
+    score from null to 9.0 AND enable signal_led."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "s6", REPO_ROOT / "scripts" / "06_score_candidates.py"
+    )
+    s6 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s6)
+
+    axes_cfg = {"axes": [{"id": "axis_1", "name": "x", "description": "y",
+                          "weight": 1.0}]}
+    pos = [{"id": 1, "quality": 3, "axes": ["axis_1"], "direction": "positive",
+            "quote": "x"}]
+    neg = [{"id": 2, "quality": 3, "axes": ["axis_1"], "direction": "negative",
+            "quote": "x"}]
+
+    pos_scored = s6._stub_axis_scores(pos, axes_cfg)["axis_1"]["score"]
+    neg_scored = s6._stub_axis_scores(neg, axes_cfg)["axis_1"]["score"]
+    assert pos_scored > 6.0, f"positive q3 should raise score, got {pos_scored}"
+    assert neg_scored < 6.0, (
+        f"negative q3 should LOWER score, got {neg_scored}"
+    )
+
+    # Stage 7 eligibility helper: filter to positive only before checking.
+    positive_signals = [s for s in neg if (s.get("direction") or "").lower() == "positive"]
+    has_q3_neg = any(s["quality"] >= 3 for s in positive_signals)
+    assert has_q3_neg is False, "negative q3 must not enable signal_led"
+
+
+def test_monthly_learning_excludes_fixture_outcomes_by_default():
+    """Batch 8: outcomes with source='fixture' must NOT drive the
+    learning report unless --include-fixture-outcomes is passed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+            ("06_score_candidates.py", ()),
+            ("07_generate_emails.py", ("--top", "5")),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Seed fixture outcomes, then run learning WITHOUT
+        # --include-fixture-outcomes. Should exclude all the seeded rows
+        # and report no usable outcomes (so no axis suggestions).
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "monthly_learning_report.py"),
+             "--workspace", ws, "--seed-fixture-outcomes"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        assert "excluded" in res.stdout and "source='fixture'" in res.stdout, (
+            f"expected fixture-exclusion notice; stdout=\n{res.stdout}"
+        )
+
+        c = sqlite3.connect(db)
+        n_sugs = c.execute(
+            "select count(*) from axis_weight_suggestions where approved is null"
+        ).fetchone()[0]
+        assert n_sugs == 0, (
+            f"expected no suggestions when fixture outcomes excluded, got {n_sugs}"
+        )
+
+        # With --include-fixture-outcomes, suggestions ARE produced.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "monthly_learning_report.py"),
+             "--workspace", ws, "--include-fixture-outcomes"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        n_sugs = c.execute(
+            "select count(*) from axis_weight_suggestions where approved is null"
+        ).fetchone()[0]
+        assert n_sugs >= 1, (
+            f"expected >=1 suggestion with --include-fixture-outcomes, got {n_sugs}"
+        )
+
+        # All seeded rows must be tagged source='fixture'.
+        n_fixture = c.execute(
+            "select count(*) from outcomes where source='fixture'"
+        ).fetchone()[0]
+        assert n_fixture >= 1, "seeded outcomes must carry source='fixture'"
+        c.close()
+
+
+def test_verify_attio_schema_fails_without_key_when_attio_configured():
+    """Batch 8: explicit Stage 0 run on a workspace whose attio.yaml is
+    configured but whose ATTIO_API_KEY is missing must NOT silently
+    exit 0 -- the operator who ran schema verification expected a real
+    check. --allow-skip restores prior cron-friendly behavior."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        # Drop a minimal attio.yaml so the code path reaches the key check
+        # but without enough config to actually call Attio.
+        (ws_dst / "config" / "attio.yaml").write_text(
+            "attio:\n"
+            "  workspace_id: dummy\n"
+            "  api_base: https://api.attio.com/v2\n"
+            "  matching_attributes:\n"
+            "    companies: domains\n"
+            "    people: email_addresses\n"
+            "  objects:\n"
+            "    funds: companies\n"
+            "    partners: people\n"
+            "  fund_attributes: {}\n"
+            "  partner_attributes: {}\n",
+            encoding="utf-8",
+        )
+
+        ws = str(ws_dst)
+        env = {**os.environ, "ATTIO_API_KEY": ""}
+
+        # Default: refuse.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "00_verify_attio_schema.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2, (
+            f"expected exit 2 on missing key, got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
+        assert "REFUSED" in res.stdout
+
+        # --allow-skip: clean skip.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "00_verify_attio_schema.py"),
+             "--workspace", ws, "--allow-skip"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        assert "skipping" in res.stdout
