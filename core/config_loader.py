@@ -51,8 +51,11 @@ class Workspace:
         self.exports_dir = ws / "exports"
         self.examples_dir = ws / "prompts" / "examples"
         self.db_path = self.data_dir / "pipeline.db"
-        for d in (self.data_dir, self.exports_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        # Do NOT mkdir here. Loading a workspace should be side-effect free so
+        # status.py / validate / typo'd paths don't dirty the filesystem.
+        # init_workspace.py creates the tree; write-stages (get_engine for
+        # data_dir, write_review_queue for exports_dir) ensure their own
+        # target dirs exist just before writing.
 
         # Config files.
         self.company = _load_yaml(self.config_dir / "company.yaml")

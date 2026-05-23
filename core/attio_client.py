@@ -77,8 +77,16 @@ class AttioClient:
             return {}
         try:
             return r.json()
-        except json.JSONDecodeError:
-            return {}
+        except json.JSONDecodeError as exc:
+            # An empty body (no content) is fine -- some endpoints legitimately
+            # return 200 with no body -- but a non-empty body that fails to
+            # decode is a real protocol problem. Surface it as an AttioError
+            # instead of returning {} and letting downstream log a successful
+            # sync with attio_id=None.
+            raise AttioError(
+                f"Attio {method} {path} returned 200 with undecodable JSON: "
+                f"{exc}"
+            ) from exc
 
     # --- schema introspection ---
 

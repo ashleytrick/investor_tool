@@ -3,13 +3,22 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
 class Partner(BaseModel):
-    name: str
+    name: str = Field(..., min_length=1)
     title: Optional[str] = None
     bio_snippet: Optional[str] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, v):
+        # Avoid generating partner_ids from " " or whitespace-only LLM output,
+        # which would collide with other empty-name partners at the same fund.
+        if isinstance(v, str):
+            return v.strip()
+        return v
 
 
 class FundEnrichment(BaseModel):

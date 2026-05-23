@@ -6,6 +6,8 @@ thicken usage but never need a migration.
 """
 from __future__ import annotations
 
+import pathlib
+
 from sqlalchemy import (
     Boolean,
     Column,
@@ -295,7 +297,15 @@ axis_weight_suggestions = Table(
 
 
 def get_engine(db_url: str) -> Engine:
-    """Create the engine and ensure all tables exist (idempotent)."""
+    """Create the engine and ensure all tables exist (idempotent).
+
+    Also ensures the SQLite parent directory exists; Workspace.__init__ no
+    longer mkdirs at load time, so the first write-stage's call to
+    get_engine is where data_dir actually gets created.
+    """
+    if db_url.startswith("sqlite:///"):
+        db_path = pathlib.Path(db_url[len("sqlite:///"):])
+        db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(db_url, future=True)
     metadata.create_all(engine)
     # Defensive: a pre-existing SQLite db may lack columns added in later

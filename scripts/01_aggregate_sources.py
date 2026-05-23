@@ -79,7 +79,17 @@ def main() -> int:
             parser_kind = src.get("parser")
             try:
                 if "path" in src:
-                    src_path = ws.path / src["path"]
+                    src_path = (ws.path / src["path"]).resolve()
+                    # Refuse paths that escape the workspace -- sources.yaml
+                    # is operator-edited config, so a stray "../../etc/passwd"
+                    # is a tenant-isolation hole.
+                    ws_root = ws.path.resolve()
+                    if not str(src_path).startswith(str(ws_root) + "/") \
+                            and src_path != ws_root:
+                        raise ValueError(
+                            f"source path {src['path']!r} escapes workspace "
+                            f"({ws_root}); refusing to read."
+                        )
                     if not src_path.exists():
                         raise FileNotFoundError(src_path)
                     if parser_kind == "csv":

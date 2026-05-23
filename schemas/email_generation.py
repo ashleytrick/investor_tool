@@ -22,11 +22,17 @@ Strategy = Literal[
 
 class EmailVariant(BaseModel):
     strategy: Strategy
-    subject: str = Field(..., max_length=80)
-    body: str
-    conversion_hypothesis: str
-    likely_objection: str
-    objection_preempted: bool
+    subject: str = Field(..., min_length=1, max_length=80)
+    # Brief: 4 sentences max -> ~40 chars min is a defensive lower bound that
+    # catches "" and "..." while not policing legitimate short drafts.
+    body: str = Field(..., min_length=40)
+    # Per brief STEP 3/4: conversion_hypothesis and likely_objection are
+    # required FOR THE RECOMMENDED VARIANT only. Alternates may leave them
+    # empty. The check_recommended_variant_complete validator on EmailOutput
+    # enforces non-empty on whichever variant is named recommended.
+    conversion_hypothesis: str = ""
+    likely_objection: str = ""
+    objection_preempted: bool = False
     preemption_line: Optional[str] = None
     template_smell: str = "unscored"
 
@@ -34,11 +40,13 @@ class EmailVariant(BaseModel):
 class EmailOutput(BaseModel):
     variants: list[EmailVariant]
     recommended_variant_strategy: Optional[Strategy] = None
-    recommendation_reasoning: str
+    recommendation_reasoning: str = Field(..., min_length=1)
     limited_variation: bool = False
     limited_variation_reason: Optional[str] = None
-    deck_request_response: str
-    followup_draft: str
+    # deck + followup are required outputs PER PARTNER per the brief; an
+    # empty string from the LLM should retry, not flow into the CSV.
+    deck_request_response: str = Field(..., min_length=1)
+    followup_draft: str = Field(..., min_length=1)
 
     @field_validator("variants")
     @classmethod
@@ -58,4 +66,48 @@ class EmailOutput(BaseModel):
                 raise ValueError(
                     "limited_variation_reason required when limited_variation=True"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def check_recommended_variant_complete(self) -> "EmailOutput":
+        """The variant named in recommended_variant_strategy must have
+        non-empty conversion_hypothesis and likely_objection. Alternates
+        may leave them blank."""
+        if self.recommended_variant_strategy is None:
+            return self
+        for v in self.variants:
+            if v.strategy == self.recommended_variant_strategy:
+                if not (v.conversion_hypothesis or "").strip():
+                    raise ValueError(
+                        "recommended variant must have non-empty conversion_hypothesis"
+                    )
+                if not (v.likely_objection or "").strip():
+                    raise ValueError(
+                        "recommended variant must have non-empty likely_objection"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def check_recommended_in_variants(self) -> "EmailOutput":
+        """Finding 1: previously the LLM could recommend a strategy it did
+        not include in `variants` and the downstream code silently dropped
+        the partner. Now the schema enforces that recommended_variant_strategy
+        names a real variant (or is None iff variants is empty)."""
+        present = {v.strategy for v in self.variants}
+        if self.variants:
+            if self.recommended_variant_strategy is None:
+                raise ValueError(
+                    "recommended_variant_strategy must be set when variants "
+                    "is non-empty"
+                )
+            if self.recommended_variant_strategy not in present:
+                raise ValueError(
+                    f"recommended_variant_strategy "
+                    f"{self.recommended_variant_strategy!r} not in returned "
+                    f"variants {sorted(present)}"
+                )
+        elif self.recommended_variant_strategy is not None:
+            raise ValueError(
+                "recommended_variant_strategy must be None when variants is empty"
+            )
         return self

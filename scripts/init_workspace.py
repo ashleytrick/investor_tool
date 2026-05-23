@@ -12,7 +12,12 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import re
+import shutil
 import sys
+
+# Slug-strict: rejects ../, slashes, anything that could escape clients/.
+SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -224,18 +229,38 @@ def main() -> int:
     parser.add_argument("name", help="Workspace short name, e.g. oko_seed.")
     parser.add_argument(
         "--force", action="store_true",
-        help="Overwrite an existing workspace directory.",
+        help="Re-write the template config files in an existing workspace. "
+             "Leaves user-added files (data/raw/, exports/, edited examples) "
+             "untouched.",
+    )
+    parser.add_argument(
+        "--destroy", action="store_true",
+        help="Remove the entire workspace directory (db, exports, raw data, "
+             "everything) before scaffolding. Use with care; data is gone.",
     )
     args = parser.parse_args()
 
-    name = args.name.strip().replace(" ", "_")
-    ws_path = REPO_ROOT / "clients" / name
-    if ws_path.exists() and not args.force:
+    raw = args.name.strip().replace(" ", "_")
+    # Finding 13: refuse path-traversal names; only allow ASCII slug chars.
+    if not SLUG_RE.match(raw):
         print(
-            f"workspace already exists: {ws_path}\n"
-            f"pass --force to overwrite, or pick another name."
+            f"workspace name {raw!r} must match {SLUG_RE.pattern} "
+            f"(letters, digits, underscore, hyphen)."
         )
         return 2
+    name = raw
+    ws_path = REPO_ROOT / "clients" / name
+    if ws_path.exists():
+        if args.destroy:
+            print(f"--destroy: removing {ws_path}")
+            shutil.rmtree(ws_path)
+        elif not args.force:
+            print(
+                f"workspace already exists: {ws_path}\n"
+                f"  --force re-writes ONLY the template config files\n"
+                f"  --destroy removes the entire workspace first"
+            )
+            return 2
 
     # Directory tree.
     for sub in (

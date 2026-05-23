@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -88,6 +89,32 @@ SOFT_CTA_PHRASES = [
 
 # ------- strategy eligibility -------
 
+# Keywords in a partner's quoted signal that indicate they care about
+# metrics / traction / customer evidence. The brief: traction_led requires
+# "strong company traction AND a metrics-oriented partner signal", not just
+# strong company traction alone.
+METRICS_SIGNAL_KEYWORDS = (
+    "metric", "metrics", "arr", "retention", "nrr", "growth", "growing",
+    "customers", "revenue", "churn", "conversion", "users", "scale",
+    "burn", "design partner", "design partners", "sign-up", "sign-ups",
+    "sales", "pipeline",
+)
+
+
+def has_metrics_oriented_signal(p_signals: list[dict]) -> bool:
+    """True iff at least one verified signal mentions metrics vocabulary."""
+    for s in p_signals:
+        text = (s.get("quote") or "").lower()
+        if any(kw in text for kw in METRICS_SIGNAL_KEYWORDS):
+            return True
+    return False
+
+
+def has_company_traction(company_cfg: dict) -> bool:
+    c = (company_cfg.get("company") or {}).get("current_traction") or {}
+    return bool(c.get("headline_metric")) or bool(c.get("secondary_metrics"))
+
+
 def compute_eligibility(
     has_q3: bool,
     has_q2: bool,
@@ -96,7 +123,12 @@ def compute_eligibility(
     market_window_match: bool,
     company_traction_proof: bool,
 ) -> dict[str, int]:
-    """0-3 score per strategy. Only >=2 may be used."""
+    """0-3 score per strategy. Only >=2 may be used.
+
+    `company_traction_proof` is now caller-computed as
+    has_company_traction(...) AND has_metrics_oriented_signal(...). It must
+    NOT be hardcoded True per finding #11.
+    """
     return {
         "signal_led": 3 if has_q3 else (2 if has_q2 else 0),
         "portfolio_led": 3 if fund_adjacent else 0,
@@ -367,8 +399,11 @@ EMAIL_BANK: dict[str, dict] = {
 
 # ------- live LLM prompt assembly (built but exercised only when key present) -------
 
-def build_live_prompt(*, company_cfg, partner_name, fund_name, signals_for_partner,
-                      deals_for_partner, examples_dir) -> str:
+def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
+                      composite_score, round_fit_score, round_fit_reasoning,
+                      lead_likelihood_score, axes_summary, fund_kill_signals,
+                      signals_for_partner, deals_for_partner,
+                      examples_dir) -> str:
     c = company_cfg["company"]
     rc = company_cfg["raise_context"]
     rh = rc.get("round_hook") or {}
@@ -395,21 +430,29 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, signals_for_partn
         .replace("{FOUNDER_MARKET_FIT}", "")
         .replace("{PARTNER_NAME}", partner_name or "")
         .replace("{FUND_NAME}", fund_name or "")
-        .replace("{COMPOSITE_SCORE}", "")
-        .replace("{ROUND_FIT_SCORE}", "")
-        .replace("{LEAD_LIKELIHOOD_SCORE}", "")
-        .replace("{TOP_AXES_NAMES_AND_SCORES}", "")
+        .replace("{PARTNER_BIO}", partner_bio or "")
+        # Finding 5: stop sending blank scoring context to the live LLM.
+        .replace("{COMPOSITE_SCORE}",
+                 "" if composite_score is None else f"{composite_score:.2f}")
+        .replace("{ROUND_FIT_SCORE}",
+                 "" if round_fit_score is None else f"{round_fit_score:.1f}")
+        .replace("{LEAD_LIKELIHOOD_SCORE}",
+                 "" if lead_likelihood_score is None else f"{lead_likelihood_score:.1f}")
+        .replace("{TOP_AXES_NAMES_AND_SCORES}", axes_summary or "")
         .replace("{TOP_SIGNALS}", json.dumps([
             {"quote": s["quote"], "url": s["source_url"], "date": str(s.get("date"))}
             for s in signals_for_partner[:3]
         ]))
+        # Stage 2 does not yet persist per-fund portfolio_companies; left
+        # blank with a comment so the operator knows it's a known gap.
         .replace("{ADJACENT_PORTFOLIO_COMPANIES}", "")
         .replace("{RECENT_PARTNER_LED_DEALS}", json.dumps([
             {"company": d["company"], "round": d.get("round_type")}
             for d in deals_for_partner
         ]))
+        # COMM_STYLE would need linguistic analysis we don't yet do.
         .replace("{COMM_STYLE}", "")
-        .replace("{KILL_SIGNALS}", "")
+        .replace("{KILL_SIGNALS}", fund_kill_signals or "")
         .replace("{FOUNDER_VOICE_STYLE}", (company_cfg.get("founder_voice") or {}).get("style", ""))
         .replace("{FOUNDER_BANNED_PHRASES}", ", ".join(
             (company_cfg.get("founder_voice") or {}).get("banned_phrases", [])
@@ -418,7 +461,23 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, signals_for_partn
         .replace("{MEETING_DURATION}", str(c.get("meeting_ask", {}).get("duration_minutes", 30)))
         .replace("{MEETING_FORMAT}", c.get("meeting_ask", {}).get("format", "video call"))
         .replace("{SCHEDULING_LINK}", c.get("meeting_ask", {}).get("preferred_scheduling_link", ""))
+        # Finding 6: {TIME_1}/{TIME_2} were never substituted; a live LLM
+        # could emit literal placeholders. Pull from
+        # company.meeting_ask.preferred_time_slots if set; else fill with a
+        # neutral string. check_hard_gates ALSO rejects any leftover
+        # `{...}` placeholder in the body as a belt-and-suspenders guard.
+        .replace("{TIME_1}", _meeting_slot(c, 0))
+        .replace("{TIME_2}", _meeting_slot(c, 1))
     )
+
+
+def _meeting_slot(company_block: dict, idx: int) -> str:
+    slots = (company_block.get("meeting_ask") or {}).get("preferred_time_slots") or []
+    if idx < len(slots) and slots[idx]:
+        return str(slots[idx])
+    # Sentinel that won't slip past the placeholder hard gate if the LLM
+    # decides to use the slots-only CTA when slots aren't configured.
+    return "(no time slot configured)"
 
 
 def build_stub_response(partner_id: str, strategies: list[str]) -> dict | None:
@@ -468,7 +527,16 @@ def build_stub_response(partner_id: str, strategies: list[str]) -> dict | None:
 def check_hard_gates(draft: dict, banned: list[str]) -> list[str]:
     """Per-draft hard gates that disqualify a draft."""
     fails: list[str] = []
-    body_lower = (draft.get("body") or "").lower()
+    body = draft.get("body") or ""
+    body_lower = body.lower()
+    # Finding 6: refuse literal `{X}` placeholders the model might have
+    # emitted (TIME_1/TIME_2 are the obvious ones, but the gate catches
+    # any uppercase-token placeholder so future prompt changes can't slip).
+    leftover = re.findall(r"\{[A-Z][A-Z0-9_]*\}", body)
+    if leftover:
+        fails.append(
+            f"unfilled prompt placeholder(s) in body: {sorted(set(leftover))}"
+        )
     if not any(k in body_lower for k in ("raising", " raise ")):
         fails.append("missing explicit raise reference in body")
     if any(p in body_lower for p in SOFT_CTA_PHRASES):
@@ -657,12 +725,24 @@ def main() -> int:
                 funds.c.name.label("fund_name"),
                 funds.c.domain.label("fund_domain"),
                 funds.c.stated_thesis,
+                # Finding 5: surface fund-level kill signals into the live
+                # prompt so the LLM can avoid triggering them.
+                funds.c.kill_signals.label("fund_kill_signals"),
             )
             .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
             .join(funds, funds.c.fund_id == partners.c.fund_id)
             .order_by(partner_score_summaries.c.send_now_priority.desc())
             .limit(args.top)
         ))
+        # Per-partner per-axis scores -- consumed by the live prompt's
+        # TOP_AXES_NAMES_AND_SCORES placeholder so the LLM strategy picker
+        # has the deterministic axis ranking in hand.
+        from core.db import scores as _scores
+        axis_scores_by_partner: dict[str, list[tuple[str, float | None]]] = {}
+        for s in conn.execute(select(_scores)):
+            axis_scores_by_partner.setdefault(s.partner_id, []).append(
+                (s.axis_id, s.score)
+            )
         # Per-partner: verified quality>=2 signals.
         signals_by_partner: dict[str, list[dict]] = {}
         for s in conn.execute(
@@ -693,52 +773,57 @@ def main() -> int:
                     "lead_fund_id": d.lead_fund_id,
                 })
 
-    # Brief Gate 5.5: scaling beyond the mid-tier (--top > 10) without a
-    # recent Green calibration is the brief's most-warned-against move.
-    # Refuse unless --skip-calibration --reason "...".
-    if args.top > TOP_BEFORE_CALIBRATION_REQUIRED and not args.skip_calibration:
-        from datetime import timedelta as _td
-        from core.db import calibration_cohorts as _cc
-        from sqlalchemy import select as _select, desc as _desc
-        cutoff = datetime.now(timezone.utc) - _td(days=CALIBRATION_WINDOW_DAYS)
-        with engine.begin() as conn:
-            green = conn.execute(
-                _select(_cc).where(
-                    _cc.c.outcome == "green",
-                    _cc.c.completed_at >= cutoff,
-                ).order_by(_desc(_cc.c.completed_at)).limit(1)
-            ).first()
-        if not green:
-            print(
-                f"[stage 7] GATE 5.5: --top={args.top} > "
-                f"{TOP_BEFORE_CALIBRATION_REQUIRED} requires a Green "
-                f"calibration cohort within the last {CALIBRATION_WINDOW_DAYS} "
-                f"days. None found.\n"
-                f"  Run a calibration first: "
-                f"uv run scripts/calibration.py --start\n"
-                f"  Or bypass with --skip-calibration --reason \"...\" "
-                f"(logged on the run)."
-            )
-            return 2
-
-    # Brief Rule 16 hard ceiling: refuse to mark more than 25 partners as
-    # ready_to_send in a single run without explicit approval. recommended_to_send
-    # is set by Stage 6; outreach_status="ready_to_send" is the user-visible
-    # mark in the CSV.
     rec_in_batch = [r for r in rows if r.recommended_to_send]
-    if (
-        len(rec_in_batch) > READY_TO_SEND_DAILY_CEILING
-        and not args.approve_bulk_ready
-    ):
-        print(
-            f"[stage 7] HARD CEILING: {len(rec_in_batch)} partners would be "
-            f"marked ready_to_send (> {READY_TO_SEND_DAILY_CEILING}). "
-            f"Re-run with --approve-bulk-ready --reason \"...\" to override."
-        )
-        return 2
 
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
+        # Both safety refusals (Gate 5.5 calibration + Rule 16 ceiling) now
+        # live inside the RunLogger context so the refusal lands in `runs`
+        # with run.failed=1 and an audit note. The previous early-returns
+        # produced no run row -- the most important refusals were invisible
+        # to status.py / audit.
+
+        # Gate 5.5: scaling beyond mid-tier without a recent Green cal.
+        if args.top > TOP_BEFORE_CALIBRATION_REQUIRED and not args.skip_calibration:
+            from datetime import timedelta as _td
+            from core.db import calibration_cohorts as _cc
+            from sqlalchemy import select as _select, desc as _desc
+            cutoff = datetime.now(timezone.utc) - _td(days=CALIBRATION_WINDOW_DAYS)
+            with engine.begin() as conn:
+                green = conn.execute(
+                    _select(_cc).where(
+                        _cc.c.outcome == "green",
+                        _cc.c.completed_at >= cutoff,
+                    ).order_by(_desc(_cc.c.completed_at)).limit(1)
+                ).first()
+            if not green:
+                msg = (
+                    f"GATE 5.5 REFUSED: --top={args.top} > "
+                    f"{TOP_BEFORE_CALIBRATION_REQUIRED} requires a Green "
+                    f"calibration cohort within the last "
+                    f"{CALIBRATION_WINDOW_DAYS} days; none found. Run "
+                    f"scripts/calibration.py --start, or pass "
+                    f"--skip-calibration --reason \"...\"."
+                )
+                print(f"[stage 7] {msg}")
+                run.note(msg)
+                run.failed = 1
+                return 2
+
+        # Rule 16 hard ceiling.
+        if (
+            len(rec_in_batch) > READY_TO_SEND_DAILY_CEILING
+            and not args.approve_bulk_ready
+        ):
+            msg = (
+                f"HARD CEILING REFUSED: {len(rec_in_batch)} partners would "
+                f"be marked ready_to_send (> {READY_TO_SEND_DAILY_CEILING}). "
+                f"Re-run with --approve-bulk-ready --reason \"...\"."
+            )
+            print(f"[stage 7] {msg}")
+            run.note(msg)
+            run.failed = 1
+            return 2
         if args.approve_bulk_ready:
             # Log the approval into the runs row's audit summary (Criterion 15).
             run.note(
@@ -784,7 +869,16 @@ def main() -> int:
                 market_window_match = any(
                     "axis_4" in s["axes"] for s in p_signals
                 )
-                company_traction_proof = True  # Tendril has 128% NRR, etc.
+                # Finding 11: traction_led requires BOTH the company having
+                # current traction in config AND THIS partner having a
+                # metrics-oriented signal in their quoted_text. Previously
+                # this was hardcoded True, which would have flagged
+                # traction_led for partners with no metric vocabulary in
+                # their public signal.
+                company_traction_proof = (
+                    has_company_traction(ws.company)
+                    and has_metrics_oriented_signal(p_signals)
+                )
 
                 elig = compute_eligibility(
                     has_q3=has_q3,
@@ -823,12 +917,30 @@ def main() -> int:
                         "stub mode: no EMAIL_BANK entry for this partner",
                     )
                     continue
-                # Live mode would build the full prompt; in stub mode the client
-                # validates the stub directly.
+                # Live mode would build the full prompt; in stub mode the
+                # client validates the stub directly. Finding 5: surface
+                # composite/round_fit/lead_likelihood scores, per-axis
+                # summary, and fund kill_signals into the prompt so the
+                # live LLM strategy picker is properly grounded.
+                axes_for_p = sorted(
+                    axis_scores_by_partner.get(partner_id, []),
+                    key=lambda a: -(a[1] or 0),
+                )
+                axes_summary = ", ".join(
+                    f"{ax_id} ({score:.1f})" for ax_id, score in axes_for_p
+                    if score is not None
+                )
                 prompt = build_live_prompt(
                     company_cfg=ws.company,
                     partner_name=row.partner_name,
                     fund_name=row.fund_name,
+                    partner_bio=getattr(row, "bio", None),
+                    composite_score=getattr(row, "composite_fit_score", None),
+                    round_fit_score=getattr(row, "round_fit_score", None),
+                    round_fit_reasoning=getattr(row, "round_fit_reasoning", None),
+                    lead_likelihood_score=getattr(row, "lead_likelihood_score", None),
+                    axes_summary=axes_summary,
+                    fund_kill_signals=getattr(row, "fund_kill_signals", None),
                     signals_for_partner=p_signals,
                     deals_for_partner=p_deals,
                     examples_dir=ws.examples_dir,

@@ -44,7 +44,13 @@ def stage_matches(raise_round: str, fund_stage: Optional[str]) -> bool:
 
 # ----- check size parsing + overlap -----
 
-_SIZE_RE = re.compile(r"\$?\s*([\d.]+)\s*([KMB])?", re.IGNORECASE)
+# Accepts $500K, $1.5M, $1,000,000, etc. Commas in the numeric part are
+# stripped before parsing so a range like "$1,000,000-$2,000,000" doesn't
+# get truncated to (1, 2).
+_SIZE_RE = re.compile(
+    r"\$?\s*([\d][\d,]*(?:\.\d+)?)\s*([KMB])?",
+    re.IGNORECASE,
+)
 _MULT = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
 
@@ -52,7 +58,10 @@ def _parse_one_amount(token: str) -> Optional[int]:
     m = _SIZE_RE.match(token.strip())
     if not m:
         return None
-    val = float(m.group(1))
+    try:
+        val = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
     suffix = (m.group(2) or "").upper()
     if suffix:
         val *= _MULT[suffix]
