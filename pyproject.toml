@@ -18,3 +18,6 @@ dependencies = [
 
 [tool.uv]
 package = false
+dev-dependencies = [
+    "pytest>=8.0",
+]

@@ -236,8 +236,13 @@ def main() -> int:
                         pid = partner_id_for(fund["domain"], p.name)
                         # Team page is a single-source recent observation, so
                         # this counts as "likely_current" per the brief's
-                        # employment confidence ladder. LinkedIn cross-check
-                        # (-> "verified_current") is a later session.
+                        # employment confidence ladder. The other states need
+                        # additional sources that this v1 does not ingest:
+                        #   verified_current = /team + LinkedIn within 30 days
+                        #   uncertain        = stale or conflicting evidence
+                        #   left_fund        = explicit departure evidence
+                        # Until LinkedIn cross-check + departure feed are added,
+                        # only likely_current is reachable from this stage.
                         upsert(conn, partners, ["partner_id"], {
                             "partner_id": pid,
                             "fund_id": fund["fund_id"],

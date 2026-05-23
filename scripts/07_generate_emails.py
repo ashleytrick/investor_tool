@@ -758,9 +758,23 @@ def main() -> int:
 
                 # ---- generate (live LLM or stub) ----
                 stub = build_stub_response(partner_id, strategies)
-                # Live mode needs a stub_response too (the client requires one);
-                # if the partner isn't in the bank, fall back to limited variation.
+                # In stub mode (no ANTHROPIC_API_KEY) the in-script EMAIL_BANK
+                # must contain an entry for this partner. A miss means the
+                # partner gets zero variants and silently drops from the CSV
+                # without a real LLM having tried. Brief Rule 14 forbids
+                # silent failures, so log explicitly.
                 if stub is None:
+                    if llm.stub:
+                        print(
+                            f"[stage 7] WARN: partner {partner_id} "
+                            f"({row.partner_name}) has no entry in stub "
+                            "EMAIL_BANK; no variants generated. A live LLM "
+                            "would handle this partner via prompts/generate_email.txt."
+                        )
+                        run.log_error(
+                            partner_id, "stub_bank_miss",
+                            "stub mode: no EMAIL_BANK entry for this partner",
+                        )
                     stub = {
                         "variants": [],
                         "recommended_variant_strategy": None,
