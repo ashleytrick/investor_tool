@@ -45,6 +45,27 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def low_confidence_refusal_message(
+    *,
+    mode: str,
+    count: int = 1,
+    suggestion_id: int | None = None,
+    sample_size: int | None = None,
+) -> str:
+    """Explain why an explicit low-confidence override is required."""
+    if mode == "single":
+        return (
+            f"REFUSED: suggestion_id={suggestion_id} has confidence='low' "
+            f"(sample_size={sample_size}). Re-run with "
+            "--accept-low-confidence to override."
+        )
+    noun = "suggestion" if count == 1 else "suggestions"
+    return (
+        f"REFUSED: {mode} would apply {count} confidence='low' {noun}. "
+        "Re-run with --accept-low-confidence to override."
+    )
+
+
 def _rotate_backups(config_dir: pathlib.Path, keep: int = BACKUP_KEEP) -> int:
     """Keep `keep` most-recent axes.yaml.bak.* files; delete the rest."""
     backups = sorted(
@@ -176,6 +197,20 @@ def main() -> int:
                         axis_weight_suggestions.c.approved.is_(None)
                     ).order_by(axis_weight_suggestions.c.suggestion_id)
                 ))
+            eligible_low = [
+                row for row in pending
+                if CONFIDENCE_RANK.get(row.confidence, -1) >= min_rank
+                and row.confidence == "low"
+            ]
+            if eligible_low and not args.accept_low_confidence:
+                msg = low_confidence_refusal_message(
+                    mode=f"--all-above {args.all_above}",
+                    count=len(eligible_low),
+                )
+                print(f"[apply] {msg}")
+                run.note(msg)
+                run.failed = 1
+                return 2
             applied = 0
             for row in pending:
                 run.processed += 1
@@ -219,10 +254,10 @@ def main() -> int:
             and row.confidence == "low"
             and not args.accept_low_confidence
         ):
-            msg = (
-                f"REFUSED: suggestion_id={args.suggestion_id} has "
-                f"confidence='low' (sample_size={row.sample_size}). "
-                f"Re-run with --accept-low-confidence to override."
+            msg = low_confidence_refusal_message(
+                mode="single",
+                suggestion_id=args.suggestion_id,
+                sample_size=row.sample_size,
             )
             print(f"[apply] {msg}")
             run.note(msg)
