@@ -1,11 +1,32 @@
-"""Stage 7: generate emails + write CSV review queue.
+"""Stage 7: generate emails + write the CSV review queue.
 
-SESSION 1 MINIMAL VERSION. Reads one partner from a fixture, runs it through
-stubbed verification/quality/scoring, generates a draft via the LLM client
-(stub mode), and writes one CSV row. Session 7 replaces this with the full
-strategy-eligibility / two-variant / batch-QA implementation.
+For the top N partners by send_now_priority (default 25; Gate 5 fixture runs
+top 5), per partner:
+  1. Score the 6 strategies for eligibility (0-3); a strategy is usable only
+     at >= 2, and signal_led specifically requires a quality->=3 signal.
+  2. Pick two distinct strategies (or one with limited_variation=true).
+  3. Produce two variants, a deck_request_response, a follow-up draft, a
+     conversion hypothesis, and a likely-objection + preemption tag.
+  4. Validate against schemas/email_generation.py.
 
-Run: uv run scripts/07_generate_emails.py --workspace clients/test_workspace
+After per-partner generation, the batch is QA'd:
+  - pairwise body / first-sentence / subject similarity (rapidfuzz token_set)
+  - template-smell judge (LLM live, heuristic in stub mode) on each draft
+    against its 5 nearest neighbors
+  - hard gates (similarity, smell, raise reference, soft CTA, eligibility)
+  - warning gates (strategy concentration, CTA repetition, smell distribution)
+
+Outputs:
+  - email_drafts / followup_drafts / deck_request_responses rows replaced for
+    each partner in the batch
+  - one batch_qa_reports row
+  - clients/{workspace}/exports/review_queue.csv overwritten
+
+Stub mode: when no ANTHROPIC_API_KEY is resolvable, per-partner stub_response
+dicts come from a static EMAIL_BANK keyed on partner_id. The live LLM path is
+the same code path; only the stub_response source differs.
+
+Run: uv run scripts/07_generate_emails.py --workspace clients/test_workspace --top 5
 """
 from __future__ import annotations
 
@@ -13,16 +34,18 @@ import argparse
 import json
 import pathlib
 import sys
-from datetime import date, datetime, timezone
+from collections import Counter
+from datetime import datetime, timezone
 
-# Make repo-root packages (core, schemas) importable when run as a script.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import delete, select as sqla_select
+from sqlalchemy import delete, select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.csv_export import write_review_queue
 from core.db import (
+    batch_qa_reports,
+    deal_attributions,
     deck_request_responses,
     email_drafts,
     followup_drafts,
@@ -31,345 +54,752 @@ from core.db import (
     partner_score_summaries,
     partners,
     signals,
-    source_snapshots,
-    upsert,
 )
-from core.lead_likelihood import compute_lead_likelihood
 from core.llm.client import MODEL_EMAIL, LLMClient
-from core.round_fit import compute_round_fit
 from core.runs import RunLogger
-from core.signal_quality import score_signal
-from core.verification import verify_signal
+from core.similarity import first_sentence, ratio_similarity, token_set_similarity
 from schemas.email_generation import EmailOutput
 
-BATCH_ID = "session1"
 STAGE = "07_generate_emails"
+PROMPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "generate_email.txt"
 
+# Batch QA thresholds (brief).
+SIM_BODY_HARD = 0.82
+SIM_FIRST_HARD = 0.70
+SIM_SUBJECT_HARD = 0.75
+WARN_STRATEGY_SHARE = 0.35
+WARN_FIRST_SENT_SHARE = 0.25
+WARN_CTA_SHARE = 0.20
+WARN_TEMPLATE_LOW_SHARE = 0.80
+
+# Forbidden phrases (universal + founder-voice banned).
+UNIVERSAL_FORBIDDEN = [
+    "building the future of", "would love", "circling back",
+    "wanted to reach out", "hope this finds you", "quick question",
+    "pressure-test", "compare notes", "thesis chat", "get your feedback",
+    "synergy", "game-changing", "excited to",
+]
+SOFT_CTA_PHRASES = [
+    "thesis chat", "feedback", "pressure-test", "compare notes",
+    "grab coffee", "would love to chat",
+]
+
+
+# ------- strategy eligibility -------
+
+def compute_eligibility(
+    has_q3: bool,
+    has_q2: bool,
+    fund_adjacent: bool,
+    partner_led_in_target: bool,
+    market_window_match: bool,
+    company_traction_proof: bool,
+) -> dict[str, int]:
+    """0-3 score per strategy. Only >=2 may be used."""
+    return {
+        "signal_led": 3 if has_q3 else (2 if has_q2 else 0),
+        "portfolio_led": 3 if fund_adjacent else 0,
+        "round_pattern_led": 3 if partner_led_in_target else 0,
+        "market_shift_led": 2 if market_window_match else 0,
+        "contrarian_thesis_led": 2 if has_q3 else 0,
+        "traction_led": 2 if company_traction_proof else 0,
+    }
+
+
+# Tie-break order when two strategies score equally: strongest evidence shape
+# first. signal_led/portfolio_led/round_pattern_led are concrete; market_shift
+# and traction lean general; contrarian_thesis_led is last because it leans on
+# rhetorical risk.
+STRATEGY_TIE_BREAK = (
+    "signal_led",
+    "portfolio_led",
+    "round_pattern_led",
+    "market_shift_led",
+    "traction_led",
+    "contrarian_thesis_led",
+)
+
+
+def pick_strategies(elig: dict[str, int]) -> list[str]:
+    """Return up to two eligible strategies, highest score first then tie-break."""
+    eligible = sorted(
+        [(s, score) for s, score in elig.items() if score >= 2],
+        key=lambda x: (-x[1], STRATEGY_TIE_BREAK.index(x[0])),
+    )
+    return [s for s, _ in eligible[:2]]
+
+
+# ------- stub email bank (fixture path) -------
+
+DECK_RESPONSE_TEMPLATE = (
+    "Deck attached. The reporting regimes that matter most depend on which "
+    "fintechs in your portfolio sit closest to the mandates, so 30 minutes "
+    "lets me show the slides that are actually relevant rather than the "
+    "generic version. Happy to do that this week: https://cal.example/dana-tendril"
+)
+
+EMAIL_BANK: dict[str, dict] = {
+    "northbeam.example_priya_anand": {
+        "signal_led": {
+            "subject": "Reporting wedge, productized",
+            "body": (
+                "On the Distribution podcast you said compliance reporting is the "
+                "wedge nobody wants to build but everyone regulated has to buy. "
+                "Tendril is that wedge productized: a regulatory-reporting API at "
+                "$180K ARR with 128% net revenue retention across four design "
+                "partners. "
+                "State mandates land this quarter, so the wedge framing is about "
+                "to be tested in production for every regulated fintech. "
+                "I would like 30 minutes to walk through it; we are raising a $3M "
+                "Seed closing in 8 weeks: https://cal.example/dana-tendril"
+            ),
+            "conversion_hypothesis": (
+                "Anand's public wedge framing applies directly to a company that "
+                "already monetizes that wedge, so the meeting is about underwriting "
+                "rather than introducing a category."
+            ),
+            "likely_objection": "Too early; only four design partners.",
+            "objection_preempted": True,
+            "preemption_line": (
+                "$180K ARR with 128% net revenue retention across four design partners"
+            ),
+        },
+        "portfolio_led": {
+            "subject": "Tendril, adjacent to Comply.io",
+            "body": (
+                "Comply.io and LedgerKit, both Northbeam-backed, sit one layer down "
+                "the stack from where Tendril operates. "
+                "We ship regulatory reporting as an API and have moved four design "
+                "partners from build to buy with retention of 128% in year one. "
+                "Mandates landing this quarter are pulling fintech pipelines ahead "
+                "of plan, including ours. "
+                "Raising a $3M Seed; first close 8 weeks out. I would like 30 "
+                "minutes for the walk-through: https://cal.example/dana-tendril"
+            ),
+        },
+        "followup_draft": (
+            "Following up: we signed a fifth design partner this week and our "
+            "first close is now 6 weeks out. Still worth 30 minutes to walk you "
+            "through the round?"
+        ),
+    },
+    "northbeam.example_marcus_lindqvist": {
+        "signal_led": {
+            "subject": "Reconciliation, plus reporting",
+            "body": (
+                "Your DevFin point that reconciliation infrastructure is the most "
+                "boring and most valuable thing in fintech tracks the shape of "
+                "what we are building. "
+                "Tendril is the reporting-API layer for regulated fintechs, "
+                "deployed in days rather than the months they typically lose to "
+                "compliance wiring. "
+                "Customers move from build to buy when a mandate landing date is "
+                "fixed, which is exactly what is happening to our pipeline this "
+                "quarter. "
+                "Raising a $3M Seed; first close 8 weeks out. 30 minutes for the "
+                "round: https://cal.example/dana-tendril"
+            ),
+            "conversion_hypothesis": (
+                "Lindqvist values boring infrastructure-as-product; Tendril's "
+                "reporting API is the same shape of plumbing his thesis underwrites."
+            ),
+            "likely_objection": "Reporting is a feature, not a company.",
+            "objection_preempted": True,
+            "preemption_line": (
+                "deployed in days rather than the months they typically lose to "
+                "compliance wiring"
+            ),
+        },
+        "portfolio_led": {
+            "subject": "Tendril, next to Paywall",
+            "body": (
+                "Paywall and Comply.io live in adjacent regulated-finance plumbing; "
+                "Tendril extends that surface into reporting. "
+                "$180K ARR, 128% NRR, four design partners shipping reporting via "
+                "our API rather than internal builds. "
+                "The mandate window this quarter is forcing fintechs to buy this "
+                "category, ahead of our pipeline plan. "
+                "We are raising a $3M Seed and I would like 30 minutes to walk "
+                "you through the round: https://cal.example/dana-tendril"
+            ),
+        },
+        "followup_draft": (
+            "Follow-up: a regulated payments customer just signed a six-figure "
+            "pilot and first close is 6 weeks out. Worth 30 minutes to walk you "
+            "through the round?"
+        ),
+    },
+    "tidewater.example_dana_cole": {
+        "signal_led": {
+            "subject": "Design partners, not sign-ups",
+            "body": (
+                "Your Tidewater note that five design partners doing real work "
+                "beats a thousand sign-ups is the exact motion that took Tendril "
+                "to $180K ARR. "
+                "We have four paying design partners on our regulatory reporting "
+                "API, retention at 128% in a category where churn is normally high. "
+                "State mandates this quarter are turning every regulated fintech "
+                "into a forced buyer of this category rather than a builder. "
+                "We are raising a $3M Seed closing in 8 weeks and I would like 30 "
+                "minutes to walk through the round: https://cal.example/dana-tendril"
+            ),
+            "conversion_hypothesis": (
+                "Cole's investment criterion (design partners over PLG) is exactly "
+                "how Tendril got to its first revenue, so the conversation maps to "
+                "her stated decision frame."
+            ),
+            "likely_objection": "Wrong stack; Tendril is fintech, not pure B2B ops.",
+            "objection_preempted": True,
+            "preemption_line": (
+                "turning every regulated fintech into a forced buyer of this category "
+                "rather than a builder"
+            ),
+        },
+        "traction_led": {
+            "subject": "Tendril seed, 128% NRR",
+            "body": (
+                "Tendril is at $180K ARR with 128% net revenue retention across "
+                "four design partners in a category where churn is normally high. "
+                "The product is a regulatory-reporting API for fintechs, replacing "
+                "months of internal compliance work with days of integration. "
+                "Mandate landing dates this quarter mean buyers no longer have the "
+                "luxury of building it themselves. "
+                "We are raising a $3M Seed; I would like 30 minutes for the "
+                "walk-through: https://cal.example/dana-tendril"
+            ),
+        },
+        "followup_draft": (
+            "Follow-up: our pipeline added two more fintechs this week and we are "
+            "6 weeks from first close. Still worth 30 minutes to walk you through "
+            "the round?"
+        ),
+    },
+    "tidewater.example_renee_park": {
+        "signal_led": {
+            "subject": "Founder sales, regulated buyers",
+            "body": (
+                "Your substack point that a seed founder not doing sales themselves "
+                "does not understand the buyer is how I closed our first four "
+                "design partners on the regulatory reporting API. "
+                "Tendril is at $180K ARR, retention 128%, in a category where "
+                "buyers are about to be forced into the buy decision by mandate "
+                "deadlines. "
+                "Founder-led sales is also the only way I have been able to read "
+                "the compliance reporting buyer before the category was obvious. "
+                "Raising a $3M Seed closing in 8 weeks; 30 minutes for the round: "
+                "https://cal.example/dana-tendril"
+            ),
+            "conversion_hypothesis": (
+                "Park's belief about founder-led sales maps to the literal motion "
+                "that produced Tendril's first four design partners."
+            ),
+            "likely_objection": "Stage and check-size mismatch with Tidewater.",
+            "objection_preempted": False,
+            "preemption_line": None,
+        },
+        "traction_led": {
+            "subject": "Tendril, retention at 128%",
+            "body": (
+                "Four paying design partners on Tendril's regulatory reporting API, "
+                "$180K ARR, retention 128% in a category where churn is normally "
+                "the dominant force. "
+                "The product replaces months of compliance wiring with days of "
+                "integration via API, which is what makes the retention hold. "
+                "State mandate dates land this quarter; the buyers in our pipeline "
+                "are turning from build into buy faster than we are raising. "
+                "Raising a $3M Seed and I would like 30 minutes on the round: "
+                "https://cal.example/dana-tendril"
+            ),
+        },
+        "followup_draft": (
+            "Follow-up: design partner number five just signed and first close is "
+            "6 weeks out. Worth 30 minutes for the walk-through?"
+        ),
+    },
+    "foundrynorth.example_kwame_boateng": {
+        "signal_led": {
+            "subject": "Policy windows, regulated fintech",
+            "body": (
+                "Your Climate Podcast framing that policy-shaped markets create "
+                "forced-buy windows worth underwriting is the exact dynamic "
+                "playing out in fintech compliance this quarter. "
+                "Tendril is the regulatory-reporting API turning that mandate "
+                "window into a buy decision for fintechs; $180K ARR, retention "
+                "128%, four design partners. "
+                "Pipeline is pulling ahead of the round because the buyers no "
+                "longer have the option of waiting. "
+                "Raising a $3M Seed; I would like 30 minutes to walk you through "
+                "the round: https://cal.example/dana-tendril"
+            ),
+            "conversion_hypothesis": (
+                "Boateng's policy-driven forced-buy framing is exactly the playbook "
+                "Tendril is running in regulated finance, even if his usual sector "
+                "is climate."
+            ),
+            "likely_objection": "Wrong sector; Foundry is climate-focused.",
+            "objection_preempted": True,
+            "preemption_line": (
+                "the exact dynamic playing out in fintech compliance this quarter"
+            ),
+        },
+        "market_shift_led": {
+            "subject": "Mandate window, buy or fail",
+            "body": (
+                "New state-level reporting mandates landing this quarter are "
+                "turning regulated fintech compliance into a buy-or-fail decision, "
+                "the same policy-window shape Foundry underwrites in climate. "
+                "Tendril ships the reporting layer as an API; $180K ARR with "
+                "retention 128% across our first four design partners. "
+                "The fintechs facing these mandates are pulling our pipeline "
+                "forward faster than the round itself. "
+                "We are raising a $3M Seed and I would like 30 minutes for the "
+                "walk-through: https://cal.example/dana-tendril"
+            ),
+        },
+        "followup_draft": (
+            "Follow-up: another regulated fintech signed a pilot this week and "
+            "first close is 6 weeks out. 30 minutes to walk you through the round?"
+        ),
+    },
+}
+
+
+# ------- live LLM prompt assembly (built but exercised only when key present) -------
+
+def build_live_prompt(*, company_cfg, partner_name, fund_name, signals_for_partner,
+                      deals_for_partner, examples_dir) -> str:
+    c = company_cfg["company"]
+    rc = company_cfg["raise_context"]
+    rh = rc.get("round_hook") or {}
+    return (
+        PROMPT_PATH.read_text(encoding="utf-8")
+        .replace("{COMPANY_NAME}", c["name"])
+        .replace("{FOUNDER_NAME}", c["founder_name"])
+        .replace("{ROUND}", rc.get("round", ""))
+        .replace("{RAISE_AMOUNT}", rc.get("amount", ""))
+        .replace("{RAISE_STATUS}", rc.get("status", ""))
+        .replace("{RAISE_TIMING}", rc.get("timing", ""))
+        .replace("{WHY_THIS_ROUND_IS_FUNDABLE_NOW}", rc.get("why_this_round_is_fundable_now", ""))
+        .replace("{WHAT_CHANGES_AFTER_THIS_ROUND}", rc.get("what_changes_after_this_round", ""))
+        .replace("{ROUND_HOOK_REASON}", rh.get("strongest_reason_to_meet_now", ""))
+        .replace("{ROUND_HOOK_CONSEQUENCE}", rh.get("investor_consequence_of_waiting", ""))
+        .replace("{ROUND_HOOK_MOMENTUM_PROOF}", rh.get("round_momentum_proof", ""))
+        .replace("{COMPANY_DESCRIPTION}", c.get("description", ""))
+        .replace("{STRONGEST_RAISE_PROOF}", rc.get("strongest_raise_proof", ""))
+        .replace("{HEADLINE_METRIC}", c.get("current_traction", {}).get("headline_metric", ""))
+        .replace("{SECONDARY_METRICS}", ", ".join(c.get("current_traction", {}).get("secondary_metrics", [])))
+        .replace("{CUSTOMER_EVIDENCE}", "")
+        .replace("{TECHNICAL_VALIDATION}", "")
+        .replace("{NON_DILUTIVE_OR_STRATEGIC}", rc.get("notable_existing_investors_or_non_dilutive", ""))
+        .replace("{FOUNDER_MARKET_FIT}", "")
+        .replace("{PARTNER_NAME}", partner_name or "")
+        .replace("{FUND_NAME}", fund_name or "")
+        .replace("{COMPOSITE_SCORE}", "")
+        .replace("{ROUND_FIT_SCORE}", "")
+        .replace("{LEAD_LIKELIHOOD_SCORE}", "")
+        .replace("{TOP_AXES_NAMES_AND_SCORES}", "")
+        .replace("{TOP_SIGNALS}", json.dumps([
+            {"quote": s["quote"], "url": s["source_url"], "date": str(s.get("date"))}
+            for s in signals_for_partner[:3]
+        ]))
+        .replace("{ADJACENT_PORTFOLIO_COMPANIES}", "")
+        .replace("{RECENT_PARTNER_LED_DEALS}", json.dumps([
+            {"company": d["company"], "round": d.get("round_type")}
+            for d in deals_for_partner
+        ]))
+        .replace("{COMM_STYLE}", "")
+        .replace("{KILL_SIGNALS}", "")
+        .replace("{FOUNDER_VOICE_STYLE}", (company_cfg.get("founder_voice") or {}).get("style", ""))
+        .replace("{FOUNDER_BANNED_PHRASES}", ", ".join(
+            (company_cfg.get("founder_voice") or {}).get("banned_phrases", [])
+        ))
+        .replace("{EXAMPLES_DIR}", str(examples_dir))
+        .replace("{MEETING_DURATION}", str(c.get("meeting_ask", {}).get("duration_minutes", 30)))
+        .replace("{MEETING_FORMAT}", c.get("meeting_ask", {}).get("format", "video call"))
+        .replace("{SCHEDULING_LINK}", c.get("meeting_ask", {}).get("preferred_scheduling_link", ""))
+    )
+
+
+def build_stub_response(partner_id: str, strategies: list[str]) -> dict | None:
+    """Construct an EmailOutput-shaped stub from the in-script bank.
+
+    Returns None if the partner has no bank entry (stub mode can't generate).
+    """
+    bank = EMAIL_BANK.get(partner_id)
+    if not bank:
+        return None
+    variants = []
+    for s in strategies:
+        if s not in bank:
+            continue
+        v = bank[s]
+        variants.append({
+            "strategy": s,
+            "subject": v["subject"],
+            "body": v["body"],
+            "conversion_hypothesis": v.get("conversion_hypothesis", ""),
+            "likely_objection": v.get("likely_objection", ""),
+            "objection_preempted": v.get("objection_preempted", False),
+            "preemption_line": v.get("preemption_line"),
+            "template_smell": "unscored",
+        })
+    if not variants:
+        return None
+    limited = len(variants) < 2
+    return {
+        "variants": variants,
+        "recommended_variant_strategy": variants[0]["strategy"],
+        "recommendation_reasoning": (
+            "Primary strategy carries the strongest evidence; alternate offers a "
+            "different opening logic at acceptable eligibility."
+        ),
+        "limited_variation": limited,
+        "limited_variation_reason": (
+            "only one eligible strategy in fixture bank" if limited else None
+        ),
+        "deck_request_response": DECK_RESPONSE_TEMPLATE,
+        "followup_draft": bank.get("followup_draft", ""),
+    }
+
+
+# ------- batch QA -------
+
+def check_hard_gates(draft: dict, banned: list[str]) -> list[str]:
+    """Per-draft hard gates that disqualify a draft."""
+    fails: list[str] = []
+    body_lower = (draft.get("body") or "").lower()
+    if not any(k in body_lower for k in ("raising", " raise ")):
+        fails.append("missing explicit raise reference in body")
+    if any(p in body_lower for p in SOFT_CTA_PHRASES):
+        fails.append("soft CTA phrase present")
+    for ph in UNIVERSAL_FORBIDDEN + banned:
+        if ph and ph.lower() in body_lower:
+            fails.append(f"forbidden phrase: {ph!r}")
+    if "—" in (draft.get("body") or ""):
+        fails.append("em dash in body")
+    if "!" in (draft.get("body") or ""):
+        fails.append("exclamation mark in body")
+    return fails
+
+
+def template_smell_judge(
+    draft_body: str, neighbor_bodies: list[str]
+) -> tuple[str, bool, bool]:
+    """Heuristic stub judge: returns (smell, sounds_mass_generated, too_similar).
+
+    `high` is reserved for near-duplicates above the body hard gate (0.82). The
+    judge promotes to `medium` when a draft shares its opening structure with a
+    neighbor (the brief's "same first-sentence structural pattern" warning) or
+    sits in the 0.80-0.82 body-similarity band. Token-set similarity in a tight
+    single-company batch will inherently run in the 0.60-0.78 range due to
+    shared CTA and product vocabulary; that range is `low`.
+    """
+    if not neighbor_bodies:
+        return "low", False, False
+    body_sims = [token_set_similarity(draft_body, n) for n in neighbor_bodies if n]
+    fs_a = first_sentence(draft_body)
+    fs_sims = [
+        ratio_similarity(fs_a, first_sentence(n)) for n in neighbor_bodies if n
+    ]
+    max_body = max(body_sims) if body_sims else 0.0
+    max_first = max(fs_sims) if fs_sims else 0.0
+    too_similar = max_body > 0.78
+    mass = max_first > 0.70
+    if max_body > 0.82:
+        return "high", mass, True
+    if mass or max_body > 0.80:
+        return "medium", mass, too_similar
+    return "low", mass, too_similar
+
+
+def evaluate_batch(
+    recommended_drafts: list[dict],
+    all_drafts: list[dict],
+) -> dict:
+    """Compute similarity, template_smell, and gate report for the batch."""
+    # Similarity check across recommended drafts.
+    sim_failures: list[tuple[str, str, str, float]] = []
+    bodies = [(d["partner_id"], d["body"]) for d in recommended_drafts]
+    subjects = [(d["partner_id"], d.get("subject") or "") for d in recommended_drafts]
+    for i in range(len(bodies)):
+        for j in range(i + 1, len(bodies)):
+            sb = token_set_similarity(bodies[i][1], bodies[j][1])
+            if sb > SIM_BODY_HARD:
+                sim_failures.append((bodies[i][0], bodies[j][0], "body", sb))
+            fa = first_sentence(bodies[i][1])
+            fb = first_sentence(bodies[j][1])
+            sf = ratio_similarity(fa, fb)
+            if sf > SIM_FIRST_HARD:
+                sim_failures.append((bodies[i][0], bodies[j][0], "first_sentence", sf))
+            ss = ratio_similarity(subjects[i][1], subjects[j][1])
+            if ss > SIM_SUBJECT_HARD:
+                sim_failures.append((subjects[i][0], subjects[j][0], "subject", ss))
+
+    # Per-draft template-smell judging against 5 nearest neighbors.
+    for d in all_drafts:
+        others = [o["body"] for o in all_drafts if o is not d]
+        others_with_sim = sorted(
+            ((token_set_similarity(d["body"], b), b) for b in others),
+            key=lambda x: -x[0],
+        )[:5]
+        neighbors = [b for _, b in others_with_sim]
+        smell, mass, too_sim = template_smell_judge(d["body"], neighbors)
+        d["template_smell"] = smell
+        d["sounds_mass_generated"] = mass
+        d["too_similar_to_neighbors"] = too_sim
+
+    smell_high_count = sum(1 for d in all_drafts if d["template_smell"] == "high")
+    smell_low_count = sum(1 for d in all_drafts if d["template_smell"] == "low")
+    raise_missing = sum(
+        1 for d in all_drafts
+        if not any(k in (d["body"] or "").lower() for k in ("raising", " raise "))
+    )
+
+    # Strategy distribution (recommended drafts only).
+    strategy_counts = Counter(d["strategy"] for d in recommended_drafts)
+    n_rec = max(1, len(recommended_drafts))
+    warnings: list[str] = []
+    for strat, n in strategy_counts.items():
+        if n / n_rec > WARN_STRATEGY_SHARE:
+            warnings.append(
+                f"strategy {strat!r} used by {n}/{n_rec} drafts "
+                f"({n/n_rec:.0%}); evidence quality should justify it"
+            )
+    smell_low_share = smell_low_count / max(1, len(all_drafts))
+    if smell_low_share < WARN_TEMPLATE_LOW_SHARE:
+        warnings.append(
+            f"only {smell_low_share:.0%} of drafts are template_smell=low "
+            f"(target >= {WARN_TEMPLATE_LOW_SHARE:.0%})"
+        )
+
+    hard_fail_reasons: list[str] = []
+    if sim_failures:
+        hard_fail_reasons.append(f"{len(sim_failures)} similarity gate failure(s)")
+    if smell_high_count:
+        hard_fail_reasons.append(f"{smell_high_count} draft(s) template_smell=high")
+    if raise_missing:
+        hard_fail_reasons.append(f"{raise_missing} draft(s) missing raise reference")
+
+    return {
+        "similarity_failures": sim_failures,
+        "similarity_failure_count": len(sim_failures),
+        "template_smell_high_count": smell_high_count,
+        "template_smell_low_count": smell_low_count,
+        "raise_reference_missing_count": raise_missing,
+        "strategy_distribution": dict(strategy_counts),
+        "warnings": warnings,
+        "hard_fail_reasons": hard_fail_reasons,
+        "passed": not hard_fail_reasons,
+    }
+
+
+# ------- main -------
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _signal_recency_bonus(signal_date: date | None) -> float:
-    if signal_date is None:
-        return 0.0
-    days = (date.today() - signal_date).days
-    if days <= 90:
-        return 2.0
-    if days <= 180:
-        return 1.0
-    return 0.0
-
-
-def _build_email_stub(cfg: dict, partner_row: dict, signal_row: dict) -> dict:
-    """Construct a schema-shaped EmailOutput stub for offline (stub-mode) runs.
-
-    In live mode this would be the validated model output; in stub mode the
-    LLM client validates this same dict so the data shape is proven end to end.
-    """
-    c = cfg["company"]
-    raise_ctx = cfg["raise_context"]
-    link = c["meeting_ask"]["preferred_scheduling_link"]
-    duration = c["meeting_ask"]["duration_minutes"]
-    recommended_body = (
-        f"On the Distribution podcast you said compliance reporting is the wedge "
-        f"nobody wants to build but everyone regulated has to buy. "
-        f"{c['name']} turns regulatory reporting into an API that ships in days, "
-        f"with 128% net revenue retention across our first 4 design partners. "
-        f"New state mandates land this quarter, so regulated fintechs are in a "
-        f"forced-buy window now. We are raising a {raise_ctx['amount']} Seed with "
-        f"first close in 8 weeks and I want to book {duration} minutes to walk you "
-        f"through the company and round: {link}"
-    )
-    alt_body = (
-        f"{c['name']} has reached $180K ARR with 128% net revenue retention across "
-        f"4 paying design partners in regulatory reporting, a category where churn "
-        f"is normally high. New state mandates this quarter turn build into buy for "
-        f"regulated fintechs. We are raising a $3M Seed closing in 8 weeks and I want "
-        f"to book {duration} minutes to walk you through the company and round: {link}"
-    )
-    return {
-        "variants": [
-            {
-                "strategy": "signal_led",
-                "subject": "Regulated reporting, forced buy",
-                "body": recommended_body,
-                "conversion_hypothesis": (
-                    "Anand has publicly framed compliance reporting as a wedge, so a "
-                    "company that already monetizes that wedge maps directly to a "
-                    "stated belief and a deployable seed thesis."
-                ),
-                "likely_objection": "Too early; only 4 design partners.",
-                "objection_preempted": True,
-                "preemption_line": (
-                    "with 128% net revenue retention across our first 4 design partners"
-                ),
-                "template_smell": "unscored",
-            },
-            {
-                "strategy": "traction_led",
-                "subject": "Tendril seed, 128% NRR",
-                "body": alt_body,
-                "conversion_hypothesis": (
-                    "Retention is the cleanest seed-stage proof and a metrics-oriented "
-                    "investor can underwrite it without a category debate."
-                ),
-                "likely_objection": "Small absolute ARR.",
-                "objection_preempted": True,
-                "preemption_line": "128% net revenue retention",
-                "template_smell": "unscored",
-            },
-        ],
-        "recommended_variant_strategy": "signal_led",
-        "recommendation_reasoning": (
-            "The verified podcast quote is a quality-3 signal that gives the strongest, "
-            "most partner-specific opener."
-        ),
-        "limited_variation": False,
-        "limited_variation_reason": None,
-        "deck_request_response": (
-            "Deck attached. The reporting regimes that matter most to you depend on "
-            "your portfolio's exposure, so 30 minutes lets me show the parts that are "
-            "actually relevant rather than the generic version. Happy to do that "
-            f"this week: {c['meeting_ask']['preferred_scheduling_link']}"
-        ),
-        "followup_draft": (
-            "Following up: we signed a fifth design partner this week and first close "
-            "is now 6 weeks out. Still worth 30 minutes to walk you through the round?"
-        ),
-    }
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Stage 7 (Session 1 minimal).")
+    parser = argparse.ArgumentParser(description="Stage 7 email generation + CSV write.")
     add_workspace_arg(parser)
+    parser.add_argument("--top", type=int, default=25,
+                        help="Top-N partners by send_now_priority (Gate 5 uses 5).")
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)
+    batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    banned = (ws.company.get("founder_voice") or {}).get("banned_phrases", []) or []
+    target_sectors = {
+        s.lower()
+        for s in (ws.company.get("company") or {}).get("target_sectors", []) or []
+    }
 
-    fixture_path = ws.fixtures_dir / "session1_fixture.json"
-    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-    fund = fixture["fund"]
-    partner = fixture["partner"]
-    signal = fixture["signal"]
+    # ---- pull top-N partners + their context ----
+    with engine.begin() as conn:
+        rows = list(conn.execute(
+            select(
+                partner_score_summaries,
+                partners.c.name.label("partner_name"),
+                partners.c.title,
+                partners.c.linkedin_url,
+                partners.c.warm_path_available,
+                partners.c.bio,
+                funds.c.name.label("fund_name"),
+                funds.c.domain.label("fund_domain"),
+                funds.c.stated_thesis,
+            )
+            .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
+            .join(funds, funds.c.fund_id == partners.c.fund_id)
+            .order_by(partner_score_summaries.c.send_now_priority.desc())
+            .limit(args.top)
+        ))
+        # Per-partner: verified quality>=2 signals.
+        signals_by_partner: dict[str, list[dict]] = {}
+        for s in conn.execute(
+            select(signals).where(
+                signals.c.verified.is_(True),
+                signals.c.signal_quality_score >= 2,
+            )
+        ):
+            signals_by_partner.setdefault(s.partner_id, []).append({
+                "id": int(s.signal_id),
+                "quote": s.quoted_text,
+                "source_url": s.source_url,
+                "source_type": s.source_type,
+                "axes": json.loads(s.axis_relevance or "[]"),
+                "direction": s.signal_direction,
+                "quality": int(s.signal_quality_score),
+                "date": s.quote_date,
+            })
+        # Partner-attributed deals.
+        deals_by_partner: dict[str, list[dict]] = {}
+        for d in conn.execute(select(deal_attributions)):
+            if d.attributed_partner_id:
+                deals_by_partner.setdefault(d.attributed_partner_id, []).append({
+                    "company": d.company,
+                    "round_type": d.round_type,
+                    "round_size_usd": d.round_size_usd,
+                    "announcement_date": d.announcement_date,
+                    "lead_fund_id": d.lead_fund_id,
+                })
 
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
-        run.processed = 1
-        try:
-            partner_id = partner["partner_id"]
+        recommended_drafts: list[dict] = []
+        all_drafts: list[dict] = []
+        partner_outputs: list[tuple[dict, EmailOutput, list[str]]] = []
 
-            # --- Persist fund + partner (idempotent upserts) ---
-            with engine.begin() as conn:
-                upsert(conn, funds, ["fund_id"], {
-                    "fund_id": fund["fund_id"],
-                    "name": fund["name"],
-                    "domain": fund["domain"],
-                    "stated_thesis": fund["stated_thesis"],
-                    "stated_stage_focus": fund["stated_stage_focus"],
-                    "check_size_range": fund["check_size_range"],
-                    "last_known_activity_date": date.fromisoformat(
-                        fund["last_known_activity_date"]),
-                    "is_active": fund["is_active"],
-                    "kill_signals": fund["kill_signals"],
-                    "source_urls": fund["source_urls"],
-                    "last_updated": _now(),
-                })
-                upsert(conn, partners, ["partner_id"], {
-                    "partner_id": partner_id,
-                    "fund_id": partner["fund_id"],
-                    "name": partner["name"],
-                    "title": partner["title"],
-                    "linkedin_url": partner["linkedin_url"],
-                    "twitter_handle": partner["twitter_handle"],
-                    "bio": partner["bio"],
-                    "employment_status": partner["employment_status"],
-                    "last_updated": _now(),
-                })
+        for row in rows:
+            run.processed += 1
+            partner_id = row.partner_id
+            try:
+                p_signals = signals_by_partner.get(partner_id, [])
+                p_deals = deals_by_partner.get(partner_id, [])
 
-            # --- Signal: snapshot, verify, score quality, idempotent insert ---
-            # Session 1 path: persist a snapshot containing the quote so the
-            # real verification gauntlet (Session 5) can confirm via snapshot
-            # fallback in the absence of network.
-            import hashlib as _hl
-            snap_text = signal["quoted_text"]
-            chash = _hl.sha256(snap_text.encode("utf-8")).hexdigest()
-            with engine.begin() as conn:
-                existing_snap = conn.execute(
-                    sqla_select(source_snapshots.c.snapshot_id).where(
-                        source_snapshots.c.source_url == signal["source_url"],
-                        source_snapshots.c.content_hash == chash,
+                # ---- strategy eligibility ----
+                has_q3 = any(s["quality"] >= 3 for s in p_signals)
+                has_q2 = any(s["quality"] >= 2 for s in p_signals)
+                # Loose single-keyword match is too generous (e.g. "infrastructure"
+                # matches both Foundry-style climate-infra and Northbeam-style
+                # fintech-infra). Require >=2 target-sector keyword hits.
+                thesis_lower = (row.stated_thesis or "").lower()
+                fund_adjacent = sum(
+                    1 for kw in target_sectors if kw and kw in thesis_lower
+                ) >= 2
+                # partner_led_in_target: partner has a named-lead deal at a fund
+                # whose thesis is target-adjacent.
+                partner_led_in_target = bool(p_deals) and fund_adjacent
+                # market_shift_led eligibility: partner has signal tagged with the
+                # axis describing timing-driven category conviction.
+                market_window_match = any(
+                    "axis_4" in s["axes"] for s in p_signals
+                )
+                company_traction_proof = True  # Tendril has 128% NRR, etc.
+
+                elig = compute_eligibility(
+                    has_q3=has_q3,
+                    has_q2=has_q2,
+                    fund_adjacent=fund_adjacent,
+                    partner_led_in_target=partner_led_in_target,
+                    market_window_match=market_window_match,
+                    company_traction_proof=company_traction_proof,
+                )
+                strategies = pick_strategies(elig)
+                if not strategies:
+                    run.skipped += 1
+                    run.log_error(
+                        partner_id, "no_eligible_strategies",
+                        f"strategy eligibility: {elig}"
                     )
-                ).first()
-                if existing_snap:
-                    snap_id = int(existing_snap.snapshot_id)
-                else:
-                    snap_id = int(conn.execute(source_snapshots.insert().values(
-                        source_url=signal["source_url"],
-                        fetched_at=_now(),
-                        http_status=200,
-                        content_hash=chash,
-                        extracted_text=snap_text,
-                        fetched_during_stage=STAGE,
-                    )).inserted_primary_key[0])
-            ver = verify_signal(
-                engine, signal["source_url"], signal["quoted_text"], snap_id
-            )
-            qual = score_signal(
-                llm,
-                quoted_text=signal["quoted_text"],
-                axis_relevance=signal["axis_relevance"],
-                quote_date=signal["quote_date"],
-                source_url=signal["source_url"],
-                signal_direction=signal["signal_direction"],
-                confidence=signal["confidence"],
-                company_description=ws.company["company"]["description"],
-                company_name=ws.company["company"]["name"],
-            )
-            signal_date = date.fromisoformat(signal["quote_date"])
-            with engine.begin() as conn:
-                conn.execute(
-                    delete(signals).where(
-                        signals.c.partner_id == partner_id,
-                        signals.c.source_url == signal["source_url"],
+                    continue
+
+                # ---- generate (live LLM or stub) ----
+                stub = build_stub_response(partner_id, strategies)
+                # Live mode needs a stub_response too (the client requires one);
+                # if the partner isn't in the bank, fall back to limited variation.
+                if stub is None:
+                    stub = {
+                        "variants": [],
+                        "recommended_variant_strategy": None,
+                        "recommendation_reasoning": (
+                            "No fixture bank entry; live LLM would generate here."
+                        ),
+                        "limited_variation": True,
+                        "limited_variation_reason": (
+                            "stub-mode bank has no entry for this partner"
+                        ),
+                        "deck_request_response": DECK_RESPONSE_TEMPLATE,
+                        "followup_draft": "",
+                    }
+                # Live mode would build the full prompt; in stub mode the client
+                # validates the stub directly.
+                prompt = build_live_prompt(
+                    company_cfg=ws.company,
+                    partner_name=row.partner_name,
+                    fund_name=row.fund_name,
+                    signals_for_partner=p_signals,
+                    deals_for_partner=p_deals,
+                    examples_dir=ws.examples_dir,
+                )
+                output: EmailOutput = llm.complete_json(
+                    prompt=prompt,
+                    schema=EmailOutput,
+                    model=MODEL_EMAIL,
+                    stub_response=stub,
+                )
+
+                # Track drafts for batch QA.
+                draft_recs: list[str] = []
+                for v in output.variants:
+                    is_rec = (v.strategy == output.recommended_variant_strategy)
+                    draft_recs.append(v.strategy)
+                    rec = {
+                        "partner_id": partner_id,
+                        "partner_name": row.partner_name,
+                        "strategy": v.strategy,
+                        "subject": v.subject,
+                        "body": v.body,
+                        "is_recommended": is_rec,
+                    }
+                    all_drafts.append(rec)
+                    if is_rec:
+                        recommended_drafts.append(rec)
+                partner_outputs.append((dict(row._mapping), output, draft_recs))
+                run.succeeded += 1
+            except Exception as exc:  # noqa: BLE001
+                run.failed += 1
+                run.log_error(partner_id, type(exc).__name__, str(exc))
+
+        # ---- batch QA ----
+        qa = evaluate_batch(recommended_drafts, all_drafts)
+
+        # ---- persistence ----
+        partner_ids_in_batch = [r.partner_id for r in rows]
+        with engine.begin() as conn:
+            for pid in partner_ids_in_batch:
+                conn.execute(delete(email_drafts).where(email_drafts.c.partner_id == pid))
+                conn.execute(delete(followup_drafts).where(followup_drafts.c.partner_id == pid))
+                conn.execute(delete(deck_request_responses).where(
+                    deck_request_responses.c.partner_id == pid))
+
+            # Index per-draft QA results by (partner_id, strategy).
+            qa_by_key = {
+                (d["partner_id"], d["strategy"]): d for d in all_drafts
+            }
+            for ctx, output, _ in partner_outputs:
+                pid = ctx["partner_id"]
+                for v in output.variants:
+                    is_rec = (v.strategy == output.recommended_variant_strategy)
+                    smell_info = qa_by_key.get((pid, v.strategy), {})
+                    hard_fails = check_hard_gates(
+                        {"subject": v.subject, "body": v.body}, banned
                     )
-                )
-                conn.execute(signals.insert().values(
-                    partner_id=partner_id,
-                    snapshot_id=snap_id,
-                    source_type=signal["source_type"],
-                    source_url=signal["source_url"],
-                    quoted_text=signal["quoted_text"],
-                    quote_date=signal_date,
-                    axis_relevance=json.dumps(signal["axis_relevance"]),
-                    signal_direction=signal["signal_direction"],
-                    verified=ver.verified,
-                    verification_method=ver.verification_method,
-                    verification_error=ver.verification_error,
-                    signal_quality_score=qual.signal_quality_score,
-                    quality_reasoning=qual.quality_reasoning,
-                    captured_at=_now(),
-                ))
-
-            # --- Deterministic-ish scoring (stubs return canned values) ---
-            rf = compute_round_fit(fund, partner, [], False, ws.company)
-            ll = compute_lead_likelihood(partner, [], None)
-            # Canned 4-axis composite for the slice (Session 6 builds the real one).
-            axis_scores = [8.0, 7.0, 5.0, 6.0]
-            composite = sum(axis_scores) / len(axis_scores)
-            axis_max = max(axis_scores)
-            mean = composite
-            variance = sum((s - mean) ** 2 for s in axis_scores) / len(axis_scores)
-            spiky = max(0.0, min(2.0, variance * 0.5))
-            cold_reach = 7.0  # canned; Session 4/6 compute the real value
-
-            verified_quality2_count = (
-                1 if (ver.verified and qual.signal_quality_score >= 2) else 0
-            )
-            recency_bonus = _signal_recency_bonus(signal_date)
-            kill_penalty = 0.0
-            send_now = (
-                rf.round_fit_score * 2.0
-                + ll.lead_likelihood_score * 1.5
-                + composite * 1.0
-                + cold_reach * 0.5
-                + recency_bonus
-                + spiky
-                - kill_penalty
-            )
-
-            # --- recommended_to_send (honest evaluation of available criteria) ---
-            reasons: list[str] = []
-            ok = True
-            if composite < 6.5:
-                ok = False
-                reasons.append("composite_fit_score < 6.5")
-            if rf.round_fit_score < 6.0 or rf.disqualifier_present:
-                ok = False
-                reasons.append("round_fit < 6.0 or disqualifier present")
-            if ll.lead_likelihood_score < 5.0:
-                ok = False
-                reasons.append("lead_likelihood < 5.0")
-            if verified_quality2_count < 2:
-                ok = False
-                reasons.append(
-                    "fewer than 2 distinct verified quality>=2 evidence sources "
-                    "(Session 1 fixture supplies only one signal)"
-                )
-            if partner["employment_status"] not in ("verified_current", "likely_current"):
-                ok = False
-                reasons.append("employment not verified/likely current")
-            recommended = ok
-            rec_reasoning = (
-                "All available recommend-to-send criteria met."
-                if ok
-                else "Not recommended: " + "; ".join(reasons)
-            )
-
-            with engine.begin() as conn:
-                upsert(conn, partner_score_summaries, ["partner_id"], {
-                    "partner_id": partner_id,
-                    "composite_fit_score": composite,
-                    "axis_max_score": axis_max,
-                    "axis_score_variance": variance,
-                    "spiky_belief_score": spiky,
-                    "score_confidence": "low",
-                    "verified_signal_count": 1 if ver.verified else 0,
-                    "quality_2_plus_signal_count": verified_quality2_count,
-                    "distinct_source_type_count": 1,
-                    "most_recent_signal_date": signal_date,
-                    "major_kill_signal_present": False,
-                    "kill_signal_summary": "",
-                    "cold_reachability_score": cold_reach,
-                    "round_fit_score": rf.round_fit_score,
-                    "round_fit_reasoning": rf.round_fit_reasoning,
-                    "lead_likelihood_score": ll.lead_likelihood_score,
-                    "lead_likelihood_signals": ll.lead_likelihood_signals,
-                    "send_now_priority": send_now,
-                    "employment_status": partner["employment_status"],
-                    "manual_score_override": False,
-                    "manual_recommended_override": False,
-                    "recommended_to_send": recommended,
-                    "recommendation_reasoning": rec_reasoning,
-                    "scored_at": _now(),
-                })
-
-            # --- Email generation (stub mode validates the canned EmailOutput) ---
-            stub = _build_email_stub(ws.company, partner, signal)
-            email: EmailOutput = llm.complete_json(
-                prompt="[Session 1 minimal: see prompts/generate_email.txt in Session 7]",
-                schema=EmailOutput,
-                model=MODEL_EMAIL,
-                stub_response=stub,
-            )
-
-            variants = email.variants
-            recommended_v = next(
-                v for v in variants
-                if v.strategy == email.recommended_variant_strategy
-            )
-            alternate_v = next(
-                (v for v in variants if v.strategy != recommended_v.strategy), None
-            )
-
-            with engine.begin() as conn:
-                conn.execute(
-                    delete(email_drafts).where(email_drafts.c.partner_id == partner_id)
-                )
-                conn.execute(
-                    delete(followup_drafts).where(
-                        followup_drafts.c.partner_id == partner_id)
-                )
-                conn.execute(
-                    delete(deck_request_responses).where(
-                        deck_request_responses.c.partner_id == partner_id)
-                )
-                for v in variants:
+                    qa_status = "pass" if not hard_fails and smell_info.get("template_smell") != "high" else "fail"
                     conn.execute(email_drafts.insert().values(
-                        partner_id=partner_id,
-                        batch_id=BATCH_ID,
+                        partner_id=pid,
+                        batch_id=batch_id,
                         strategy=v.strategy,
                         subject=v.subject,
                         body=v.body,
@@ -377,66 +807,117 @@ def main() -> int:
                         likely_objection=v.likely_objection,
                         objection_preempted=v.objection_preempted,
                         preemption_line=v.preemption_line,
-                        template_smell=v.template_smell,
-                        is_recommended=(v.strategy == recommended_v.strategy),
+                        template_smell=smell_info.get("template_smell", "unscored"),
+                        qa_status=qa_status,
+                        regeneration_count=0,
+                        is_recommended=is_rec,
                         generated_at=_now(),
-                        written_to_csv_at=_now(),
+                        written_to_csv_at=_now() if is_rec else None,
                     ))
                 conn.execute(followup_drafts.insert().values(
-                    partner_id=partner_id, body=email.followup_draft,
+                    partner_id=pid, body=output.followup_draft,
                     generated_at=_now(),
                 ))
                 conn.execute(deck_request_responses.insert().values(
-                    partner_id=partner_id, body=email.deck_request_response,
+                    partner_id=pid, body=output.deck_request_response,
                     generated_at=_now(),
                 ))
+            conn.execute(batch_qa_reports.insert().values(
+                batch_id=batch_id,
+                batch_size=len(all_drafts),
+                strategy_distribution=json.dumps(qa["strategy_distribution"]),
+                similarity_failures=qa["similarity_failure_count"],
+                template_smell_high_count=qa["template_smell_high_count"],
+                raise_reference_missing_count=qa["raise_reference_missing_count"],
+                passed=qa["passed"],
+                failure_reasons=json.dumps(qa["hard_fail_reasons"] + qa["warnings"]),
+                generated_at=_now(),
+            ))
 
-            # --- CSV row ---
-            top_signals = (
-                f'"{signal["quoted_text"]}" - {signal["source_url"]} '
-                f'({signal["quote_date"]})'
+        # ---- CSV write ----
+        rec_by_partner = {
+            d["partner_id"]: d for d in all_drafts if d.get("is_recommended")
+        }
+        alt_by_partner: dict[str, dict] = {}
+        for d in all_drafts:
+            if not d.get("is_recommended"):
+                alt_by_partner[d["partner_id"]] = d
+
+        # Build CSV rows.
+        csv_rows: list[dict] = []
+        for ctx, output, _ in partner_outputs:
+            pid = ctx["partner_id"]
+            rec = rec_by_partner.get(pid)
+            alt = alt_by_partner.get(pid)
+            if not rec:
+                continue
+            p_signals = signals_by_partner.get(pid, [])
+            top_signals_str = "\n".join(
+                f'"{s["quote"]}" - {s["source_url"]} ({s["date"]})'
+                for s in sorted(
+                    p_signals, key=lambda s: s["quality"], reverse=True
+                )[:3]
             )
-            csv_row = {
-                "partner_id": partner_id,
-                "partner_name": partner["name"],
-                "partner_title": partner["title"],
-                "fund_name": fund["name"],
-                "fund_domain": fund["domain"],
-                "linkedin_url": partner["linkedin_url"],
-                "send_now_priority": round(send_now, 2),
-                "composite_fit_score": round(composite, 2),
-                "round_fit_score": rf.round_fit_score,
-                "round_fit_reasoning": rf.round_fit_reasoning,
-                "lead_likelihood_score": ll.lead_likelihood_score,
-                "lead_likelihood_signals": ll.lead_likelihood_signals,
-                "cold_reachability_score": cold_reach,
-                "spiky_belief_score": round(spiky, 3),
-                "top_signals": top_signals,
-                "recommended_to_send": recommended,
-                "recommendation_reasoning": rec_reasoning,
-                "email_strategy_used": recommended_v.strategy,
-                "email_subject_line": recommended_v.subject,
-                "outreach_email_draft": recommended_v.body,
-                "conversion_hypothesis": recommended_v.conversion_hypothesis,
-                "likely_objection": recommended_v.likely_objection,
-                "objection_preempted": recommended_v.objection_preempted,
-                "email_alternate_strategy": alternate_v.strategy if alternate_v else "",
-                "email_draft_alternate": alternate_v.body if alternate_v else "",
-                "followup_email_draft": email.followup_draft,
-                "deck_request_response": email.deck_request_response,
-                "template_smell": recommended_v.template_smell,
-                "warm_path_available": "",
-                "outreach_status": "ready_to_send" if recommended else "draft",
-            }
-            out_path = write_review_queue(ws.exports_dir, [csv_row])
-            run.succeeded = 1
-            print(f"[stage 7] wrote CSV review queue: {out_path}")
-            print(f"[stage 7] llm stub mode: {llm.stub}")
-        except Exception as exc:  # noqa: BLE001 - logged then re-raised
-            run.failed = 1
-            run.succeeded = 0
-            run.log_error(partner.get("partner_id", "?"), type(exc).__name__, str(exc))
-            raise
+            csv_rows.append({
+                "partner_id": pid,
+                "partner_name": ctx["partner_name"],
+                "partner_title": ctx["title"],
+                "fund_name": ctx["fund_name"],
+                "fund_domain": ctx["fund_domain"],
+                "linkedin_url": ctx["linkedin_url"],
+                "send_now_priority": round(ctx["send_now_priority"] or 0, 2),
+                "composite_fit_score": round(ctx["composite_fit_score"] or 0, 2),
+                "round_fit_score": ctx["round_fit_score"],
+                "round_fit_reasoning": ctx["round_fit_reasoning"],
+                "lead_likelihood_score": ctx["lead_likelihood_score"],
+                "lead_likelihood_signals": ctx["lead_likelihood_signals"],
+                "cold_reachability_score": ctx["cold_reachability_score"],
+                "spiky_belief_score": round(ctx["spiky_belief_score"] or 0, 3),
+                "top_signals": top_signals_str,
+                "recommended_to_send": ctx["recommended_to_send"],
+                "recommendation_reasoning": ctx["recommendation_reasoning"],
+                "email_strategy_used": rec["strategy"],
+                "email_subject_line": rec["subject"],
+                "outreach_email_draft": rec["body"],
+                "conversion_hypothesis": next(
+                    v.conversion_hypothesis for v in output.variants
+                    if v.strategy == rec["strategy"]
+                ),
+                "likely_objection": next(
+                    v.likely_objection for v in output.variants
+                    if v.strategy == rec["strategy"]
+                ),
+                "objection_preempted": next(
+                    v.objection_preempted for v in output.variants
+                    if v.strategy == rec["strategy"]
+                ),
+                "email_alternate_strategy": alt["strategy"] if alt else "",
+                "email_draft_alternate": alt["body"] if alt else "",
+                "followup_email_draft": output.followup_draft,
+                "deck_request_response": output.deck_request_response,
+                "template_smell": rec.get("template_smell", "unscored"),
+                "warm_path_available": "" if ctx["warm_path_available"] is None else bool(ctx["warm_path_available"]),
+                "outreach_status": (
+                    "ready_to_send" if ctx["recommended_to_send"] else "draft"
+                ),
+            })
+
+        out_path = write_review_queue(ws.exports_dir, csv_rows)
+
+        print(
+            f"[stage 7] {len(csv_rows)} partners in CSV review queue -> {out_path}"
+        )
+        print(
+            f"[stage 7] batch QA: passed={qa['passed']} | "
+            f"similarity failures={qa['similarity_failure_count']} | "
+            f"template_smell=high {qa['template_smell_high_count']} | "
+            f"strategy distribution={qa['strategy_distribution']}"
+        )
+        for w in qa["warnings"]:
+            print(f"[stage 7] WARN: {w}")
+        for hf in qa["hard_fail_reasons"]:
+            print(f"[stage 7] HARD FAIL: {hf}")
+        print(f"[stage 7] llm stub mode: {llm.stub}")
 
     return 0
 
