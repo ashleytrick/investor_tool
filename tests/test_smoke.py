@@ -675,3 +675,143 @@ def test_extract_json_tolerates_malformed_fences():
     import pytest
     with pytest.raises(ValueError):
         _extract_json("```\nno json here at all\n```")
+
+
+def _run_pipeline_through_stage_6(ws_dst: Path) -> None:
+    """Helper: drive the fixture pipeline up to Stage 6 (no emails yet)."""
+    ws = str(ws_dst)
+    for s, extra in (
+        ("01_aggregate_sources.py", ()),
+        ("02_enrich_funds.py", ("--fixtures",)),
+        ("03_mine_activity.py", ("--fixtures",)),
+        ("04_mine_partner_signals.py", ("--fixtures",)),
+        ("05_verify_and_quality.py", ()),
+        ("06_score_candidates.py", ()),
+    ):
+        _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+
+def test_batch_qa_failure_blocks_csv_publication():
+    """When evaluate_batch() reports passed=False, Stage 7 must:
+      - record the failed batch_qa_reports row,
+      - NOT overwrite the previous review_queue.csv,
+      - NOT delete-and-replace email_drafts/followup_drafts/deck_request_responses,
+      - return non-zero,
+      - surface the failure in runs.error_summary.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+
+        # ---- Run 1: passing batch publishes a good CSV + drafts ----
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5", cwd=REPO_ROOT)
+        csv_path = ws_dst / "exports" / "review_queue.csv"
+        assert csv_path.exists(), "first run should have produced the CSV"
+        good_csv_bytes = csv_path.read_bytes()
+        good_csv_mtime = csv_path.stat().st_mtime
+
+        c = sqlite3.connect(db)
+        good_drafts = c.execute(
+            "select count(*) from email_drafts"
+        ).fetchone()[0]
+        assert good_drafts > 0
+        c.close()
+
+        # ---- Force batch QA to fail by patching the similarity threshold
+        # so EVERY pair in the fixture flunks the body gate. Drive Stage 7
+        # via importlib so we can mutate the module-level constant for one
+        # call (same trick as the ceiling test).
+        driver = ws_dst / "_drive_stage7_qa_fail.py"
+        driver.write_text(
+            "import sys, importlib.util\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "spec = importlib.util.spec_from_file_location("
+            f"'s7', {str(REPO_ROOT / 'scripts' / '07_generate_emails.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.SIM_BODY_HARD = 0.0\n"  # any nonzero similarity becomes a failure
+            f"sys.argv = ['s7', '--workspace', {ws!r}, '--top', '5']\n"
+            "raise SystemExit(m.main())\n"
+        )
+        res = subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True,
+            env={**os.environ, "ANTHROPIC_API_KEY": ""}, timeout=120,
+        )
+        assert res.returncode == 2, (
+            f"failed-QA run should exit 2, got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
+        assert "BATCH QA REFUSED" in res.stdout
+        assert "HARD FAIL" in res.stdout
+
+        # ---- CSV unchanged (last good batch preserved) ----
+        assert csv_path.read_bytes() == good_csv_bytes, (
+            "review_queue.csv was overwritten despite failed QA"
+        )
+        assert csv_path.stat().st_mtime == good_csv_mtime, (
+            "review_queue.csv mtime changed despite failed QA"
+        )
+
+        # ---- email_drafts not wiped + replaced ----
+        c = sqlite3.connect(db)
+        post_drafts = c.execute(
+            "select count(*) from email_drafts"
+        ).fetchone()[0]
+        assert post_drafts == good_drafts, (
+            f"email_drafts changed despite failed QA: "
+            f"{good_drafts} -> {post_drafts}"
+        )
+
+        # ---- batch_qa_reports has BOTH the passing and failing row ----
+        report_rows = c.execute(
+            "select passed from batch_qa_reports order by report_id"
+        ).fetchall()
+        assert len(report_rows) == 2, (
+            f"expected 2 batch_qa_reports rows (pass + fail), got {len(report_rows)}"
+        )
+        assert report_rows[0][0] == 1
+        assert report_rows[1][0] == 0
+
+        # ---- runs.error_summary surfaces the failure ----
+        note = c.execute(
+            "select error_summary from runs where stage='07_generate_emails' "
+            "order by run_id desc limit 1"
+        ).fetchone()[0]
+        assert note and "BATCH QA REFUSED" in note
+        c.close()
+
+
+def test_batch_qa_passing_still_publishes_csv():
+    """The happy path: when evaluate_batch passes, the CSV gets written
+    and email_drafts get rewritten. (Asserted explicitly so the gate
+    above can't regress into refusing every batch.)"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5", cwd=REPO_ROOT)
+
+        csv_path = ws_dst / "exports" / "review_queue.csv"
+        assert csv_path.exists(), "passing-QA run must produce the CSV"
+
+        c = sqlite3.connect(db)
+        n_drafts = c.execute("select count(*) from email_drafts").fetchone()[0]
+        assert n_drafts == 10, f"expected 5x2 variants, got {n_drafts}"
+        passed = c.execute(
+            "select passed from batch_qa_reports order by report_id desc limit 1"
+        ).fetchone()[0]
+        assert passed == 1, "batch_qa_reports.passed should be 1 on happy path"
+        c.close()

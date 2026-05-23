@@ -1019,6 +1019,44 @@ def main() -> int:
         # ---- batch QA ----
         qa = evaluate_batch(recommended_drafts, all_drafts)
 
+        # ---- batch QA hard gate ----
+        # If batch QA failed (similarity dupes, template_smell=high in any
+        # draft, or missing raise references), refuse to publish. We still
+        # record an audit row in batch_qa_reports so the operator can see
+        # WHICH batch failed and WHY, but:
+        #   - no new email_drafts/followup_drafts/deck_request_responses
+        #     are inserted (prior good batch survives intact)
+        #   - review_queue.csv is NOT overwritten (last good CSV stays)
+        #   - run.failed=1 + the reasons land in runs.error_summary
+        if not qa["passed"]:
+            with engine.begin() as conn:
+                conn.execute(batch_qa_reports.insert().values(
+                    batch_id=batch_id,
+                    batch_size=len(all_drafts),
+                    strategy_distribution=json.dumps(qa["strategy_distribution"]),
+                    similarity_failures=qa["similarity_failure_count"],
+                    template_smell_high_count=qa["template_smell_high_count"],
+                    raise_reference_missing_count=qa["raise_reference_missing_count"],
+                    passed=False,
+                    failure_reasons=json.dumps(
+                        qa["hard_fail_reasons"] + qa["warnings"]
+                    ),
+                    generated_at=_now(),
+                ))
+            msg = (
+                f"BATCH QA REFUSED: {len(qa['hard_fail_reasons'])} hard fail "
+                f"reason(s); prior review_queue.csv and email_drafts left "
+                f"intact. Reasons: {'; '.join(qa['hard_fail_reasons'])}"
+            )
+            print(f"[stage 7] {msg}")
+            for hf in qa["hard_fail_reasons"]:
+                print(f"[stage 7] HARD FAIL: {hf}")
+            for w in qa["warnings"]:
+                print(f"[stage 7] WARN: {w}")
+            run.note(msg)
+            run.failed = max(run.failed, 1)
+            return 2
+
         # ---- persistence ----
         # Stale-state invalidation (Findings 11, 115, 116):
         # Only delete prior drafts for partners we ACTUALLY generated new
