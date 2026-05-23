@@ -54,8 +54,13 @@ def main() -> int:
 
     try:
         gmail = GmailClient.from_workspace(ws)
-    except GmailNotConfigured as exc:
-        print(f"[gmail_drafts] {exc}; skipping")
+    except GmailNotConfigured:
+        print(
+            f"[gmail_drafts] Gmail not linked for workspace {ws.name!r}.\n"
+            f"  Run: uv run scripts/connect_gmail.py "
+            f"--workspace {args.workspace or ws.path}\n"
+            f"  That script walks through the one-time GCP setup."
+        )
         # Treat as skip not failure -- consistent with attio_sync and
         # outcome_sync no-op paths.
         return 0

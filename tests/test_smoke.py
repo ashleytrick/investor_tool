@@ -430,13 +430,24 @@ def test_operator_clis():
         ).fetchone()[0]
         assert email == "priya@northbeam.example"
 
+        # connect_gmail without credentials -> exit 2 + setup walkthrough
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "connect_gmail.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        assert "GCP setup" in res.stdout or "Gmail isn't linked" in res.stdout
+
+        # create_gmail_drafts without credentials -> skip cleanly + point at
+        # connect_gmail
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "create_gmail_drafts.py"),
              "--workspace", ws],
             capture_output=True, text=True, env=env, timeout=60,
         )
-        assert res.returncode == 0  # graceful skip
-        assert "skipping" in res.stdout
+        assert res.returncode == 0
+        assert "connect_gmail.py" in res.stdout
         c.close()
 
 

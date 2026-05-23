@@ -120,11 +120,15 @@ Sending without leaving the loop:
 
 - `scripts/set_partner_email.py --partner-id X --email "..."` — populate the
   `email` field. `--from-csv path.csv` for bulk.
+- `scripts/connect_gmail.py` — link your Gmail to a workspace (one-time per
+  workspace). Walks you through the GCP setup if credentials aren't present;
+  runs OAuth in your browser; confirms which account connected by hitting
+  `gmail.users().getProfile`. `--force` switches accounts; `--disconnect`
+  removes the saved token.
 - `scripts/create_gmail_drafts.py` — for each top-N recommended partner with
-  an email on file, create a Gmail draft (NOT send). One-time GCP OAuth
-  setup: drop `.gmail_credentials.json` into the workspace dir, first run
-  prompts for browser consent. Operator opens Gmail Drafts, reviews, hits
-  send. Idempotent: drafts already pushed are skipped unless `--regenerate`.
+  an email on file, create a Gmail draft (NOT send). Idempotent: drafts
+  already pushed are skipped unless `--regenerate`. Requires
+  `connect_gmail.py` to have been run first.
 
 ## Known limitations
 
