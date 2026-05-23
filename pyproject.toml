@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "google-api-python-client>=2.100",
     "google-auth-oauthlib>=1.2",
+    "feedparser>=6.0",
 ]
 
 [tool.uv]

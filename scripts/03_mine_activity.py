@@ -14,6 +14,7 @@ Run: uv run scripts/03_mine_activity.py --workspace clients/test_workspace --fix
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import pathlib
 import sys
@@ -26,6 +27,7 @@ from sqlalchemy import delete, select
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
 from core.db import deal_attributions, funds, get_engine, partners
+from core.http_client import HttpClient
 from core.ids import normalize_name, partner_id_for
 from core.llm.client import MODEL_BATCH, LLMClient
 from core.runs import RunLogger
@@ -36,6 +38,67 @@ STAGE = "03_mine_activity"
 PROMPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "attribute_deal.txt"
 ACTIVE_WINDOW_DAYS = 365  # is_active = activity in last 12 months
 FUND_NAME_FUZZY_THRESHOLD = 0.85
+RSS_LOOKBACK_DAYS = 365  # only attribute announcements published in last N days
+
+
+def _fetch_live_rss_announcements(feeds: list[dict]) -> list[dict]:
+    """Pull RSS items from each feed in sources.yaml.funding_announcement_feeds.
+
+    Returns a list of {"source_url", "text"} dicts ready for LLM attribution.
+    Items older than RSS_LOOKBACK_DAYS are filtered out (per brief: 12 months).
+    """
+    if not feeds:
+        return []
+    try:
+        import feedparser
+    except ImportError:
+        print(
+            "[stage 3] feedparser not installed; run `uv sync`. "
+            "Skipping live RSS."
+        )
+        return []
+    client = HttpClient()
+    cutoff = date.today().toordinal() - RSS_LOOKBACK_DAYS
+    out: list[dict] = []
+    for feed_cfg in feeds:
+        url = feed_cfg.get("url")
+        name = feed_cfg.get("name") or url
+        if not url:
+            continue
+        try:
+            res = asyncio.run(client.fetch(url))
+        except Exception as exc:  # noqa: BLE001 - one bad feed shouldn't kill the run
+            print(f"[stage 3] feed {name!r} fetch failed: {exc}")
+            continue
+        if res.status != 200 or not res.text:
+            print(f"[stage 3] feed {name!r} returned HTTP {res.status}")
+            continue
+        feed = feedparser.parse(res.text)
+        for entry in getattr(feed, "entries", []):
+            link = getattr(entry, "link", None) or getattr(entry, "id", None)
+            if not link:
+                continue
+            published = getattr(entry, "published_parsed", None)
+            if published is not None:
+                try:
+                    pub_ord = date(
+                        published.tm_year, published.tm_mon, published.tm_mday
+                    ).toordinal()
+                    if pub_ord < cutoff:
+                        continue
+                except (ValueError, AttributeError):
+                    pass
+            title = getattr(entry, "title", "") or ""
+            summary = getattr(entry, "summary", "") or ""
+            content_blocks = getattr(entry, "content", []) or []
+            body = " ".join(
+                [title, summary]
+                + [getattr(b, "value", "") for b in content_blocks]
+            ).strip()
+            if body:
+                out.append({"source_url": link, "text": body})
+        print(f"[stage 3] feed {name!r}: {len(feed.entries)} entries pulled")
+    return out
 
 
 def _now() -> datetime:
@@ -124,8 +187,24 @@ def main() -> int:
             (ws.fixtures_dir / "announcements.json").read_text(encoding="utf-8")
         )
     else:
-        announcements = []  # Live RSS support arrives with Stage 3 production use.
-        print("[stage 3] no --fixtures flag and live RSS not configured; nothing to do")
+        announcements = _fetch_live_rss_announcements(
+            ws.sources.get("funding_announcement_feeds") or []
+        )
+        if not announcements:
+            print(
+                "[stage 3] no announcements ingested; check "
+                "sources.yaml funding_announcement_feeds or use --fixtures"
+            )
+        if llm.stub and announcements:
+            # Per-announcement attribution is an LLM call; in stub mode every
+            # call would fail with "stub_response required". Refuse upfront.
+            print(
+                f"[stage 3] {len(announcements)} live announcements fetched, "
+                f"but llm is in stub mode (no ANTHROPIC_API_KEY). Each "
+                f"announcement requires an LLM attribution. Set the key, or "
+                f"run with --fixtures to use canned attributions."
+            )
+            return 2
 
     prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
     with RunLogger(engine, ws.name, STAGE) as run:

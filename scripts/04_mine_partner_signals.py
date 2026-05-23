@@ -18,19 +18,24 @@ Run: uv run scripts/04_mine_partner_signals.py --workspace clients/test_workspac
 from __future__ import annotations
 
 import argparse
+import asyncio
+import csv
 import hashlib
 import json
 import pathlib
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from selectolax.parser import HTMLParser
 from sqlalchemy import and_, select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
 from core.db import funds, get_engine, partners, signals, source_snapshots
+from core.http_client import HttpClient
 from core.llm.client import MODEL_BATCH, LLMClient
 from core.runs import RunLogger
 from schemas.partner_signals import PartnerSignalsOutput
@@ -39,6 +44,7 @@ STAGE = "04_mine_partner_signals"
 PROMPT_PATH = (
     pathlib.Path(__file__).resolve().parent.parent / "prompts" / "extract_partner_signals.txt"
 )
+PARTNER_CONTENT_URLS_PATH = "data/raw/partner_content_urls.csv"
 
 
 def _now() -> datetime:
@@ -84,6 +90,54 @@ def upsert_snapshot(engine, source_url: str, text: str) -> int:
         return int(result.inserted_primary_key[0])
 
 
+def _fetch_live_partner_content(ws) -> dict:
+    """Read data/raw/partner_content_urls.csv (cols: partner_id, source_type,
+    source_url), fetch each URL via http_client, and return a dict matching
+    the partner_signals_seed.json shape so the rest of Stage 4 is identical.
+
+    No `_extraction` is set on live entries -- the LLM will produce signals
+    in live mode. Stub mode would refuse upfront.
+    """
+    csv_path = ws.path / PARTNER_CONTENT_URLS_PATH
+    if not csv_path.exists():
+        return {}
+    client = HttpClient()
+    out: dict[str, dict] = {}
+    by_partner: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    with csv_path.open(encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh):
+            pid = (row.get("partner_id") or "").strip()
+            url = (row.get("source_url") or "").strip()
+            stype = (row.get("source_type") or "blog").strip()
+            if pid and url:
+                by_partner[pid].append((stype, url))
+
+    for pid, items in by_partner.items():
+        sources: list[dict] = []
+        for stype, url in items:
+            try:
+                res = asyncio.run(client.fetch(url))
+            except Exception as exc:  # noqa: BLE001 - log, move on
+                print(f"[stage 4] {pid} fetch {url} failed: {exc}")
+                continue
+            if res.status != 200 or not res.text:
+                print(f"[stage 4] {pid} {url} -> HTTP {res.status}; skipping")
+                continue
+            text = HTMLParser(res.text).text(separator=" ", strip=True)
+            if not text:
+                continue
+            sources.append({
+                "source_type": stype,
+                "source_url": url,
+                "quote_date": None,
+                "text": text,
+            })
+        if sources:
+            out[pid] = {"sources": sources}
+            print(f"[stage 4] {pid}: {len(sources)} live content source(s) fetched")
+    return out
+
+
 def render_prompt(template: str, *, company: dict, partner_row, fund_name: str,
                   axes_block: str, content: str) -> str:
     c = company["company"]
@@ -126,9 +180,21 @@ def main() -> int:
             (ws.fixtures_dir / "partner_signals_seed.json").read_text(encoding="utf-8")
         )
     else:
-        fixture = {}
-        print("[stage 4] no --fixtures flag and live content sources are not "
-              "configured; nothing to do")
+        fixture = _fetch_live_partner_content(ws)
+        if not fixture:
+            print(
+                f"[stage 4] no live content fetched; populate "
+                f"{PARTNER_CONTENT_URLS_PATH} (cols: partner_id, source_type, "
+                f"source_url) or run with --fixtures."
+            )
+        if llm.stub and fixture:
+            print(
+                f"[stage 4] {sum(len(v.get('sources', [])) for v in fixture.values())} "
+                f"live content sources fetched, but llm is in stub mode "
+                f"(no ANTHROPIC_API_KEY). Each source requires an LLM signal "
+                f"extraction. Set the key, or run with --fixtures."
+            )
+            return 2
 
     template = PROMPT_PATH.read_text(encoding="utf-8")
     axes_block = build_axes_block(ws.axes)

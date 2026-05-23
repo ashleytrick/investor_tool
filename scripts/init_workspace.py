@@ -141,21 +141,33 @@ axes:
 """
 
 SOURCES_TEMPLATE = """\
+# Stage 1 sources. Mix of local CSV (e.g. an OpenVC export) and live URL
+# sources (markdown awesome-lists, CSV at URL).
 public_lists:
   - name: "OpenVC Export"
     path: "data/raw/openvc_export.csv"
     parser: "csv"
-# Add more here. Example:
-#   - name: "GitHub Awesome List"
-#     url: "https://raw.githubusercontent.com/..."
-#     parser: "markdown"
+  # - name: "GitHub Awesome VC List"
+  #   url: "https://raw.githubusercontent.com/<user>/<repo>/main/list.md"
+  #   parser: "markdown"
+
+# Stage 3 RSS feeds. Stage 3 fetches each and LLM-attributes deals.
+# (LLM live mode required; stub mode refuses live RSS.)
 funding_announcement_feeds:
   - name: "TechCrunch Funding"
     url: "https://techcrunch.com/category/venture/feed/"
     parser: "rss"
+  # - name: "Crunchbase News"
+  #   url: "https://news.crunchbase.com/feed/"
+  #   parser: "rss"
+
+# Stage 4 partner signal sources. The script reads
+# data/raw/partner_content_urls.csv (cols: partner_id, source_type, source_url)
+# and fetches each URL. Populate it by hand or via your own discovery tool.
 partner_signal_sources:
-  podcast_search_api: "listennotes"
-  substack_search: true
+  partner_content_urls_csv: "data/raw/partner_content_urls.csv"
+  # Optional: ListenNotes podcast search (paid; not yet integrated).
+  # podcast_search_api: "listennotes"
 """
 
 ATTIO_TEMPLATE = """\
@@ -243,6 +255,11 @@ def main() -> int:
                                                      encoding="utf-8")
     (ws_path / "config" / "attio.yaml").write_text(ATTIO_TEMPLATE, encoding="utf-8")
     (ws_path / ".env").write_text(ENV_TEMPLATE, encoding="utf-8")
+
+    # Stage 4 live-mode input. Header-only so the operator sees the columns.
+    (ws_path / "data" / "raw" / "partner_content_urls.csv").write_text(
+        "partner_id,source_type,source_url\n", encoding="utf-8"
+    )
 
     # Email-style example stubs.
     for fname in EXAMPLE_FILES:

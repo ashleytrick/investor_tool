@@ -9,6 +9,7 @@ Run: uv run scripts/01_aggregate_sources.py --workspace clients/test_workspace
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import pathlib
 import re
@@ -20,6 +21,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
 from core.db import funds, get_engine, upsert
+from core.http_client import HttpClient
 from core.ids import fund_id_for, normalize_domain
 from core.runs import RunLogger
 
@@ -33,13 +35,19 @@ def _now() -> datetime:
 
 def _parse_csv(path: pathlib.Path) -> list[dict]:
     """Expect at least `name` and `domain` columns."""
-    rows: list[dict] = []
     with path.open("r", encoding="utf-8", newline="") as fh:
-        for row in csv.DictReader(fh):
-            name = (row.get("name") or "").strip()
-            domain = normalize_domain(row.get("domain") or "")
-            if name and domain:
-                rows.append({"name": name, "domain": domain})
+        return list(_parse_csv_text(fh.read()))
+
+
+def _parse_csv_text(text: str) -> list[dict]:
+    """Parse CSV string with `name` + `domain` columns."""
+    import io
+    rows: list[dict] = []
+    for row in csv.DictReader(io.StringIO(text)):
+        name = (row.get("name") or "").strip()
+        domain = normalize_domain(row.get("domain") or "")
+        if name and domain:
+            rows.append({"name": name, "domain": domain})
     return rows
 
 
@@ -80,10 +88,27 @@ def main() -> int:
                         parsed = _parse_markdown(src_path.read_text(encoding="utf-8"))
                     else:
                         raise ValueError(f"unsupported parser: {parser_kind}")
+                elif "url" in src:
+                    # Live URL source. Fetch via http_client; parse based on
+                    # parser_kind (markdown today; CSV at-URL trivially added).
+                    client = HttpClient()
+                    res = asyncio.run(client.fetch(src["url"]))
+                    if res.status != 200 or not res.text:
+                        raise RuntimeError(
+                            f"URL fetch returned HTTP {res.status} / empty body"
+                        )
+                    if parser_kind == "markdown":
+                        parsed = _parse_markdown(res.text)
+                    elif parser_kind == "csv":
+                        # CSV body served at a URL: parse from string.
+                        parsed = list(_parse_csv_text(res.text))
+                    else:
+                        raise ValueError(
+                            f"unsupported URL parser: {parser_kind!r}"
+                        )
                 else:
-                    # URL sources require network; skip cleanly when unreachable.
-                    raise NotImplementedError(
-                        f"URL source '{name}' skipped (no network in fixture run)"
+                    raise ValueError(
+                        f"source {name!r} has neither `path` nor `url`"
                     )
             except Exception as exc:  # noqa: BLE001 - logged, run continues
                 run.skipped += 1

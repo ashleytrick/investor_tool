@@ -130,6 +130,23 @@ Sending without leaving the loop:
   already pushed are skipped unless `--regenerate`. Requires
   `connect_gmail.py` to have been run first.
 
+## What each stage actually ingests (live vs fixtures)
+
+| Stage | Live source | Fixture flag | Requires API key |
+|---|---|---|---|
+| 1 aggregate_sources | CSV at `path`, markdown/CSV at `url` | n/a | no |
+| 2 enrich_funds | fetches fund site (homepage/team/portfolio/...) | `--fixtures` reads `data/fixtures/fund_pages/` | yes (LLM extracts enrichment) |
+| 3 mine_activity | RSS feeds from `sources.yaml.funding_announcement_feeds` | `--fixtures` reads `data/fixtures/announcements.json` | yes (LLM attributes each deal) |
+| 4 mine_partner_signals | rows from `data/raw/partner_content_urls.csv` | `--fixtures` reads `data/fixtures/partner_signals_seed.json` | yes (LLM extracts signals) |
+| 5 verify_and_quality | always live URL fetch with snapshot fallback | n/a | yes (LLM scores quality) |
+| 6 score_candidates | reads db; LLM scores axes | n/a | yes (LLM for composite; round_fit/lead_likelihood are deterministic) |
+| 7 generate_emails | LLM drafts via `prompts/generate_email.txt` | n/a | yes (LLM drafts each variant) |
+| 8 sync_to_attio | live Attio v2 API | n/a | needs `ATTIO_API_KEY` |
+
+Stages 3, 4, 6, 7, and 8 refuse upfront when the relevant API key is missing
+and the live path is selected — they print what's wrong instead of writing
+empty / wrong data.
+
 ## Known limitations
 
 - **Employment classification.** Stage 2's team-page discovery only produces

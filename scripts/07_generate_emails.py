@@ -805,12 +805,11 @@ def main() -> int:
 
                 # ---- generate (live LLM or stub) ----
                 stub = build_stub_response(partner_id, strategies)
-                # In stub mode (no ANTHROPIC_API_KEY) the in-script EMAIL_BANK
-                # must contain an entry for this partner. A miss means the
-                # partner gets zero variants and is dropped from the CSV
-                # without a real LLM having tried. Brief Rule 14 forbids
-                # silent failures, so log explicitly and count as skipped
-                # rather than succeeded so the run-summary audit is honest.
+                # Stub mode (no ANTHROPIC_API_KEY): EMAIL_BANK miss means we
+                # can't produce variants offline. WARN + skip (Brief Rule 14:
+                # no silent failures), count as skipped not succeeded.
+                # Live mode: stub being None is fine -- the LLM runs against
+                # prompts/generate_email.txt and stub_response is unused.
                 if stub is None and llm.stub:
                     print(
                         f"[stage 7] WARN: partner {partner_id} "
@@ -822,16 +821,6 @@ def main() -> int:
                     run.log_error(
                         partner_id, "stub_bank_miss",
                         "stub mode: no EMAIL_BANK entry for this partner",
-                    )
-                    continue
-                if stub is None:
-                    # Live mode reached this branch only if every chosen strategy
-                    # was somehow unsupported by the live prompt -- shouldn't
-                    # happen, but skip cleanly rather than persist empty variants.
-                    run.skipped += 1
-                    run.log_error(
-                        partner_id, "no_variants",
-                        "live mode produced no variants for chosen strategies",
                     )
                     continue
                 # Live mode would build the full prompt; in stub mode the client
