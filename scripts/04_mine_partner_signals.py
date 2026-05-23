@@ -175,32 +175,52 @@ def main() -> int:
             r.fund_id: r.name for r in conn.execute(select(funds.c.fund_id, funds.c.name))
         }
 
-    if args.fixtures:
-        fixture = json.loads(
-            (ws.fixtures_dir / "partner_signals_seed.json").read_text(encoding="utf-8")
-        )
-    else:
-        fixture = _fetch_live_partner_content(ws)
-        if not fixture:
-            print(
-                f"[stage 4] no live content fetched; populate "
-                f"{PARTNER_CONTENT_URLS_PATH} (cols: partner_id, source_type, "
-                f"source_url) or run with --fixtures."
-            )
-        if llm.stub and fixture:
-            print(
-                f"[stage 4] {sum(len(v.get('sources', [])) for v in fixture.values())} "
-                f"live content sources fetched, but llm is in stub mode "
-                f"(no ANTHROPIC_API_KEY). Each source requires an LLM signal "
-                f"extraction. Set the key, or run with --fixtures."
-            )
-            return 2
-
     template = PROMPT_PATH.read_text(encoding="utf-8")
     axes_block = build_axes_block(ws.axes)
 
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
+        # Source content (inside RunLogger so failures land in `runs`).
+        if args.fixtures:
+            fixture = json.loads(
+                (ws.fixtures_dir / "partner_signals_seed.json").read_text(encoding="utf-8")
+            )
+        else:
+            fixture = _fetch_live_partner_content(ws)
+            csv_path = ws.path / PARTNER_CONTENT_URLS_PATH
+            configured_rows = 0
+            if csv_path.exists():
+                with csv_path.open(encoding="utf-8") as fh:
+                    configured_rows = sum(
+                        1 for i, line in enumerate(fh)
+                        if i > 0 and line.strip()
+                    )
+            if not fixture:
+                if configured_rows > 0:
+                    msg = (
+                        f"FAIL: {configured_rows} url(s) configured in "
+                        f"{PARTNER_CONTENT_URLS_PATH} but 0 sources fetched. "
+                        f"Check URL reachability."
+                    )
+                    print(f"[stage 4] {msg}")
+                    run.note(msg)
+                    run.failed = configured_rows
+                    return 2
+                print(
+                    f"[stage 4] no live content fetched; populate "
+                    f"{PARTNER_CONTENT_URLS_PATH} (cols: partner_id, "
+                    f"source_type, source_url) or run with --fixtures."
+                )
+            if llm.stub and fixture:
+                msg = (
+                    f"REFUSED: {sum(len(v.get('sources', [])) for v in fixture.values())} "
+                    f"live content sources fetched but llm is in stub mode. "
+                    f"Set ANTHROPIC_API_KEY, or run with --fixtures."
+                )
+                print(f"[stage 4] {msg}")
+                run.note(msg)
+                run.failed = 1
+                return 2
         partners_with_signals = 0
         total_signals = 0
         for p in partner_rows:

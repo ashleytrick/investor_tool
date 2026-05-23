@@ -128,6 +128,16 @@ def main() -> int:
                     "domain": domain,
                     "last_updated": _now(),
                 })
+        # Loud failure: sources were configured but produced nothing usable.
+        # Quiet success of an empty pipeline is the old "no silent failures"
+        # trap wearing a new jacket -- exit 2 so wrappers notice.
+        if not seen and run.processed > 0:
+            print(
+                f"[stage 1] FAIL: {run.processed} source(s) configured but "
+                f"0 usable funds ingested. Check sources.yaml + recent errors."
+            )
+            run.note("zero funds ingested from configured sources")
+            return 2
         print(f"[stage 1] {len(seen)} unique funds aggregated -> funds table")
 
     return 0

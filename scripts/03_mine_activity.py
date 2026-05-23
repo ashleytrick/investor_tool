@@ -181,34 +181,43 @@ def main() -> int:
     fund_id_to_domain = {r.fund_id: r.domain for r in fund_rows}
     known_partner_ids = {r.partner_id for r in partner_rows}
 
-    # Source announcements.
-    if args.fixtures:
-        announcements = json.loads(
-            (ws.fixtures_dir / "announcements.json").read_text(encoding="utf-8")
-        )
-    else:
-        announcements = _fetch_live_rss_announcements(
-            ws.sources.get("funding_announcement_feeds") or []
-        )
-        if not announcements:
-            print(
-                "[stage 3] no announcements ingested; check "
-                "sources.yaml funding_announcement_feeds or use --fixtures"
-            )
-        if llm.stub and announcements:
-            # Per-announcement attribution is an LLM call; in stub mode every
-            # call would fail with "stub_response required". Refuse upfront.
-            print(
-                f"[stage 3] {len(announcements)} live announcements fetched, "
-                f"but llm is in stub mode (no ANTHROPIC_API_KEY). Each "
-                f"announcement requires an LLM attribution. Set the key, or "
-                f"run with --fixtures to use canned attributions."
-            )
-            return 2
-
+    feeds = ws.sources.get("funding_announcement_feeds") or []
     prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
+        # Source announcements (enter RunLogger BEFORE the ingest check so the
+        # run row records the failure visibly in `runs` / status.py).
+        if args.fixtures:
+            announcements = json.loads(
+                (ws.fixtures_dir / "announcements.json").read_text(encoding="utf-8")
+            )
+        else:
+            announcements = _fetch_live_rss_announcements(feeds)
+            if not announcements:
+                if feeds:
+                    msg = (
+                        f"FAIL: {len(feeds)} feed(s) configured but 0 usable "
+                        f"announcements ingested. Check feed reachability + "
+                        f"recent-item dates."
+                    )
+                    print(f"[stage 3] {msg}")
+                    run.note(msg)
+                    run.failed = len(feeds)
+                    return 2
+                print(
+                    "[stage 3] no announcements ingested; sources.yaml has no "
+                    "funding_announcement_feeds and --fixtures wasn't passed"
+                )
+            if llm.stub and announcements:
+                msg = (
+                    f"REFUSED: {len(announcements)} live announcements "
+                    f"fetched but llm is in stub mode (no ANTHROPIC_API_KEY). "
+                    f"Set the key, or run with --fixtures."
+                )
+                print(f"[stage 3] {msg}")
+                run.note(msg)
+                run.failed = 1
+                return 2
         partner_attributed = 0
         for ann in announcements:
             run.processed += 1

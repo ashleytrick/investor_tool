@@ -117,13 +117,19 @@ def main() -> int:
             )
         ).scalar()
 
-        # Last run per stage.
-        last_by_stage: dict[str, datetime] = {}
+        # Last run per stage (latest run_id wins; carries processed counts so
+        # status surfaces "ran but ingested zero" as a yellow flag).
+        last_by_stage: dict[str, object] = {}
         for r in conn.execute(
-            select(runs.c.stage, func.max(runs.c.completed_at))
-            .group_by(runs.c.stage)
+            select(
+                runs.c.stage, runs.c.run_id, runs.c.completed_at,
+                runs.c.records_processed, runs.c.records_succeeded,
+                runs.c.records_failed, runs.c.records_skipped,
+                runs.c.error_summary,
+            ).order_by(desc(runs.c.run_id))
         ):
-            last_by_stage[r[0]] = r[1]
+            if r.stage not in last_by_stage:
+                last_by_stage[r.stage] = r
 
         # Recent errors.
         recent_errors = list(conn.execute(
@@ -161,7 +167,27 @@ def main() -> int:
         "attio_outcome_sync", "monthly_learning_report",
     ]
     for st in expected:
-        print(f"  {st:30s} {_fmt_ts(last_by_stage.get(st))}")
+        r = last_by_stage.get(st)
+        if r is None:
+            print(f"  {st:30s} never")
+            continue
+        # Yellow flag: a stage that ran but processed nothing usable is
+        # the "empty pipeline but green vibes" trap. Surface it.
+        empty_ingest = (
+            (r.records_processed or 0) > 0
+            and (r.records_succeeded or 0) == 0
+        )
+        flag = "  EMPTY" if empty_ingest else ""
+        print(
+            f"  {st:30s} {_fmt_ts(r.completed_at)}  "
+            f"processed={r.records_processed or 0} "
+            f"ok={r.records_succeeded or 0} "
+            f"failed={r.records_failed or 0} "
+            f"skipped={r.records_skipped or 0}"
+            f"{flag}"
+        )
+        if r.error_summary:
+            print(f"    -> {r.error_summary[:100]}")
 
     print()
     print("== CSV review queue ==")
