@@ -221,6 +221,96 @@ def test_ready_to_send_ceiling_blocks_without_approval():
         assert note and "BULK_READY_APPROVED" in note
 
 
+def test_jobs_produce_suggestions_and_apply():
+    """monthly_learning_report seeds outcomes -> writes suggestions ->
+    apply_axis_suggestion mutates axes.yaml + backs up + marks approved."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        # Build the universe so axes/scores/outcomes have a substrate.
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+            ("06_score_candidates.py", ()),
+            ("07_generate_emails.py", ("--top", "5")),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        # attio_outcome_sync skips cleanly without attio.yaml
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "attio_outcome_sync.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        assert "skipping" in res.stdout
+
+        # monthly_learning_report with seed -> at least 1 suggestion
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "monthly_learning_report.py"),
+             "--workspace", ws, "--seed-fixture-outcomes"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        assert "suggestion" in res.stdout
+
+        c = sqlite3.connect(db)
+        n = c.execute(
+            "select count(*) from axis_weight_suggestions where approved is null"
+        ).fetchone()[0]
+        assert n >= 1, f"expected >=1 unapproved suggestion, got {n}"
+        sid, ax_id, current_w, suggested_w = c.execute(
+            "select suggestion_id, axis_id, current_weight, suggested_weight "
+            "from axis_weight_suggestions order by suggestion_id limit 1"
+        ).fetchone()
+        c.close()
+
+        # Confirm axes.yaml NOT yet mutated by the learning report.
+        axes_yaml = ws_dst / "config" / "axes.yaml"
+        original_text = axes_yaml.read_text()
+        assert f"weight: {current_w}" in original_text or "weight: 1.0" in original_text
+
+        # apply_axis_suggestion mutates + backs up + marks approved
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "apply_axis_suggestion.py"),
+             "--workspace", ws, "--suggestion-id", str(sid)],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        assert "Backup:" in res.stdout
+
+        # Backup file present
+        backups = list((ws_dst / "config").glob("axes.yaml.bak.*"))
+        assert len(backups) == 1, f"expected 1 backup, got {len(backups)}"
+
+        # axes.yaml weight for the targeted axis is updated
+        new_text = axes_yaml.read_text()
+        assert new_text != original_text
+        import yaml as _yaml
+        loaded = _yaml.safe_load(new_text)
+        target_axis = next(a for a in loaded["axes"] if a["id"] == ax_id)
+        assert float(target_axis["weight"]) == float(suggested_w)
+
+        # Re-applying same suggestion is a no-op
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "jobs" / "apply_axis_suggestion.py"),
+             "--workspace", ws, "--suggestion-id", str(sid)],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0
+        assert "already approved" in res.stdout
+
+
 def test_manual_override_skip_without_force():
     """Stage 6 must skip a partner with manual_score_override=True unless
     --force-rescore --reason is passed."""
