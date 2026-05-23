@@ -24,6 +24,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sqlalchemy import delete, select
 
 from core.config_loader import add_workspace_arg, load_workspace
+from core.banner import print_banner
 from core.db import deal_attributions, funds, get_engine, partners
 from core.ids import normalize_name, partner_id_for
 from core.llm.client import MODEL_BATCH, LLMClient
@@ -105,6 +106,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)
 

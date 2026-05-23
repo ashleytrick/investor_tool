@@ -287,7 +287,7 @@ def test_jobs_produce_suggestions_and_apply():
             capture_output=True, text=True, env=env, timeout=60,
         )
         assert res.returncode == 0
-        assert "Backup:" in res.stdout
+        assert "backup=" in res.stdout
 
         # Backup file present
         backups = list((ws_dst / "config").glob("axes.yaml.bak.*"))

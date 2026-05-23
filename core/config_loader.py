@@ -81,13 +81,26 @@ class Workspace:
 
 
 def add_workspace_arg(parser) -> None:
-    """Shared argparse wiring so every script accepts --workspace identically."""
+    """Shared argparse wiring so every script accepts --workspace identically.
+
+    Not strictly required: scripts can also resolve the workspace from the
+    INVESTOR_WORKSPACE env var. The explicit --workspace arg wins when both
+    are present.
+    """
     parser.add_argument(
         "--workspace",
-        required=True,
-        help="Path to the workspace dir, e.g. clients/test_workspace",
+        default=None,
+        help="Path to the workspace dir, e.g. clients/test_workspace. "
+             "Falls back to the INVESTOR_WORKSPACE env var if omitted.",
     )
 
 
-def load_workspace(workspace_arg: str) -> Workspace:
-    return Workspace(workspace_arg)
+def load_workspace(workspace_arg: str | None) -> Workspace:
+    """Resolve --workspace OR INVESTOR_WORKSPACE OR raise a clear error."""
+    ws = workspace_arg or os.environ.get("INVESTOR_WORKSPACE")
+    if not ws:
+        raise SystemExit(
+            "no workspace specified: pass --workspace clients/{name} or "
+            "set INVESTOR_WORKSPACE in your environment."
+        )
+    return Workspace(ws)

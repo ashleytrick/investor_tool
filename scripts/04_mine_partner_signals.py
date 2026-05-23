@@ -29,6 +29,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sqlalchemy import and_, select
 
 from core.config_loader import add_workspace_arg, load_workspace
+from core.banner import print_banner
 from core.db import funds, get_engine, partners, signals, source_snapshots
 from core.llm.client import MODEL_BATCH, LLMClient
 from core.runs import RunLogger
@@ -108,6 +109,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)
 

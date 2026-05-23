@@ -43,6 +43,7 @@ import yaml
 from sqlalchemy import delete, select
 
 from core.config_loader import add_workspace_arg, load_workspace
+from core.banner import print_banner
 from core.db import (
     axis_weight_suggestions,
     email_drafts,
@@ -150,6 +151,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
 
     if args.seed_fixture_outcomes:

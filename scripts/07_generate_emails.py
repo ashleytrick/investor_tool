@@ -42,6 +42,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sqlalchemy import delete, select
 
 from core.config_loader import add_workspace_arg, load_workspace
+from core.banner import print_banner
 from core.csv_export import write_review_queue
 from core.db import (
     batch_qa_reports,
@@ -622,6 +623,7 @@ def main() -> int:
         parser.error("--approve-bulk-ready requires --reason \"...\"")
 
     ws = load_workspace(args.workspace)
+    print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)
     batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"

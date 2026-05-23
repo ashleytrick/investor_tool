@@ -4,6 +4,27 @@ Workspace-based VC partner outreach pipeline. Builds a verified, scored target
 list of VC partners, drafts pitch-meeting emails per partner, and produces a
 reviewable CSV (plus optional Attio sync). Built per `PROJECT_BRIEF.md`.
 
+## Quick start (5 commands)
+
+```bash
+uv sync
+cp .env.example .env && $EDITOR .env                  # add ANTHROPIC_API_KEY
+uv run scripts/init_workspace.py my_raise              # scaffold clients/my_raise/
+$EDITOR clients/my_raise/config/*.yaml \
+        clients/my_raise/prompts/examples/*.md         # fill the templates
+export INVESTOR_WORKSPACE=clients/my_raise             # so --workspace is optional
+# then run the pipeline:
+uv run scripts/01_aggregate_sources.py
+uv run scripts/02_enrich_funds.py
+uv run scripts/03_mine_activity.py
+uv run scripts/04_mine_partner_signals.py
+uv run scripts/05_verify_and_quality.py
+uv run scripts/06_score_candidates.py
+uv run scripts/07_generate_emails.py --top 25
+# review clients/my_raise/exports/review_queue.csv
+uv run scripts/status.py                               # any time, to see state
+```
+
 ## Setup
 
 ```bash
@@ -12,7 +33,8 @@ cp .env.example .env   # each operator supplies their own ANTHROPIC_API_KEY
 ```
 
 Per-workspace state lives under `clients/{workspace}/`. Code under `core/` and
-`scripts/` is tenant-agnostic. Every script takes `--workspace`.
+`scripts/` is tenant-agnostic. Every script takes `--workspace` or falls back
+to `INVESTOR_WORKSPACE` env var.
 
 ## End-to-end run (test fixture)
 
@@ -59,6 +81,22 @@ specific high-blast-radius actions:
 - `--approve-bulk-ready --reason "..."` (Stage 7): allow more than 25 partners
   to be marked `ready_to_send` in a single run (Brief Rule 16 hard ceiling).
   Approval is persisted as a note on the `runs` row.
+
+## Operator CLIs (no SQL required)
+
+- `scripts/init_workspace.py NAME` — scaffold a new `clients/NAME/` with template
+  config + example stubs.
+- `scripts/status.py` — single-pane view: counts per stage, last-run timestamps,
+  pending suggestions, recent errors, suggested next command.
+- `scripts/manual_override.py --partner-id X --score|--recommended|--warm-path
+  --reason "..."` — flip override flags without raw SQL. `--list` shows what's
+  set; `--clear` removes everything for a partner.
+- `scripts/record_outcome.py --partner-id X --status STATUS --reply-type TYPE
+  [--meeting-booked ...]` — append outcomes for the monthly learning report
+  without going through Attio. `--from-csv path.csv` does batch import.
+- `jobs/apply_axis_suggestion.py --list | --suggestion-id N | --all-above LEVEL`
+  — review and apply axis-weight suggestions. Keeps the 10 most-recent
+  `axes.yaml.bak.*` backups, rotates older ones.
 
 ## Known limitations
 

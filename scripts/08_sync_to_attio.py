@@ -33,6 +33,7 @@ from sqlalchemy import select
 
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
 from core.config_loader import add_workspace_arg, load_workspace
+from core.banner import print_banner
 from core.db import (
     attio_sync_log,
     deck_request_responses,
@@ -195,6 +196,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     cfg = ws.attio or {}
     attio_cfg = cfg.get("attio") or cfg

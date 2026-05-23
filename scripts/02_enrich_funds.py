@@ -28,6 +28,7 @@ from selectolax.parser import HTMLParser
 from sqlalchemy import select
 
 from core.config_loader import add_workspace_arg, load_workspace
+from core.banner import print_banner
 from core.db import funds, get_engine, partners, source_snapshots, upsert
 from core.http_client import HttpClient
 from core.ids import partner_id_for
@@ -191,6 +192,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
+    print_banner(ws, stage=STAGE)
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)
 
