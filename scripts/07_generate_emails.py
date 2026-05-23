@@ -933,8 +933,17 @@ def main() -> int:
             if not d.get("is_recommended"):
                 alt_by_partner[d["partner_id"]] = d
 
+        # Pre-compute the set of partners whose recommended draft is in a
+        # similarity-failure pair (Finding 1: don't mark such drafts
+        # ready_to_send just because Stage 6 said so).
+        sim_failed_partners: set[str] = set()
+        for pid_a, pid_b, _kind, _score in qa["similarity_failures"]:
+            sim_failed_partners.add(pid_a)
+            sim_failed_partners.add(pid_b)
+
         # Build CSV rows.
         csv_rows: list[dict] = []
+        downgraded_count = 0
         for ctx, output, _ in partner_outputs:
             pid = ctx["partner_id"]
             rec = rec_by_partner.get(pid)
@@ -948,7 +957,7 @@ def main() -> int:
                     p_signals, key=lambda s: s["quality"], reverse=True
                 )[:3]
             )
-            csv_rows.append({
+            base = {
                 "partner_id": pid,
                 "partner_name": ctx["partner_name"],
                 "partner_title": ctx["title"],
@@ -987,16 +996,61 @@ def main() -> int:
                 "deck_request_response": output.deck_request_response,
                 "template_smell": rec.get("template_smell", "unscored"),
                 "warm_path_available": "" if ctx["warm_path_available"] is None else bool(ctx["warm_path_available"]),
-                "outreach_status": (
-                    "ready_to_send" if ctx["recommended_to_send"] else "draft"
-                ),
-            })
+            }
+            # ---- outreach_status routing (Findings 1 + 3) ----
+            # Compute per-draft hard-gate status. The draft was already
+            # validated against the schema; recheck the body-level gates here
+            # so we have the failure reasons available for the CSV.
+            qa_fails: list[str] = check_hard_gates(
+                {"subject": rec.get("subject"), "body": rec.get("body")}, banned
+            )
+            if rec.get("template_smell") == "high":
+                qa_fails.append("template_smell=high")
+            if pid in sim_failed_partners:
+                qa_fails.append("body similarity > 0.82 with another draft")
+
+            base["recommendation_reasoning"] = ctx["recommendation_reasoning"]
+            if ctx.get("warm_path_available"):
+                # Warm path takes precedence -- don't email cold.
+                base["outreach_status"] = "warm_path_needed"
+                base["recommendation_reasoning"] = (
+                    f"warm_path_available=TRUE; cold draft suppressed. "
+                    f"{ctx['recommendation_reasoning'] or ''}"
+                ).strip()
+            elif ctx["recommended_to_send"] and qa_fails:
+                base["outreach_status"] = "draft"
+                base["recommendation_reasoning"] = (
+                    f"DOWNGRADED by Stage 7 QA: {'; '.join(qa_fails)}. "
+                    f"(Stage 6 said: {ctx['recommendation_reasoning'] or '-'})"
+                )
+                downgraded_count += 1
+            elif ctx["recommended_to_send"]:
+                base["outreach_status"] = "ready_to_send"
+            else:
+                base["outreach_status"] = "draft"
+            csv_rows.append(base)
 
         out_path = write_review_queue(ws.exports_dir, csv_rows)
 
-        print(
-            f"[stage 7] {len(csv_rows)} partners in CSV review queue -> {out_path}"
+        ready = sum(1 for r in csv_rows if r["outreach_status"] == "ready_to_send")
+        warm_routed = sum(
+            1 for r in csv_rows if r["outreach_status"] == "warm_path_needed"
         )
+        print(
+            f"[stage 7] {len(csv_rows)} CSV row(s) -> {out_path} "
+            f"(ready_to_send={ready}, warm_path_needed={warm_routed}, "
+            f"draft={len(csv_rows) - ready - warm_routed})"
+        )
+        if downgraded_count:
+            # Finding 1: a Stage-6 recommended partner whose generated draft
+            # failed QA must NOT land as ready_to_send. Surface the count
+            # loudly so the operator looks at the reasoning column.
+            print(
+                f"[stage 7] DOWNGRADED {downgraded_count} recommended "
+                f"partner(s) to draft due to per-draft QA failures "
+                f"(see recommendation_reasoning column)."
+            )
+            run.note(f"downgraded_to_draft={downgraded_count}")
         print(
             f"[stage 7] batch QA: passed={qa['passed']} | "
             f"similarity failures={qa['similarity_failure_count']} | "

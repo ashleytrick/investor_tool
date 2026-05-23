@@ -77,8 +77,13 @@ def _apply_one(
         run.log_error(str(row.suggestion_id), "not_found", "axes.yaml missing")
         return False
 
-    ts = int(datetime.now().timestamp())
-    backup_path = axes_path.with_name(f"axes.yaml.bak.{ts}")
+    # Include microseconds + suggestion_id so --all-above can apply multiple
+    # suggestions in the same wall-clock second without one backup overwriting
+    # another.
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = axes_path.with_name(
+        f"axes.yaml.bak.{ts}.sug{row.suggestion_id}"
+    )
     shutil.copy2(axes_path, backup_path)
 
     cfg = yaml.safe_load(axes_path.read_text(encoding="utf-8"))

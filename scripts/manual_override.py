@@ -8,17 +8,23 @@ partners. This script is the supported interface; routine Stage 6 runs respect
 the flags it sets and Stage 7 honors warm_path_available.
 
 Examples:
-  # Pin scores on a partner you hand-tuned.
+  # Pin scores on a partner you hand-tuned. Freezes composite, round_fit,
+  # lead_likelihood, send_now_priority, etc.; routine Stage 6 skips this
+  # partner's score fields until you --clear or --force-rescore.
   uv run scripts/manual_override.py --partner-id NAME --score \\
       --reason "hand-curated after meeting"
 
-  # Force-promote (or force-demote) recommended_to_send.
-  uv run scripts/manual_override.py --partner-id NAME --recommended \\
+  # Force-promote OR force-demote recommended_to_send (BOTH sets the value
+  # AND sets manual_recommended_override=True so Stage 6 leaves it alone).
+  uv run scripts/manual_override.py --partner-id NAME --recommend yes \\
       --reason "champion at fund; bypass criterion 4"
+  uv run scripts/manual_override.py --partner-id NAME --recommend no \\
+      --reason "verified left fund last week; don't email"
 
-  # Mark warm path; Stage 6 will set outreach_status=warm_path_needed instead.
+  # Mark warm path; Stage 7 emits outreach_status=warm_path_needed in the CSV.
   uv run scripts/manual_override.py --partner-id NAME --warm-path \\
-      --warm-path-contact "ashley@... knows them"
+      --warm-path-contact "ashley@... knows them" \\
+      --reason "warm intro available"
 
   # Clear all overrides on a partner.
   uv run scripts/manual_override.py --partner-id NAME --clear
@@ -59,10 +65,14 @@ def main() -> int:
                    help="Clear all overrides on --partner-id.")
     g.add_argument("--score", action="store_true",
                    help="Set manual_score_override=TRUE on --partner-id.")
-    g.add_argument("--recommended", action="store_true",
-                   help="Set manual_recommended_override=TRUE on --partner-id.")
+    g.add_argument("--recommend", choices=("yes", "no"),
+                   help="Force-promote (yes) or force-demote (no) "
+                        "recommended_to_send on --partner-id. Sets both the "
+                        "value AND manual_recommended_override=True so Stage 6 "
+                        "leaves it alone going forward.")
     g.add_argument("--warm-path", action="store_true",
-                   help="Set partners.warm_path_available=TRUE on --partner-id.")
+                   help="Set partners.warm_path_available=TRUE on --partner-id. "
+                        "Stage 7 will emit outreach_status=warm_path_needed.")
 
     parser.add_argument("--partner-id", default=None,
                         help="Target partner_id (required for non-list ops).")
@@ -74,7 +84,7 @@ def main() -> int:
 
     if not args.list and not args.partner_id:
         parser.error("--partner-id is required unless --list")
-    requires_reason = args.score or args.recommended or args.warm_path
+    requires_reason = args.score or bool(args.recommend) or args.warm_path
     if requires_reason and not args.reason:
         parser.error("--reason is required when setting an override")
 
@@ -170,14 +180,23 @@ def main() -> int:
             run.succeeded = 1
             return 0
 
-        # --score or --recommended
+        # --score or --recommend
         update = {"manual_override_reason": args.reason}
         if args.score:
             update["manual_score_override"] = True
             label = "manual_score_override=TRUE"
         else:
+            # --recommend yes|no: BOTH set the value AND lock it (Finding 2).
+            new_value = (args.recommend == "yes")
             update["manual_recommended_override"] = True
-            label = "manual_recommended_override=TRUE"
+            update["recommended_to_send"] = new_value
+            update["recommendation_reasoning"] = (
+                f"manual override ({args.recommend}): {args.reason}"
+            )
+            label = (
+                f"recommended_to_send={new_value} + "
+                f"manual_recommended_override=TRUE"
+            )
         with engine.begin() as conn:
             existing = conn.execute(
                 select(partner_score_summaries.c.partner_id).where(
