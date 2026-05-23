@@ -322,9 +322,23 @@ def _sync_columns_with_metadata(engine: Engine) -> None:
 
 
 def upsert(conn, table: Table, pk_cols: list[str], values: dict) -> None:
-    """Idempotent insert-or-update keyed on the given primary-key columns."""
+    """Idempotent insert-or-update keyed on the table's primary-key columns.
+
+    SQLite's ON CONFLICT requires the index_elements to be the actual PK or
+    a unique index. We assert pk_cols is exactly the table's PK so future
+    callers can't quietly accept non-unique columns and get runtime failures
+    only when conflicts happen.
+    """
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+    actual_pk = {c.name for c in table.primary_key.columns}
+    requested = set(pk_cols)
+    if requested != actual_pk:
+        raise ValueError(
+            f"upsert(): pk_cols {sorted(requested)} does not match "
+            f"{table.name}.primary_key {sorted(actual_pk)}. "
+            f"ON CONFLICT only works against the actual PK / unique constraint."
+        )
     stmt = sqlite_insert(table).values(**values)
     update_cols = {c: stmt.excluded[c] for c in values if c not in pk_cols}
     if update_cols:

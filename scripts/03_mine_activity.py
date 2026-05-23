@@ -262,16 +262,21 @@ def main() -> int:
                         "sector_tags": sector_tags_json,
                         "captured_at": _now(),
                     })
-                if not rows:
-                    run.skipped += 1
-                    continue
+                # Delete prior attributions for THIS source_url FIRST. If a
+                # reprocess yields no known-fund/partner rows, the prior
+                # (possibly wrong) attribution must NOT linger -- otherwise
+                # corrections silently fail to remove stale data.
                 with engine.begin() as conn:
                     conn.execute(
                         delete(deal_attributions).where(
                             deal_attributions.c.source_url == source_url
                         )
                     )
-                    conn.execute(deal_attributions.insert(), rows)
+                    if rows:
+                        conn.execute(deal_attributions.insert(), rows)
+                if not rows:
+                    run.skipped += 1
+                    continue
                 partner_attributed += sum(1 for r in rows if r["attributed_partner_id"])
                 run.succeeded += 1
             except Exception as exc:  # noqa: BLE001 - logged, continue

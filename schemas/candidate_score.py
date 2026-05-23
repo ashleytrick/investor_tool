@@ -1,15 +1,20 @@
-"""Pydantic schema for Stage 6 candidate-scoring LLM output."""
+"""Pydantic schema for Stage 6 candidate-scoring LLM output.
+
+Bounds are enforced: a live LLM returning score=87 or score=-3 raises
+ValidationError, which the LLM client retries up to 3 times with a stricter
+prompt -- preferable to silently flowing garbage into composite_fit_score.
+"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AxisScore(BaseModel):
-    score: Optional[float] = None  # 0..10, or None if insufficient data
+    score: Optional[float] = Field(default=None, ge=0.0, le=10.0)
     supporting_signal_ids: list[int] = []
-    confidence: str  # "low" | "medium" | "high"
+    confidence: Literal["low", "medium", "high"]
     reasoning: str
 
 

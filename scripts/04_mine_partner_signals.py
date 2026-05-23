@@ -271,14 +271,26 @@ def main() -> int:
                             ))
                         ).first()
                         if exists:
-                            # Backfill snapshot_id if it was created by an earlier
-                            # shortcut path (e.g. the Session 1 fixture insert).
+                            # On dedup hit, REFRESH the metadata fields so a
+                            # corrected LLM run actually updates axis_relevance
+                            # / source_type / signal_direction / quote_date.
+                            # Previously these were frozen at first insertion
+                            # even when a later run produced better tags.
+                            # verified + signal_quality_score are preserved
+                            # (set by Stage 5; not for us to overwrite here).
+                            update_values = {
+                                "source_type": s.source_type,
+                                "quote_date": s.quote_date,
+                                "axis_relevance": json.dumps(s.axis_relevance),
+                                "signal_direction": s.signal_direction,
+                            }
                             if exists.snapshot_id is None and snap_id is not None:
-                                conn.execute(
-                                    signals.update()
-                                    .where(signals.c.signal_id == exists.signal_id)
-                                    .values(snapshot_id=snap_id)
-                                )
+                                update_values["snapshot_id"] = snap_id
+                            conn.execute(
+                                signals.update()
+                                .where(signals.c.signal_id == exists.signal_id)
+                                .values(**update_values)
+                            )
                             continue
                         conn.execute(signals.insert().values(
                             partner_id=p.partner_id,

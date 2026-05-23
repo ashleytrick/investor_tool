@@ -68,19 +68,33 @@ def gather_fixture_pages(fund: dict, ws) -> dict[str, str]:
     return pages
 
 
-async def gather_live_pages(fund: dict) -> dict[str, str]:
-    """Fetch standard fund pages over the network. Returns {url: html}."""
+async def gather_live_pages(
+    fund: dict,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Fetch standard fund pages. Returns (pages, failures) where failures is
+    a list of (url, reason) tuples for the operator audit trail.
+
+    Previously every per-URL exception was caught and silently discarded.
+    Now non-200 responses are still ignored (a missing /portfolio is normal),
+    but transport-layer errors and 5xx responses are surfaced to the caller
+    so they can land in run_errors.
+    """
     client = HttpClient()
     pages: dict[str, str] = {}
+    failures: list[tuple[str, str]] = []
     for path in LIVE_PATHS:
         url = _page_url(fund["domain"], path)
         try:
             res = await client.fetch(url)
-            if res.status == 200 and res.text.strip():
-                pages[url] = res.text
-        except Exception:  # noqa: BLE001 - a missing page is not fatal
+        except Exception as exc:  # noqa: BLE001 - audited via `failures`
+            failures.append((url, f"{type(exc).__name__}: {exc}"))
             continue
-    return pages
+        if res.status == 200 and res.text.strip():
+            pages[url] = res.text
+        elif res.status >= 500:
+            # Server errors are interesting; 404 is not.
+            failures.append((url, f"HTTP {res.status}"))
+    return pages, failures
 
 
 def deterministic_enrichment(pages: dict[str, str]) -> dict:
@@ -205,13 +219,35 @@ def main() -> int:
 
     with RunLogger(engine, ws.name, STAGE) as run:
         run.attach_llm_usage(llm.usage)
+        # Live mode requires an LLM. The deterministic_enrichment() stub is
+        # designed for our fixture HTML's <meta name="..."> tags; against a
+        # real fund site it would happily return mostly-empty enrichment and
+        # the operator would never know. Refuse upfront like Stages 3/4.
+        if not args.fixtures and llm.stub:
+            msg = (
+                "REFUSED: live Stage 2 requires ANTHROPIC_API_KEY. The "
+                "deterministic stub extractor only understands fixture HTML "
+                "and would silently produce empty enrichment against real "
+                "fund pages. Set the key, or run with --fixtures."
+            )
+            print(f"[stage 2] {msg}")
+            run.note(msg)
+            run.failed = max(run.failed, 1)
+            return 2
         for fund in fund_rows:
             run.processed += 1
             try:
                 if args.fixtures:
                     pages = gather_fixture_pages(fund, ws)
+                    fetch_failures: list[tuple[str, str]] = []
                 else:
-                    pages = asyncio.run(gather_live_pages(fund))
+                    pages, fetch_failures = asyncio.run(gather_live_pages(fund))
+                # Surface per-URL fetch failures in run_errors so an operator
+                # auditing a degraded enrichment can see WHY pages were missing.
+                for url, reason in fetch_failures:
+                    run.log_error(
+                        f"{fund['fund_id']}:{url}", "fetch_failed", reason
+                    )
                 if not pages:
                     run.skipped += 1
                     run.log_error(fund["fund_id"], "no_pages",
@@ -220,6 +256,10 @@ def main() -> int:
 
                 snaps = store_snapshots(engine, pages)
                 enrichment = enrich(llm, fund, pages)
+
+                # Track which partners are still on the team page this run so
+                # we can demote anyone previously seen but now missing.
+                discovered_pids: set[str] = set()
 
                 with engine.begin() as conn:
                     conn.execute(
@@ -236,15 +276,11 @@ def main() -> int:
                     )
                     for p in enrichment.current_partners:
                         pid = partner_id_for(fund["domain"], p.name)
-                        # Team page is a single-source recent observation, so
-                        # this counts as "likely_current" per the brief's
-                        # employment confidence ladder. The other states need
-                        # additional sources that this v1 does not ingest:
-                        #   verified_current = /team + LinkedIn within 30 days
-                        #   uncertain        = stale or conflicting evidence
-                        #   left_fund        = explicit departure evidence
-                        # Until LinkedIn cross-check + departure feed are added,
-                        # only likely_current is reachable from this stage.
+                        discovered_pids.add(pid)
+                        # Team page is a single-source recent observation;
+                        # likely_current per the brief's ladder. LinkedIn
+                        # cross-check (-> verified_current) and a departure
+                        # feed (-> left_fund) are future enhancements.
                         upsert(conn, partners, ["partner_id"], {
                             "partner_id": pid,
                             "fund_id": fund["fund_id"],
@@ -254,6 +290,38 @@ def main() -> int:
                             "employment_status": "likely_current",
                             "last_updated": _now(),
                         })
+
+                    # Demote previously-seen partners no longer on the team
+                    # page. Without this, a partner who left a fund stays
+                    # `likely_current` forever and continues to satisfy
+                    # Stage 6 criterion 6.
+                    if discovered_pids:
+                        prior_for_fund = [
+                            r.partner_id for r in conn.execute(
+                                select(partners.c.partner_id).where(
+                                    partners.c.fund_id == fund["fund_id"]
+                                )
+                            )
+                        ]
+                        vanished = [
+                            pid for pid in prior_for_fund
+                            if pid not in discovered_pids
+                        ]
+                        if vanished:
+                            conn.execute(
+                                partners.update().where(
+                                    partners.c.partner_id.in_(vanished)
+                                ).values(
+                                    employment_status="uncertain",
+                                    last_updated=_now(),
+                                )
+                            )
+                            print(
+                                f"[stage 2] {fund['name']}: demoted "
+                                f"{len(vanished)} partner(s) to "
+                                f"employment_status=uncertain (no longer on "
+                                f"team page)"
+                            )
                 run.succeeded += 1
                 print(
                     f"[stage 2] {fund['name']}: {len(pages)} pages "
