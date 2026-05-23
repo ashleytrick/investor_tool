@@ -111,6 +111,32 @@ def has_metrics_oriented_signal(p_signals: list[dict]) -> bool:
     return False
 
 
+# Axis name/description tokens that mark a "timing / market-shift" belief axis.
+# Previously Stage 7 hardcoded axis_4 (the fixture's timing axis) to enable
+# market_shift_led -- which broke for any workspace that doesn't put the
+# timing-driven axis last. Now we resolve it by inspecting axes.yaml so the
+# strategy eligibility is workspace-portable.
+MARKET_SHIFT_AXIS_TOKENS = (
+    "timing", "market shift", "market-shift", "window", "policy",
+    "forced buy", "tailwind", "regulatory",
+)
+
+
+def market_shift_axis_ids(axes_cfg: dict) -> set[str]:
+    """Return axis IDs whose name or description signals a timing/market-shift
+    belief. Falls back to {} if no axis matches -- callers treat that as
+    market_shift_led ineligible, which is the safe default."""
+    out: set[str] = set()
+    for ax in (axes_cfg or {}).get("axes", []) or []:
+        blob = " ".join((
+            (ax.get("name") or ""),
+            (ax.get("description") or ""),
+        )).lower()
+        if any(tok in blob for tok in MARKET_SHIFT_AXIS_TOKENS):
+            out.add(ax.get("id"))
+    return {aid for aid in out if aid}
+
+
 def has_company_traction(company_cfg: dict) -> bool:
     c = (company_cfg.get("company") or {}).get("current_traction") or {}
     return bool(c.get("headline_metric")) or bool(c.get("secondary_metrics"))
@@ -525,6 +551,9 @@ def build_stub_response(partner_id: str, strategies: list[str]) -> dict | None:
 
 # ------- batch QA -------
 
+_RAISE_RE = re.compile(r"\b(raising|raise|seed round|series [a-z])\b", re.IGNORECASE)
+
+
 def check_hard_gates(draft: dict, banned: list[str]) -> list[str]:
     """Per-draft hard gates that disqualify a draft."""
     fails: list[str] = []
@@ -538,7 +567,10 @@ def check_hard_gates(draft: dict, banned: list[str]) -> list[str]:
         fails.append(
             f"unfilled prompt placeholder(s) in body: {sorted(set(leftover))}"
         )
-    if not any(k in body_lower for k in ("raising", " raise ")):
+    # Word-boundary match so "$3M raise." and "Seed round closing" both count.
+    # Previous substring match required " raise " with surrounding spaces and
+    # missed sentence-final forms.
+    if not _RAISE_RE.search(body):
         fails.append("missing explicit raise reference in body")
     if any(p in body_lower for p in SOFT_CTA_PHRASES):
         fails.append("soft CTA phrase present")
@@ -621,8 +653,7 @@ def evaluate_batch(
     smell_high_count = sum(1 for d in all_drafts if d["template_smell"] == "high")
     smell_low_count = sum(1 for d in all_drafts if d["template_smell"] == "low")
     raise_missing = sum(
-        1 for d in all_drafts
-        if not any(k in (d["body"] or "").lower() for k in ("raising", " raise "))
+        1 for d in all_drafts if not _RAISE_RE.search(d.get("body") or "")
     )
 
     # Strategy distribution (recommended drafts only).
@@ -718,6 +749,7 @@ def main() -> int:
         s.lower()
         for s in (ws.company.get("company") or {}).get("target_sectors", []) or []
     }
+    market_shift_axes = market_shift_axis_ids(ws.axes)
 
     # ---- pull top-N partners + their context ----
     with engine.begin() as conn:
@@ -871,10 +903,13 @@ def main() -> int:
                 # partner_led_in_target: partner has a named-lead deal at a fund
                 # whose thesis is target-adjacent.
                 partner_led_in_target = bool(p_deals) and fund_adjacent
-                # market_shift_led eligibility: partner has signal tagged with the
-                # axis describing timing-driven category conviction.
-                market_window_match = any(
-                    "axis_4" in s["axes"] for s in p_signals
+                # market_shift_led eligibility: partner has signal tagged with
+                # an axis whose name/description signals timing-driven
+                # category conviction (resolved from axes.yaml; previously
+                # hardcoded to axis_4).
+                market_window_match = bool(market_shift_axes) and any(
+                    set(s.get("axes") or []) & market_shift_axes
+                    for s in p_signals
                 )
                 # Finding 11: traction_led requires BOTH the company having
                 # current traction in config AND THIS partner having a

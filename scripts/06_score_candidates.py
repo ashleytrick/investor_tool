@@ -320,13 +320,22 @@ def main() -> int:
         partner_rows = list(conn.execute(select(partners)))
         fund_rows = {r.fund_id: r for r in conn.execute(select(funds))}
 
+        # Per-partner: quality>=2 verified signals (used for composite + Stage 7).
         verified_signals_by_partner: dict[str, list[dict]] = {}
+        # Per-partner: ALL verified signals incl. quality=1, used only for the
+        # honest verified_signal_count we persist for audit. Previously this
+        # field was len(verified_signals_by_partner[pid]) which dropped the
+        # quality-1 verified signals -- two columns ended up identical.
+        all_verified_count_by_partner: dict[str, int] = {}
         for s in conn.execute(
-            select(signals).where(
-                signals.c.verified.is_(True),
-                signals.c.signal_quality_score >= 2,
-            )
+            select(signals).where(signals.c.verified.is_(True))
         ):
+            all_verified_count_by_partner[s.partner_id] = (
+                all_verified_count_by_partner.get(s.partner_id, 0) + 1
+            )
+            q = int(s.signal_quality_score or 0)
+            if q < 2:
+                continue
             verified_signals_by_partner.setdefault(s.partner_id, []).append({
                 "id": int(s.signal_id),
                 "quote": s.quoted_text,
@@ -334,7 +343,7 @@ def main() -> int:
                 "source_type": s.source_type,
                 "axes": json.loads(s.axis_relevance or "[]"),
                 "direction": s.signal_direction,
-                "quality": int(s.signal_quality_score),
+                "quality": q,
                 "date": s.quote_date,
             })
 
@@ -525,20 +534,30 @@ def main() -> int:
                     if partial is not None else None
                 )
 
-                # Major kill signal aggregation.
+                # Major kill signal aggregation. components.get() rather than
+                # bracket access so a future shape change in compute_round_fit
+                # doesn't KeyError here.
                 major_kill = (
                     rf.disqualifier_present
                     or (p.employment_status == "left_fund")
-                    or (not fund.is_active and rf.components["active_fund"] == 0)
+                    or (
+                        not fund.is_active
+                        and rf.components.get("active_fund", 0) == 0
+                    )
                 )
                 kill_summary = "; ".join(rf.triggered_disqualifiers) if major_kill else ""
 
                 recency_bonus = signal_recency_bonus(most_recent, today)
+                # Previously: `cold_reachability or 5.0` -- unknown reachability
+                # silently inflated send_now_priority by ~2.5 points (0.5 weight
+                # * 5.0), pushing partners with NO reachability data ABOVE
+                # partners scored low. Treat unknown as 0 so the absence of
+                # evidence doesn't masquerade as a mid-tier score.
                 send_now = compute_send_now_priority(
                     round_fit_score=rf.round_fit_score,
                     lead_likelihood_score=ll.lead_likelihood_score,
                     composite_fit_score=composite,
-                    cold_reachability_score=cold_reachability or 5.0,
+                    cold_reachability_score=cold_reachability or 0.0,
                     spiky_belief_score=spiky,
                     recency_bonus=recency_bonus,
                     major_kill=major_kill,
@@ -574,7 +593,9 @@ def main() -> int:
                     "axis_score_variance": variance,
                     "spiky_belief_score": spiky,
                     "score_confidence": score_conf,
-                    "verified_signal_count": len(p_signals),
+                    "verified_signal_count": all_verified_count_by_partner.get(
+                        p.partner_id, len(p_signals)
+                    ),
                     "quality_2_plus_signal_count": len(p_signals),
                     "distinct_source_type_count": distinct_source_types,
                     "most_recent_signal_date": most_recent,
