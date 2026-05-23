@@ -47,6 +47,24 @@ def _scalar(values: dict, slug: str):
     return v
 
 
+def _bool(values: dict, slug: str) -> bool:
+    """Parse a boolean Attio attribute value safely.
+
+    Finding 33: a previous version did `bool(_scalar(...))`, which accepted
+    a string "false" from the API as Truthy. Now we map common falsey
+    strings explicitly and only treat real-bool / explicit truthy strings
+    as True.
+    """
+    v = _scalar(values, slug)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return False
+
+
 def _option_title(values: dict, slug: str) -> str | None:
     v = values.get(slug)
     if not v:
@@ -144,12 +162,31 @@ def main() -> int:
                     "partner_id": pid,
                     "outreach_status": _option_title(values, "outreach_status"),
                     "reply_type": _option_title(values, "reply_type"),
-                    "meeting_booked": bool(_scalar(values, "meeting_booked")),
+                    "meeting_booked": _bool(values, "meeting_booked"),
                     "meeting_date": _date(values, "meeting_date"),
                     "meeting_outcome": _option_title(values, "meeting_outcome"),
                     "synced_from_attio_at": _now(),
                 }
+                # Finding 34: dedupe vs the latest outcome row for this
+                # partner. If nothing meaningful has changed since the last
+                # sync, skip the insert -- the previous append-only
+                # behavior was producing duplicate snapshots on every cron
+                # tick and polluting the learning report.
                 with engine.begin() as conn:
+                    latest = conn.execute(
+                        select(outcomes).where(outcomes.c.partner_id == pid)
+                        .order_by(outcomes.c.outcome_id.desc()).limit(1)
+                    ).first()
+                    unchanged = bool(latest) and (
+                        latest.outreach_status == row["outreach_status"]
+                        and latest.reply_type == row["reply_type"]
+                        and bool(latest.meeting_booked) == row["meeting_booked"]
+                        and latest.meeting_date == row["meeting_date"]
+                        and latest.meeting_outcome == row["meeting_outcome"]
+                    )
+                    if unchanged:
+                        run.skipped += 1
+                        continue
                     conn.execute(outcomes.insert().values(**row))
                 run.succeeded += 1
             except Exception as exc:  # noqa: BLE001 - logged, continue

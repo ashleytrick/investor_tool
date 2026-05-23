@@ -220,8 +220,15 @@ def main() -> int:
     with RunLogger(engine, ws.name, STAGE) as run:
         # ---- load per-partner state ----
         with engine.begin() as conn:
+            # Finding 35: pick latest outcome per partner by EVENT timestamp
+            # (synced_from_attio_at), with outcome_id as tiebreak. Outcome_id
+            # alone was wrong when CSV imports + Attio syncs interleaved.
             latest_outcomes: dict[str, object] = {}
-            for o in conn.execute(select(outcomes).order_by(outcomes.c.outcome_id)):
+            for o in conn.execute(
+                select(outcomes).order_by(
+                    outcomes.c.synced_from_attio_at, outcomes.c.outcome_id
+                )
+            ):
                 latest_outcomes[o.partner_id] = o
             axis_scores: dict[str, dict[str, float]] = defaultdict(dict)
             for s in conn.execute(select(scores)):

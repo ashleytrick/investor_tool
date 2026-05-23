@@ -51,9 +51,24 @@ def main() -> int:
             return 0
 
         objects = attio_cfg.get("objects") or {"funds": "companies", "partners": "people"}
+        # Finding 40: base attributes Stage 8 actually writes (name, domains
+        # for companies; name, email_addresses, company link for people)
+        # must exist too -- the previous check only validated custom-attr
+        # slugs from attio.yaml, so a misconfigured object could fail at
+        # the first sync with a confusing API error.
+        base_attrs = {
+            objects["funds"]: {"name", "domains"},
+            objects["partners"]: {"name", "email_addresses", "company"},
+        }
         expected = {
-            objects["funds"]: set((attio_cfg.get("fund_attributes") or {}).values()),
-            objects["partners"]: set((attio_cfg.get("partner_attributes") or {}).values()),
+            objects["funds"]: (
+                set((attio_cfg.get("fund_attributes") or {}).values())
+                | base_attrs[objects["funds"]]
+            ),
+            objects["partners"]: (
+                set((attio_cfg.get("partner_attributes") or {}).values())
+                | base_attrs[objects["partners"]]
+            ),
         }
         all_ok = True
         for object_slug, want in expected.items():
