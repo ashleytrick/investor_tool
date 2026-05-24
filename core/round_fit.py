@@ -111,14 +111,37 @@ def recent_relevant_deals(
     fund_deals_18mo: list[dict],
     target_sectors: list[str],
 ) -> int:
-    """Count fund's last-18mo lead deals whose sector_tags hit target_sectors."""
+    """Count fund's last-18mo lead deals whose sector_tags hit target_sectors.
+
+    Batch 24 (#419): match singular/plural forms (compliance vs compliances,
+    payment vs payments, infrastructure stays infrastructure) so the LLM's
+    free-form sector_tags don't miss obvious hits.
+    """
     targets = {t.strip().lower() for t in (target_sectors or []) if t.strip()}
     if not targets:
         return 0
+    # Expand each target sector into a set of stem-like variants. This is
+    # deliberately conservative: only add the +s/-s form so we don't
+    # over-match (e.g. "API" -> "apis" but NOT "API" -> "APIs that fail").
+    expanded: set[str] = set()
+    for t in targets:
+        expanded.add(t)
+        if t.endswith("s") and len(t) > 1:
+            expanded.add(t[:-1])
+        else:
+            expanded.add(t + "s")
     hits = 0
     for d in fund_deals_18mo:
         tags = {t.strip().lower() for t in (d.get("sector_tags") or [])}
-        if tags & targets:
+        # Also expand tags by stem so "payments" matches a target of "payment".
+        tag_expanded: set[str] = set()
+        for tag in tags:
+            tag_expanded.add(tag)
+            if tag.endswith("s") and len(tag) > 1:
+                tag_expanded.add(tag[:-1])
+            else:
+                tag_expanded.add(tag + "s")
+        if tag_expanded & expanded:
             hits += 1
     return min(2, hits)
 

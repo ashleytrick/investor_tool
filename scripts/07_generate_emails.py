@@ -103,6 +103,29 @@ METRICS_SIGNAL_KEYWORDS = (
 )
 
 
+# Batch 24 (#420): keyword matching against thesis text used substring
+# `kw in thesis` which produces false positives like "ai" in "stairwell"
+# or "art" in "smart". Use word-boundary matching against tokenized
+# thesis, handling multi-word sectors ("design partners") by matching
+# the phrase as a substring AFTER ensuring the surrounding chars are
+# non-word.
+import re as _re
+
+_NONWORD_RE = _re.compile(r"\W+")
+
+
+def _word_boundary_hit(haystack: str, needle: str) -> bool:
+    """True if `needle` appears in `haystack` bounded by non-word chars
+    (or start/end of string). Case-insensitive on the caller side; both
+    inputs should already be lower()."""
+    if not needle:
+        return False
+    pattern = _re.compile(
+        r"(?:^|\W)" + _re.escape(needle) + r"(?:$|\W)"
+    )
+    return bool(pattern.search(haystack))
+
+
 def has_metrics_oriented_signal(p_signals: list[dict]) -> bool:
     """True iff at least one verified signal mentions metrics vocabulary."""
     for s in p_signals:
@@ -1035,9 +1058,14 @@ def main() -> int:
                 # Loose single-keyword match is too generous (e.g. "infrastructure"
                 # matches both Foundry-style climate-infra and Northbeam-style
                 # fintech-infra). Require >=2 target-sector keyword hits.
+                # Batch 24 (#420): substring matching causes "art" -> "smart"
+                # and "ai" -> "stairwell" false positives. Use word-
+                # boundary matching against tokenized thesis so multi-word
+                # sectors like "design partners" still hit correctly.
                 thesis_lower = (row.stated_thesis or "").lower()
                 fund_adjacent = sum(
-                    1 for kw in target_sectors if kw and kw in thesis_lower
+                    1 for kw in target_sectors
+                    if kw and _word_boundary_hit(thesis_lower, kw)
                 ) >= 2
                 # partner_led_in_target: partner has a named-lead deal at a fund
                 # whose thesis is target-adjacent.

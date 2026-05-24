@@ -1665,6 +1665,49 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch24_sector_matching_false_positives():
+    """Inventory #419/#420/#422: word-boundary matching avoids substring
+    false positives ("ai" in "stairwell", "art" in "smart") and sector
+    plurals match against singular targets."""
+    # Import the helper from Stage 7 via importlib.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "s7", REPO_ROOT / "scripts" / "07_generate_emails.py"
+    )
+    s7 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s7)
+    hit = s7._word_boundary_hit
+
+    # NOTE: helper expects pre-lowercased input (Stage 7 caller does
+    # `thesis_lower = (...).lower()` before passing).
+
+    # Positive: real word matches.
+    assert hit("we invest in fintech infrastructure", "fintech") is True
+    assert hit("compliance reporting as an api", "api") is True
+    # Multi-word phrase matches as substring at word boundaries.
+    assert hit("design partners signed in q1", "design partners") is True
+
+    # Negative: substring false positives.
+    assert hit("stairwell ai is our portfolio company", "ai") is True
+    assert hit("retail focus, no fintech", "ai") is False
+    assert hit("smart contracts", "art") is False
+    assert hit("we invest in api-first infra", "ap") is False
+
+    # Empty needle never matches.
+    assert hit("anything", "") is False
+
+    # Sector plural / singular matching in round_fit.
+    from core.round_fit import recent_relevant_deals
+    deals = [
+        {"sector_tags": ["payment", "regulatory"]},
+        {"sector_tags": ["compliances"]},  # plural in tag
+    ]
+    # Targets singular -- both should match.
+    assert recent_relevant_deals(deals, ["payments", "compliance"]) == 2
+
+    # Empty targets returns 0.
+    assert recent_relevant_deals(deals, []) == 0
+
+
 def test_batch23_stage7_metadata():
     """Inventory #467, #471-#474: followup_drafts/deck_request_responses
     carry batch_id, written_to_csv_at is set AFTER CSV success not at
