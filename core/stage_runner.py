@@ -64,6 +64,7 @@ from core.banner import print_banner
 from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
 from core.runs import RunLogger
+from core.stage_result import StageResult
 from core.validate_config import preflight_or_exit
 
 
@@ -76,31 +77,52 @@ class StageContext:
     run: RunLogger
     llm: Optional[Any]  # core.llm.client.LLMClient; Any to avoid circular
     stage: str
-    _explicit_exit: Optional[int] = None
+    _explicit_exit: Optional[StageResult] = None
 
-    def refuse(self, reason: str, *, exit_code: int = 2) -> None:
-        """Mark the run as refused (safety gate fired) with an explicit
-        reason that lands in runs.error_summary. The stage_run context
-        manager picks up `_explicit_exit` and returns it.
+    def refuse(self, reason: str,
+               *, code: StageResult = StageResult.OPERATIONAL_FAILURE) -> None:
+        """Mark the run as refused (a gate fired) with an explicit reason
+        that lands in runs.error_summary. stage_run picks up
+        `_explicit_exit` and exposes it via .exit_code.
 
-        Use when the stage is consciously refusing to do work for a
-        safety reason (mode=fixture, freshness fail, batch QA fail).
-        Distinct from raising, which the runner treats as a fatal error.
+        Default code is OPERATIONAL_FAILURE (=2) for back-compat with
+        the pre-refactor exit-code convention. Call refuse_unsafe()
+        when the gate is specifically a safety refusal (distinguishes
+        operator-action-needed from LLM/data-failure for cron).
         """
         self.run.note(reason)
         self.run.failed = max(self.run.failed, 1)
-        self._explicit_exit = exit_code
+        self._explicit_exit = code
+
+    def refuse_unsafe(self, reason: str) -> None:
+        """Mark the run as refused for a SAFETY reason (mode=fixture,
+        freshness fail, batch QA hard fail, required-source fail).
+        Maps to StageResult.REFUSED_UNSAFE (=3) so cron wrappers can
+        distinguish 'I refuse to ship this' from 'the LLM crashed'.
+        """
+        self.refuse(reason, code=StageResult.REFUSED_UNSAFE)
+
+    def usage_error(self, reason: str) -> None:
+        """Mark the run as a CLI / config usage error (exit 1). Same
+        semantics as refuse() but uses StageResult.USAGE_ERROR so cron
+        wrappers can distinguish operator mistakes from data drift."""
+        self.refuse(reason, code=StageResult.USAGE_ERROR)
 
     @property
     def exit_code(self) -> int:
-        """0 when the run is clean, 2 when any per-record failure was
-        recorded OR refuse() was called. Refer to Refactor Batch B for
-        the planned 1/2/3 split."""
+        """StageResult mapped to an int per the policy in stage_result.py.
+
+        Priority:
+          1. explicit ctx.refuse() / refuse_unsafe() / usage_error()
+             -> their code
+          2. run.failed > 0  -> OPERATIONAL_FAILURE
+          3. otherwise       -> OK
+        """
         if self._explicit_exit is not None:
-            return self._explicit_exit
+            return int(self._explicit_exit)
         if self.run.failed > 0:
-            return 2
-        return 0
+            return int(StageResult.OPERATIONAL_FAILURE)
+        return int(StageResult.OK)
 
 
 @contextmanager

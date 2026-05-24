@@ -2,11 +2,18 @@
 row to `runs`; per-record failures go to `run_errors`. Silent failures are
 forbidden, so every run ends with an explicit processed/succeeded/failed/skipped
 summary printed and persisted.
+
+Refactor Batch C adds semantic accounting methods (attempt / succeed /
+skip / fail) that wrap the raw counter mutation pattern every script
+used to repeat. The raw counters (run.processed, .succeeded, .failed,
+.skipped) remain accessible for migration compatibility.
 """
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Iterator
 
 from sqlalchemy.engine import Engine
 
@@ -67,6 +74,79 @@ class RunLogger:
                     occurred_at=_now(),
                 )
             )
+
+    # ----- Refactor Batch C: semantic accounting helpers -----
+
+    @contextmanager
+    def attempt(self) -> Iterator["RunLogger"]:
+        """Bracket one per-record processing block. Increments .processed
+        on entry. Caller decides the outcome via .succeed(), .skip(reason),
+        or .fail(record_id, type, msg). If neither is called and no
+        exception was raised inside the block, the attempt is implicitly
+        treated as succeeded -- this matches the most common loop shape.
+
+        Usage:
+            for partner in partners:
+                with run.attempt():
+                    do_work(partner)
+                    # implicit succeed on clean exit
+        OR:
+            for partner in partners:
+                with run.attempt():
+                    try:
+                        do_work(partner)
+                        run.succeed()
+                    except KnownError as e:
+                        run.fail(partner.id, type(e).__name__, str(e))
+        """
+        self.processed += 1
+        self._attempt_resolved = False
+        try:
+            yield self
+        finally:
+            if not self._attempt_resolved:
+                # Implicit success when the block exited cleanly.
+                self.succeeded += 1
+            self._attempt_resolved = False
+
+    def succeed(self) -> None:
+        """Mark the current .attempt() as succeeded. Idempotent if called
+        twice in the same block; only the first call counts."""
+        if not getattr(self, "_attempt_resolved", False):
+            self.succeeded += 1
+            self._attempt_resolved = True
+
+    def skip(self, reason: str | None = None) -> None:
+        """Mark the current .attempt() as skipped. Optional reason lands
+        as a run.note so the audit captures WHY rows were skipped."""
+        if not getattr(self, "_attempt_resolved", False):
+            self.skipped += 1
+            self._attempt_resolved = True
+            if reason:
+                self.note(f"skip: {reason}")
+
+    def fail(self, record_id: str, error_type: str, message: str) -> None:
+        """Mark the current .attempt() as failed AND write a run_errors
+        row. One call replaces the old `run.failed += 1; run.log_error(...)`
+        pattern that was easy to half-do."""
+        if not getattr(self, "_attempt_resolved", False):
+            self.failed += 1
+            self._attempt_resolved = True
+        self.log_error(record_id, error_type, message)
+
+    def is_clean(self) -> bool:
+        """True when the run processed at least one record and none failed."""
+        return self.processed > 0 and self.failed == 0
+
+    def all_skipped(self) -> bool:
+        """True when the run processed records but every one was skipped
+        (succeeded == 0 AND failed == 0). Used by Stage 6's #29 check
+        for 'every partner had no qualifying signals'."""
+        return (
+            self.processed > 0
+            and self.succeeded == 0
+            and self.failed == 0
+        )
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         elapsed = int(time.monotonic() - self._t0)
