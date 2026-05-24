@@ -1375,6 +1375,92 @@ def test_stage8_pushed_at_timestamps_via_driver():
         c.close()
 
 
+def test_doctor_clean_fixture_then_catches_injected_drift():
+    """Batch 13: doctor.py reports clean on the fresh fixture pipeline,
+    then surfaces specific findings when DB invariants are perturbed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Clean run.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 0, (
+            f"doctor should exit 0 on clean fixture; got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
+        assert "ERRORS" not in res.stdout
+        assert "WARNINGS" not in res.stdout
+
+        # Inject: out-of-range axis score.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update scores set score = 99.0 where rowid = "
+            "(select rowid from scores limit 1)"
+        )
+        c.commit()
+        c.close()
+
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        payload = json.loads(res.stdout)
+        assert any("outside [0, 10]" in e for e in payload["errors"])
+
+        # Inject: future-dated signal.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update signals set quote_date = '2099-01-01' where signal_id = "
+            "(select signal_id from signals limit 1)"
+        )
+        c.commit()
+        c.close()
+
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        payload = json.loads(res.stdout)
+        assert any("future" in e for e in payload["errors"])
+
+        # Inject: unverified signal with quality (drift from Batch 11 fix).
+        c = sqlite3.connect(db)
+        c.execute(
+            "update signals set verified=0, signal_quality_score=3 "
+            "where signal_id = (select signal_id from signals limit 1)"
+        )
+        c.commit()
+        c.close()
+
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        payload = json.loads(res.stdout)
+        assert any("unverified" in e for e in payload["errors"])
+
+
 def test_stage6_returns_nonzero_when_partner_fails():
     """Batch 11 (#357): Stage 6 previously exited 0 even when per-partner
     exceptions had landed in run.failed. Now non-zero so cron / wrapping
