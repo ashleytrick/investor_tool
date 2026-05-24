@@ -1271,6 +1271,110 @@ def test_stage5_clears_quality_on_unverified():
         )
 
 
+def test_stage8_pushed_at_timestamps_via_driver():
+    """Batch 12 (#379/#380/#381): Stage 8 should stamp pushed_to_attio_at
+    on the latest recommended/alternate draft + the latest followup +
+    the latest deck row when a partner sync succeeds. We can't hit a
+    real Attio API in CI, so we monkey-patch AttioClient methods via
+    importlib (same pattern as the QA-fail test)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+
+        # Write a minimal attio.yaml so Stage 8 doesn't skip preflight.
+        (ws_dst / "config" / "attio.yaml").write_text(
+            "attio:\n"
+            "  workspace_id: dummy\n"
+            "  api_base: https://api.attio.com/v2\n"
+            "  matching_attributes:\n"
+            "    companies: domains\n"
+            "    people: email_addresses\n"
+            "  objects:\n"
+            "    funds: companies\n"
+            "    partners: people\n"
+            "  fund_attributes: {}\n"
+            "  partner_attributes: {}\n",
+            encoding="utf-8",
+        )
+
+        # Drive Stage 8 with a stubbed AttioClient that fakes upsert/create/
+        # update and returns canned record_ids. Just enough to walk through
+        # the partner-sync loop so pushed_to_attio_at gets set.
+        driver = ws_dst / "_drive_stage8.py"
+        driver.write_text(
+            "import sys, importlib.util\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "import core.attio_client as ac\n"
+            "from core.attio_client import AttioClient\n"
+            "_orig_from = AttioClient.from_workspace\n"
+            "class FakeClient:\n"
+            "    def upsert_record(self, obj, slug, payload):\n"
+            "        return {'data': {'id': {'record_id': 'fake_co_' + str(id(payload))}}}\n"
+            "    def get_record(self, obj, rid):\n"
+            "        return None\n"
+            "    def create_record(self, obj, payload):\n"
+            "        return {'data': {'id': {'record_id': 'fake_per_' + str(id(payload))}}}\n"
+            "    def update_record(self, obj, rid, payload):\n"
+            "        return {'data': {'id': {'record_id': rid}}}\n"
+            "    def attribute_slugs(self, obj):\n"
+            "        return set()\n"
+            "    def close(self):\n"
+            "        pass\n"
+            "ac.AttioClient.from_workspace = classmethod(lambda cls, ws: FakeClient())\n"
+            # Also patch find_partner_record to always return None (create path).
+            "import scripts as _s\n"
+            "spec = importlib.util.spec_from_file_location("
+            f"'s8', {str(REPO_ROOT / 'scripts' / '08_sync_to_attio.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.find_partner_record = lambda *a, **kw: None\n"
+            "# AttioClient.from_workspace is module-level used inside s8\n"
+            "m.AttioClient.from_workspace = classmethod(lambda cls, ws: FakeClient())\n"
+            f"sys.argv = ['s8', '--workspace', {ws!r}, '--top', '5', '--allow-example-domains']\n"
+            "raise SystemExit(m.main())\n"
+        )
+        env = {**os.environ, "ANTHROPIC_API_KEY": "", "ATTIO_API_KEY": "fake-key"}
+        res = subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        assert res.returncode == 0, (
+            f"Stage 8 with stubbed client should succeed, got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
+
+        c = sqlite3.connect(db)
+        # At least one recommended draft should have pushed_to_attio_at set.
+        n_pushed = c.execute(
+            "select count(*) from email_drafts "
+            "where pushed_to_attio_at is not null"
+        ).fetchone()[0]
+        assert n_pushed >= 1, (
+            f"expected >=1 email_drafts.pushed_to_attio_at populated; "
+            f"got {n_pushed}"
+        )
+        # At least one followup + one deck row should also be stamped.
+        n_followups = c.execute(
+            "select count(*) from followup_drafts "
+            "where pushed_to_attio_at is not null"
+        ).fetchone()[0]
+        n_decks = c.execute(
+            "select count(*) from deck_request_responses "
+            "where pushed_to_attio_at is not null"
+        ).fetchone()[0]
+        assert n_followups >= 1, f"followups pushed_to_attio_at not set ({n_followups})"
+        assert n_decks >= 1, f"deck responses pushed_to_attio_at not set ({n_decks})"
+        c.close()
+
+
 def test_stage6_returns_nonzero_when_partner_fails():
     """Batch 11 (#357): Stage 6 previously exited 0 even when per-partner
     exceptions had landed in run.failed. Now non-zero so cron / wrapping

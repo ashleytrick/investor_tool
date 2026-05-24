@@ -532,6 +532,22 @@ def main() -> int:
                         continue
                     if attio_id and payload:
                         client.update_record(person_object, attio_id, payload)
+                    elif attio_id and not payload:
+                        # Batch 12 (#383): an empty payload is a NO-OP, not a
+                        # silent success. Log it so the operator can see that
+                        # nothing was sent and the preserved-fields logic is
+                        # working as intended (or, conversely, that something
+                        # else upstream blanked the payload).
+                        log_sync(
+                            engine, object_type="person",
+                            local_id=p.partner_id,
+                            attio_record_id=attio_id,
+                            operation="patch_noop", success=True,
+                            error_message=(
+                                "all writable fields preserved or empty; "
+                                "no remote PATCH issued"
+                            ),
+                        )
                 else:
                     if args.dry_run:
                         print(f"[stage 8] DRY-RUN: would CREATE person "
@@ -558,14 +574,59 @@ def main() -> int:
                     continue
 
                 if attio_id:
+                    now = _now()
                     with engine.begin() as conn:
                         conn.execute(
                             partners.update().where(
                                 partners.c.partner_id == p.partner_id
                             ).values(
-                                attio_record_id=attio_id, last_updated=_now(),
+                                attio_record_id=attio_id, last_updated=now,
                             )
                         )
+                        # Batch 12 (#379/#380/#381): record pushed_to_attio_at
+                        # on the LATEST recommended/alternate draft + the
+                        # latest followup + the latest deck-response for this
+                        # partner so the operator (and `status.py`) can see
+                        # exactly which artifact was synced and when. Without
+                        # this the timestamp column stayed NULL forever.
+                        rec_draft = drafts.get("recommended")
+                        if rec_draft is not None:
+                            conn.execute(
+                                email_drafts.update()
+                                .where(email_drafts.c.draft_id == rec_draft.draft_id)
+                                .values(pushed_to_attio_at=now)
+                            )
+                        alt_draft = drafts.get("alternate")
+                        if alt_draft is not None:
+                            conn.execute(
+                                email_drafts.update()
+                                .where(email_drafts.c.draft_id == alt_draft.draft_id)
+                                .values(pushed_to_attio_at=now)
+                            )
+                        latest_followup_id = conn.execute(
+                            select(followup_drafts.c.followup_id)
+                            .where(followup_drafts.c.partner_id == p.partner_id)
+                            .order_by(followup_drafts.c.followup_id.desc())
+                            .limit(1)
+                        ).scalar()
+                        if latest_followup_id is not None:
+                            conn.execute(
+                                followup_drafts.update()
+                                .where(followup_drafts.c.followup_id == latest_followup_id)
+                                .values(pushed_to_attio_at=now)
+                            )
+                        latest_deck_id = conn.execute(
+                            select(deck_request_responses.c.response_id)
+                            .where(deck_request_responses.c.partner_id == p.partner_id)
+                            .order_by(deck_request_responses.c.response_id.desc())
+                            .limit(1)
+                        ).scalar()
+                        if latest_deck_id is not None:
+                            conn.execute(
+                                deck_request_responses.update()
+                                .where(deck_request_responses.c.response_id == latest_deck_id)
+                                .values(pushed_to_attio_at=now)
+                            )
                 log_sync(engine, object_type="person", local_id=p.partner_id,
                          attio_record_id=attio_id, operation=op, success=True)
                 run.succeeded += 1
@@ -576,9 +637,18 @@ def main() -> int:
                 run.failed += 1
                 run.log_error(p.partner_id, "AttioError", str(exc))
 
-        client.close()
-        print(f"[stage 8] synced {run.succeeded} record(s); "
-              f"failed={run.failed} skipped={run.skipped}")
+        # Batch 12 (#385): close the Attio client even on unexpected
+        # exception paths. Previously a crash between "begin partners loop"
+        # and the unconditional client.close() leaked the underlying httpx
+        # session. RunLogger's __exit__ still records the failed run.
+        try:
+            print(f"[stage 8] synced {run.succeeded} record(s); "
+                  f"failed={run.failed} skipped={run.skipped}")
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - close shouldn't mask the real error
+                pass
         # Finding 7: automation must see partial sync failure as red, not green.
         if run.failed:
             return 2

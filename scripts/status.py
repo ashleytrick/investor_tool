@@ -18,6 +18,7 @@ from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.validate_config import validate_workspace_config
 from core.db import (
+    attio_sync_log,
     axis_weight_suggestions,
     deal_attributions,
     email_drafts,
@@ -124,6 +125,19 @@ def main() -> int:
                 axis_weight_suggestions.c.approved.is_(None)
             )
         ).scalar()
+        # Batch 12 (#496): surface Attio sync health separately from
+        # generic "recent errors". The sync log carries operation+success
+        # for every CRM call, so partial failures (preserve_stripped,
+        # skip_conflict, no_record_id, patch_noop) can be quantified.
+        attio_recent_failures = conn.execute(
+            select(func.count()).select_from(attio_sync_log).where(
+                attio_sync_log.c.success.is_(False)
+            )
+        ).scalar()
+        attio_last_sync = conn.execute(
+            select(attio_sync_log.c.synced_at)
+            .order_by(desc(attio_sync_log.c.sync_id)).limit(1)
+        ).scalar()
 
         # Last run per stage (latest run_id wins; carries processed counts so
         # status surfaces "ran but ingested zero" as a yellow flag).
@@ -204,6 +218,20 @@ def main() -> int:
         print(f"  {csv_path} ({n_rows} row(s))")
     else:
         print(f"  not yet written ({csv_path})")
+
+    # Attio block only printed when sync has ever happened OR attio.yaml is
+    # configured -- workspaces that don't sync skip this entirely.
+    if attio_last_sync is not None or ws.attio:
+        print()
+        print("== Attio sync ==")
+        print(f"  last sync attempt:   {_fmt_ts(attio_last_sync)}")
+        print(f"  recorded failures:   {attio_recent_failures}")
+        if attio_recent_failures:
+            print(
+                "  inspect: select operation, error_message, synced_at "
+                "from attio_sync_log where success=0 order by sync_id "
+                "desc limit 10;"
+            )
 
     if recent_errors:
         print()
