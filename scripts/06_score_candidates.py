@@ -200,41 +200,11 @@ def composite_and_spikiness(
 
 
 # ------- send_now_priority -------
-
-def signal_recency_bonus(most_recent: date | None, today: date) -> float:
-    # days_since() returns None for missing/future dates, so neither inflates
-    # the recency bonus.
-    from core.dates import days_since
-    days = days_since(most_recent, today)
-    if days is None:
-        return 0.0
-    if days <= SIGNAL_RECENCY_90_BONUS_DAYS:
-        return 2.0
-    if days <= SIGNAL_RECENCY_180_BONUS_DAYS:
-        return 1.0
-    return 0.0
-
-
-def compute_send_now_priority(
-    *,
-    round_fit_score: float,
-    lead_likelihood_score: float,
-    composite_fit_score: float | None,
-    cold_reachability_score: float,
-    spiky_belief_score: float,
-    recency_bonus: float,
-    major_kill: bool,
-) -> float:
-    comp = composite_fit_score if composite_fit_score is not None else 0.0
-    return (
-        round_fit_score * 2.0
-        + lead_likelihood_score * 1.5
-        + comp * 1.0
-        + cold_reachability_score * 0.5
-        + recency_bonus
-        + spiky_belief_score
-        - (10.0 if major_kill else 0.0)
-    )
+# Moved to core/scoring/send_now_priority.py (Refactor item 7/13).
+from core.scoring.send_now_priority import (  # noqa: E402,F401
+    compute_send_now_priority,
+    signal_recency_bonus,
+)
 
 
 # ------- recommended_to_send (criteria 1-9) -------
