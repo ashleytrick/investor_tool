@@ -398,6 +398,18 @@ def main() -> int:
     engine = get_engine(ws.db_url)
     llm = LLMClient(workspace=ws)
     today = date.today()
+    # Batch 39 (#24/#25): scoring config knobs. recent_outreach_window_days
+    # tunes how long a fresh active-outreach outcome suppresses re-
+    # recommendation (default 30). min_deal_confidence filters out Stage
+    # 3 attributions below the threshold from counting as deal evidence
+    # (default 0.0 = keep all).
+    scoring_cfg = (ws.company or {}).get("scoring") or {}
+    recent_outreach_window_days = int(
+        scoring_cfg.get("recent_outreach_window_days", 30)
+    )
+    min_deal_confidence = float(
+        scoring_cfg.get("min_deal_confidence", 0.0)
+    )
 
     # ---- load all the data we need in one pass ----
     with engine.begin() as conn:
@@ -448,12 +460,25 @@ def main() -> int:
                 "source_url": d.source_url,
             })
         # Per-partner attributed deals (for lead_likelihood).
+        # Batch 39 (#25): apply min_deal_confidence filter so low-
+        # confidence Stage 3 fuzzy attributions don't count as evidence.
+        # Rows pre-dating the match_confidence column (NULL value) are
+        # KEPT for backward compat -- only explicitly-low rows get
+        # filtered.
         partner_deals: dict[str, list[dict]] = {}
+        filtered_low_confidence = 0
         for d in conn.execute(
             select(deal_attributions).where(
                 deal_attributions.c.attributed_partner_id.isnot(None)
             )
         ):
+            if (
+                min_deal_confidence > 0.0
+                and d.match_confidence is not None
+                and d.match_confidence < min_deal_confidence
+            ):
+                filtered_low_confidence += 1
+                continue
             partner_deals.setdefault(d.attributed_partner_id, []).append({
                 "company": d.company,
                 "round_type": d.round_type,
@@ -708,6 +733,7 @@ def main() -> int:
                     cold_reachability_score=cold_reachability,
                     warm_path_available=p.warm_path_available,
                     latest_outcome=latest_outcome_by_partner.get(p.partner_id),
+                    latest_outcome_window_days=recent_outreach_window_days,
                     today=today,
                 )
 
@@ -826,6 +852,21 @@ def main() -> int:
                 f"[stage 6] {recommended_count} partners recommended_to_send "
                 f"(criteria 1-9; Stage 7 finalizes)"
             )
+        # Batch 39 (#25): surface low-confidence deal filter count.
+        if filtered_low_confidence:
+            msg = (
+                f"filtered {filtered_low_confidence} deal_attributions "
+                f"row(s) below min_deal_confidence={min_deal_confidence}"
+            )
+            print(f"[stage 6] {msg}")
+            run.note(msg)
+        # Batch 39 (#28): force-rescore is loud + auditable.
+        if args.force_rescore:
+            msg = (
+                f"FORCE_RESCORE applied: reason={args.reason!r} "
+                f"(override-protected partners were rewritten)"
+            )
+            run.note(msg)
         print(f"[stage 6] llm stub mode: {llm.stub}")
         # Batch 11 (#357): previously returned 0 even when per-partner
         # exceptions had landed in run.failed -- cron / wrapping scripts

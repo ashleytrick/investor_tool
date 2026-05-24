@@ -22,6 +22,7 @@ from core.db import (
     axis_weight_suggestions,
     deal_attributions,
     email_drafts,
+    force_refresh_log,
     funds,
     get_engine,
     outcomes,
@@ -180,6 +181,17 @@ def main() -> int:
         latest_outcome_sync = conn.execute(
             select(func.max(outcomes.c.synced_from_attio_at))
         ).scalar()
+        # Batch 39 (#28): surface the most recent force-rescore so the
+        # operator can see when an override was last broken.
+        latest_force_rescore = conn.execute(
+            select(
+                force_refresh_log.c.refreshed_at,
+                force_refresh_log.c.reason,
+                func.count().label("n"),
+            )
+            .group_by(force_refresh_log.c.refreshed_at, force_refresh_log.c.reason)
+            .order_by(desc(force_refresh_log.c.refreshed_at)).limit(1)
+        ).first()
         # latest learning run + suggestion summary
         from core.db import learning_runs as _lr
         latest_learning = conn.execute(
@@ -220,6 +232,13 @@ def main() -> int:
             f"  last learning run:      {_fmt_ts(latest_learning.generated_at)} "
             f"(terminal outcomes={latest_learning.terminal_outcomes or 0}, "
             f"suggestions written={latest_learning.suggestions_written or 0})"
+        )
+    if latest_force_rescore:
+        print(
+            f"  last FORCE_RESCORE:     "
+            f"{_fmt_ts(latest_force_rescore.refreshed_at)} "
+            f"({latest_force_rescore.n} field(s)) reason="
+            f"{latest_force_rescore.reason!r}"
         )
 
     print()

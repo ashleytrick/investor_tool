@@ -149,6 +149,29 @@ def _check_company(company_cfg: dict, issues: list[str]) -> None:
         issues.append("company.yaml: company.target_sectors must list >=1 sector")
 
 
+def _check_scoring(company_cfg: dict, issues: list[str]) -> None:
+    """Batch 39: optional `scoring:` block in company.yaml lets the
+    operator tune Stage 6 knobs without code changes."""
+    sc = (company_cfg or {}).get("scoring") or {}
+    if not isinstance(sc, dict):
+        issues.append("company.yaml: 'scoring:' must be a mapping if present")
+        return
+    win = sc.get("recent_outreach_window_days")
+    if win is not None:
+        if not isinstance(win, int) or win <= 0 or win > 365:
+            issues.append(
+                f"company.yaml: scoring.recent_outreach_window_days must "
+                f"be a positive integer <= 365 (got {win!r})"
+            )
+    conf = sc.get("min_deal_confidence")
+    if conf is not None:
+        if not isinstance(conf, (int, float)) or not (0.0 <= conf <= 1.0):
+            issues.append(
+                f"company.yaml: scoring.min_deal_confidence must be in "
+                f"[0.0, 1.0] (got {conf!r})"
+            )
+
+
 def _check_raise_context(company_cfg: dict, issues: list[str]) -> None:
     rc = (company_cfg or {}).get("raise_context") or {}
     if not rc:
@@ -409,6 +432,7 @@ def validate_workspace_config(
     else:
         _check_company(ws.company, issues)
         _check_raise_context(ws.company, issues)
+        _check_scoring(ws.company, issues)
         _check_meeting_ask(ws.company, issues)
         _scan_placeholders(ws.company, "company.yaml", issues)
 

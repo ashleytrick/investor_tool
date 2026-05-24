@@ -45,6 +45,7 @@ from core.db import (
     get_engine,
     partner_score_summaries,
     partners,
+    runs,
 )
 from core.runs import RunLogger
 
@@ -705,18 +706,26 @@ def main() -> int:
         try:
             # Batch 38 (#54): surface preserve-stripped counts in the
             # summary so the operator can see how often the preserve-
-            # on-outreach-started logic kicked in this run.
+            # on-outreach-started logic kicked in this run. We scope to
+            # "rows landed since this run started" by joining against
+            # the current run_id; without a per-run column on
+            # attio_sync_log, fall back to counting events whose
+            # synced_at is >= the latest runs.started_at for this stage.
             with engine.begin() as conn:
-                preserved_count = conn.execute(
-                    select(func.count()).select_from(attio_sync_log)
-                    .where(
-                        attio_sync_log.c.operation == "preserve_stripped",
-                        attio_sync_log.c.synced_at >= run._t0_dt
-                        if hasattr(run, "_t0_dt") else (
-                            attio_sync_log.c.synced_at.isnot(None)
-                        ),
+                this_run_start = conn.execute(
+                    select(runs.c.started_at).where(
+                        runs.c.run_id == run.run_id,
                     )
-                ).scalar() or 0
+                ).scalar()
+                preserved_q = (
+                    select(func.count()).select_from(attio_sync_log)
+                    .where(attio_sync_log.c.operation == "preserve_stripped")
+                )
+                if this_run_start is not None:
+                    preserved_q = preserved_q.where(
+                        attio_sync_log.c.synced_at >= this_run_start,
+                    )
+                preserved_count = conn.execute(preserved_q).scalar() or 0
             print(
                 f"[stage 8] synced {run.succeeded} record(s); "
                 f"failed={run.failed} skipped={run.skipped} "
