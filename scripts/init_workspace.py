@@ -281,6 +281,24 @@ def main() -> int:
     (ws_path / "config" / "attio.yaml").write_text(ATTIO_TEMPLATE, encoding="utf-8")
     (ws_path / ".env").write_text(ENV_TEMPLATE, encoding="utf-8")
 
+    # Batch 14 (#794/#797): drop a per-workspace .gitignore so the operator
+    # doesn't accidentally commit pipeline.db, exports, raw scraped data,
+    # or .env secrets. Repo-level .gitignore is the backstop; this is the
+    # belt that fires even if someone clones with shallow git config.
+    (ws_path / ".gitignore").write_text(
+        "# Per-workspace gitignore. Pipeline state + secrets + raw scraped\n"
+        "# content + generated exports must NEVER be committed.\n"
+        ".env\n"
+        ".gmail_credentials.json\n"
+        ".gmail_token.json\n"
+        "data/pipeline.db\n"
+        "data/pipeline.db-*\n"
+        "data/raw/\n"
+        "exports/\n"
+        "*.bak.*\n",
+        encoding="utf-8",
+    )
+
     # Stage 4 live-mode input. Header-only so the operator sees the columns.
     (ws_path / "data" / "raw" / "partner_content_urls.csv").write_text(
         "partner_id,source_type,source_url\n", encoding="utf-8"

@@ -1375,6 +1375,215 @@ def test_stage8_pushed_at_timestamps_via_driver():
         c.close()
 
 
+def test_batch14_workspace_safety_and_clis():
+    """Batch 14: friendlier YAML errors, absolute-path basename
+    disambiguation, db_url URL-escaping, .gitignore generation, and the
+    three new operator CLIs all behave."""
+    from core.config_loader import Workspace, _load_yaml
+
+    # ---- friendlier YAML diagnostics (#304) ----
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bad = Path(tmpdir) / "bad.yaml"
+        bad.write_text("a: 1\n  b: : :\n", encoding="utf-8")
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            _load_yaml(bad)
+        assert "not valid YAML" in str(exc_info.value)
+        # Should include the filename so the operator knows which file to edit
+        assert "bad.yaml" in str(exc_info.value)
+
+    # ---- absolute-path basename disambiguation (#302) ----
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_a = Path(tmpdir) / "a" / "test_workspace"
+        ws_b = Path(tmpdir) / "b" / "test_workspace"
+        shutil.copytree(ws_src, ws_a)
+        shutil.copytree(ws_src, ws_b)
+        wa = Workspace(str(ws_a))
+        wb = Workspace(str(ws_b))
+        assert wa.name != wb.name, (
+            f"two absolute workspaces with same basename should disambiguate; "
+            f"got {wa.name!r} and {wb.name!r}"
+        )
+        # Both should still START with the bare name for readability.
+        assert wa.name.startswith("test_workspace-")
+        assert wb.name.startswith("test_workspace-")
+        # In-repo path keeps the bare name (backward compat).
+        w_repo = Workspace("clients/test_workspace")
+        assert w_repo.name == "test_workspace"
+
+    # ---- db_url URL-escapes the path (#303) ----
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_with_space = Path(tmpdir) / "has space" / "test_workspace"
+        shutil.copytree(ws_src, ws_with_space)
+        ws = Workspace(str(ws_with_space))
+        # Path contains a space; the URL must NOT contain a raw space.
+        assert " " not in ws.db_url, f"db_url has raw space: {ws.db_url!r}"
+        assert "%20" in ws.db_url, (
+            f"space should be URL-escaped to %20; got {ws.db_url!r}"
+        )
+
+    # ---- init_workspace writes a .gitignore (#794/#797) ----
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        # init_workspace.py only works from REPO_ROOT and writes under
+        # clients/. Use a unique name.
+        ws_name = f"batch14_init_test_{os.getpid()}"
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "init_workspace.py"),
+             ws_name],
+            capture_output=True, text=True, env=env, timeout=60, cwd=REPO_ROOT,
+        )
+        try:
+            assert res.returncode == 0, (
+                f"init_workspace should succeed; got {res.returncode}\n"
+                f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+            )
+            gitignore = REPO_ROOT / "clients" / ws_name / ".gitignore"
+            assert gitignore.exists(), "init_workspace should drop .gitignore"
+            body = gitignore.read_text(encoding="utf-8")
+            for must in (".env", "pipeline.db", "raw/", "exports/"):
+                assert must in body, (
+                    f".gitignore missing {must!r}; got:\n{body}"
+                )
+        finally:
+            shutil.rmtree(REPO_ROOT / "clients" / ws_name, ignore_errors=True)
+
+
+def test_batch14_new_clis_against_fixture():
+    """Batch 14: set_employment_status, set_fund_inactive,
+    set_partner_linkedin, list_missing_fields, list_blocked_recommendations."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # set_employment_status: flip Priya to left_fund.
+        pid = "northbeam.example_priya_anand"
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "set_employment_status.py"),
+             "--workspace", ws, "--partner-id", pid,
+             "--status", "left_fund", "--reason", "test"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        status = c.execute(
+            "select employment_status from partners where partner_id=?",
+            (pid,),
+        ).fetchone()[0]
+        c.close()
+        assert status == "left_fund"
+
+        # Unknown partner -> exit 2.
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "set_employment_status.py"),
+             "--workspace", ws, "--partner-id", "no-such-partner",
+             "--status", "left_fund", "--reason", "test"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2
+
+        # set_fund_inactive
+        fid = "northbeam.example"
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "set_fund_inactive.py"),
+             "--workspace", ws, "--fund-id", fid,
+             "--reason", "test inactive"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        active = c.execute(
+            "select is_active from funds where fund_id=?", (fid,),
+        ).fetchone()[0]
+        assert active == 0
+        # Reactivate
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "set_fund_inactive.py"),
+             "--workspace", ws, "--fund-id", fid, "--reactivate",
+             "--reason", "test reactivate"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        active = c.execute(
+            "select is_active from funds where fund_id=?", (fid,),
+        ).fetchone()[0]
+        c.close()
+        assert active == 1
+
+        # set_partner_linkedin
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "set_partner_linkedin.py"),
+             "--workspace", ws, "--partner-id", pid,
+             "--url", "https://www.linkedin.com/in/priya-anand"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        url = c.execute(
+            "select linkedin_url from partners where partner_id=?", (pid,),
+        ).fetchone()[0]
+        c.close()
+        assert url == "https://www.linkedin.com/in/priya-anand"
+
+        # Invalid URL rejected
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "set_partner_linkedin.py"),
+             "--workspace", ws, "--partner-id", pid,
+             "--url", "not-a-url"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2
+
+        # list_missing_fields --json
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "list_missing_fields.py"),
+             "--workspace", ws, "--all", "--json"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        payload = json.loads(res.stdout)
+        assert "partners" in payload and "funds" in payload
+        # Priya now has a linkedin_url from above, but still missing email.
+        priya = next(
+            (p for p in payload["partners"] if p["partner_id"] == pid), None,
+        )
+        assert priya is not None
+        assert "email" in priya["missing"]
+        assert "linkedin_url" not in priya["missing"]
+
+        # list_blocked_recommendations --json
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "list_blocked_recommendations.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        payload = json.loads(res.stdout)
+        assert "by_reason" in payload
+        # At least one of the known not-recommended fixtures (e.g. Ingrid
+        # Solberg for lead_likelihood, or Sofia for round_fit) should land
+        # in a bucket.
+        assert any(items for items in payload["by_reason"].values())
+
+
 def test_doctor_clean_fixture_then_catches_injected_drift():
     """Batch 13: doctor.py reports clean on the fresh fixture pipeline,
     then surfaces specific findings when DB invariants are perturbed."""
