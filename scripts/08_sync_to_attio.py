@@ -202,7 +202,16 @@ def main() -> int:
         "--require-ready-to-send", action="store_true",
         help="Sync only partners whose outreach_status is ready_to_send "
              "AND whose recommended draft has qa_status='pass'. Use this "
-             "before a real send batch (Findings 42, 43).",
+             "before a real send batch (Findings 42, 43). Note: in "
+             "production-mode workspaces this flag is ENABLED BY DEFAULT; "
+             "pass --include-not-ready to opt out.",
+    )
+    parser.add_argument(
+        "--include-not-ready", action="store_true",
+        help="Opt out of the prod-mode default that requires ready_to_send "
+             "+ qa_status='pass'. Use when you want to push all top-N "
+             "partners to Attio for CRM visibility even though they are "
+             "not yet draft-ready.",
     )
     parser.add_argument(
         "--allow-example-domains", action="store_true",
@@ -259,6 +268,15 @@ def main() -> int:
         # require-attio so a prod workspace can't quietly skip its CRM
         # sync without the operator noticing.
         require = args.require_attio or ws.mode == "prod"
+        # Prod-mode default: only sync ready_to_send + qa_status='pass'
+        # partners so a workspace that's wired into a real Attio CRM
+        # never silently pushes non-recommended partners as if they
+        # were on the outreach list. Operator can opt out with
+        # --include-not-ready (Finding from review).
+        require_ready_to_send = (
+            args.require_ready_to_send
+            or (ws.mode == "prod" and not args.include_not_ready)
+        )
         if not attio_cfg:
             msg = f"no attio.yaml in workspace {ws.name!r}"
             if require:
@@ -455,8 +473,10 @@ def main() -> int:
                     # Findings 42, 43: --require-ready-to-send only syncs
                     # partners whose recommended draft passed Stage 7 QA AND
                     # whose recommended_to_send is True. Prevents pushing
-                    # known-bad drafts as ready-to-send into Attio.
-                    if args.require_ready_to_send:
+                    # known-bad drafts as ready-to-send into Attio. In
+                    # prod-mode workspaces this is on by default unless
+                    # --include-not-ready opts out.
+                    if require_ready_to_send:
                         rec_draft = drafts.get("recommended")
                         if not p.recommended_to_send:
                             run.skip()
@@ -582,10 +602,15 @@ def main() -> int:
                         attio_id = match.get("id", {}).get("record_id")
                         op = "patch"
                         if args.dry_run:
+                            # Dry-run is a preview, not a live write -- count
+                            # as skip so the run summary doesn't claim
+                            # successful syncs (mirrors the company-loop
+                            # dry-run behavior).
                             print(f"[stage 8] DRY-RUN: would PATCH person "
                                   f"{p.partner_id} attio_id={attio_id} "
                                   f"with {len(payload)} attrs "
                                   f"(preserved: {sorted(removed)})")
+                            run.skip()
                             continue
                         if attio_id and payload:
                             client.update_record(person_object, attio_id, payload)
@@ -609,6 +634,7 @@ def main() -> int:
                         if args.dry_run:
                             print(f"[stage 8] DRY-RUN: would CREATE person "
                                   f"{p.partner_id} with {len(payload)} attrs")
+                            run.skip()
                             continue
                         result = client.create_record(person_object, payload)
                         attio_id = (result.get("data") or {}).get("id", {}).get("record_id")
