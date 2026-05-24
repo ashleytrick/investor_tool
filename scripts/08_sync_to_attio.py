@@ -363,19 +363,31 @@ def main() -> int:
                 .limit(args.top)
             ))
             # Pull recommended email draft + followup + deck per partner.
+            # Batch 11 (#477-480): order by draft_id / followup_id / response_id
+            # ASCENDING so the last-iterated row wins, guaranteeing we sync
+            # the LATEST recommended/alternate per partner. Previously the
+            # select had no ORDER BY -- DB-iteration order could surface a
+            # stale recommended draft from an old Stage 7 run.
             drafts_by_partner: dict[str, dict] = {}
-            for d in conn.execute(select(email_drafts)):
-                if d.is_recommended:
-                    drafts_by_partner.setdefault(d.partner_id, {})["recommended"] = d
-                else:
-                    drafts_by_partner.setdefault(d.partner_id, {})["alternate"] = d
-            followups_by_partner = {
-                f.partner_id: f.body for f in conn.execute(select(followup_drafts))
-            }
-            deck_by_partner = {
-                d.partner_id: d.body
-                for d in conn.execute(select(deck_request_responses))
-            }
+            for d in conn.execute(
+                select(email_drafts).order_by(email_drafts.c.draft_id.asc())
+            ):
+                key = "recommended" if d.is_recommended else "alternate"
+                drafts_by_partner.setdefault(d.partner_id, {})[key] = d
+            followups_by_partner: dict[str, str] = {}
+            for f in conn.execute(
+                select(followup_drafts).order_by(
+                    followup_drafts.c.followup_id.asc()
+                )
+            ):
+                followups_by_partner[f.partner_id] = f.body
+            deck_by_partner: dict[str, str] = {}
+            for d in conn.execute(
+                select(deck_request_responses).order_by(
+                    deck_request_responses.c.response_id.asc()
+                )
+            ):
+                deck_by_partner[d.partner_id] = d.body
 
         for p in partner_rows:
             run.processed += 1

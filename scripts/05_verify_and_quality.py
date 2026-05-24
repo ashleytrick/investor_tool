@@ -115,6 +115,13 @@ def main() -> int:
                             )
                         )
                 else:
+                    # Batch 11 (#351/#352): when verification flips to False,
+                    # the previously-set signal_quality_score and
+                    # quality_reasoning become misleading -- they describe a
+                    # quote that no longer verifies. Clear them so Stage 6's
+                    # quality>=2 filter and Stage 7's signal_led eligibility
+                    # don't pick up an unverified signal that still carries
+                    # a stale quality score.
                     with engine.begin() as conn:
                         conn.execute(
                             signals.update().where(signals.c.signal_id == s.signal_id)
@@ -122,6 +129,8 @@ def main() -> int:
                                 verified=False,
                                 verification_method=ver.verification_method,
                                 verification_error=ver.verification_error,
+                                signal_quality_score=None,
+                                quality_reasoning=None,
                             )
                         )
                 run.succeeded += 1

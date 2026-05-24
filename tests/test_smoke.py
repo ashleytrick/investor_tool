@@ -1200,3 +1200,137 @@ def test_batch10_schema_validators():
         SignalQuality.model_validate({
             "signal_quality_score": 3, "quality_reasoning": "",
         })
+
+
+def test_stage5_clears_quality_on_unverified():
+    """Batch 11 (#351/#352): if Stage 5 re-runs and a previously-verified
+    signal flips to unverified, its signal_quality_score and
+    quality_reasoning must be cleared so Stage 6's quality>=2 filter and
+    Stage 7's signal_led eligibility don't pick up stale quality data."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        # Pick a verified signal with a real quality score, then break its
+        # quoted_text so re-verification fails, then re-run Stage 5 --force.
+        c = sqlite3.connect(db)
+        row = c.execute(
+            "select signal_id, quoted_text, signal_quality_score, "
+            "quality_reasoning from signals where verified=1 and "
+            "signal_quality_score >= 2 limit 1"
+        ).fetchone()
+        assert row is not None, "fixture should produce at least one verified q2+ signal"
+        sid, old_quote, old_quality, old_reasoning = row
+        assert old_quality is not None and old_reasoning, (
+            "baseline: row should have non-null quality + reasoning"
+        )
+        # Mutate the quoted text to something that can't be verified anywhere.
+        c.execute(
+            "update signals set quoted_text = ? where signal_id = ?",
+            (
+                "this quote could not possibly appear in any real source page "
+                "because it was constructed solely for the regression test",
+                sid,
+            ),
+        )
+        c.commit()
+        c.close()
+
+        _run("05_verify_and_quality.py", "--workspace", ws, "--force",
+             cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        verified, qscore, qreason = c.execute(
+            "select verified, signal_quality_score, quality_reasoning "
+            "from signals where signal_id = ?",
+            (sid,),
+        ).fetchone()
+        c.close()
+        assert verified == 0, "signal should now be unverified"
+        assert qscore is None, (
+            f"signal_quality_score should be cleared on unverified "
+            f"transition; still {qscore}"
+        )
+        assert qreason is None, (
+            f"quality_reasoning should be cleared on unverified transition; "
+            f"still {qreason!r}"
+        )
+
+
+def test_stage6_returns_nonzero_when_partner_fails():
+    """Batch 11 (#357): Stage 6 previously exited 0 even when per-partner
+    exceptions had landed in run.failed. Now non-zero so cron / wrapping
+    scripts notice partial scoring failure."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        # Drive Stage 6 via importlib so we can monkey-patch score_candidate
+        # to raise for the first partner -- exercising the per-partner
+        # try/except path that increments run.failed. The corruption-based
+        # approach hits an uncaught exception OUTSIDE the per-partner try
+        # (in the bulk signal load), which isn't what we want to test.
+        driver = ws_dst / "_drive_stage6_fail.py"
+        driver.write_text(
+            "import sys, importlib.util\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "spec = importlib.util.spec_from_file_location("
+            f"'s6', {str(REPO_ROOT / 'scripts' / '06_score_candidates.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "real = m.score_candidate\n"
+            "calls = {'n': 0}\n"
+            "def boom(*a, **kw):\n"
+            "    calls['n'] += 1\n"
+            "    if calls['n'] == 1:\n"
+            "        raise RuntimeError('synthetic partner failure for #357 test')\n"
+            "    return real(*a, **kw)\n"
+            "m.score_candidate = boom\n"
+            f"sys.argv = ['s6', '--workspace', {ws!r}]\n"
+            "raise SystemExit(m.main())\n"
+        )
+        res = subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True,
+            env={**os.environ, "ANTHROPIC_API_KEY": ""}, timeout=120,
+        )
+        assert res.returncode == 2, (
+            f"Stage 6 should exit 2 when any per-partner failure occurs, "
+            f"got {res.returncode}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
+
+        # run.failed should be reflected in the runs row.
+        c = sqlite3.connect(db)
+        failed = c.execute(
+            "select records_failed from runs where stage='06_score_candidates' "
+            "order by run_id desc limit 1"
+        ).fetchone()[0]
+        c.close()
+        assert failed >= 1, f"expected run.failed >= 1, got {failed}"

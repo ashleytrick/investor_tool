@@ -172,8 +172,14 @@ def main() -> int:
     llm = LLMClient(workspace=ws)
 
     with engine.begin() as conn:
+        # Include reachability fields so the "no fresh content" branch can
+        # decide whether to clear stale partials (Batch 11 #348).
         partner_rows = list(conn.execute(
-            select(partners.c.partner_id, partners.c.name, partners.c.fund_id)
+            select(
+                partners.c.partner_id, partners.c.name, partners.c.fund_id,
+                partners.c.cold_reachability_partial_score,
+                partners.c.cold_reachability_partial_evidence,
+            )
         ))
         fund_name_by_id = {
             r.fund_id: r.name for r in conn.execute(select(funds.c.fund_id, funds.c.name))
@@ -230,6 +236,30 @@ def main() -> int:
         for p in partner_rows:
             entry = fixture.get(p.partner_id)
             if not entry:
+                # Batch 11 (#348): a partner with no fresh content this run
+                # used to keep their stale cold_reachability_partial_score
+                # forever, so Stage 6's send_now_priority kept boosting a
+                # partner whose evidence was N runs old. Clear the partial
+                # score + evidence so Stage 6 treats reachability as unknown
+                # (post-Batch 5: unknown contributes 0, not 5).
+                if (
+                    p.cold_reachability_partial_score is not None
+                    or p.cold_reachability_partial_evidence is not None
+                ):
+                    with engine.begin() as conn:
+                        conn.execute(
+                            partners.update()
+                            .where(partners.c.partner_id == p.partner_id)
+                            .values(
+                                cold_reachability_partial_score=None,
+                                cold_reachability_partial_evidence=None,
+                                last_updated=_now(),
+                            )
+                        )
+                    run.note(
+                        f"cleared stale reachability partial for "
+                        f"{p.partner_id} (no fresh content)"
+                    )
                 run.skipped += 1
                 continue
             run.processed += 1

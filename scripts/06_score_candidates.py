@@ -702,8 +702,12 @@ def main() -> int:
             f"(criteria 1-9; Stage 7 finalizes)"
         )
         print(f"[stage 6] llm stub mode: {llm.stub}")
+        # Batch 11 (#357): previously returned 0 even when per-partner
+        # exceptions had landed in run.failed -- cron / wrapping scripts
+        # never noticed partial scoring failures.
+        any_failed = run.failed > 0
 
-    return 0
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

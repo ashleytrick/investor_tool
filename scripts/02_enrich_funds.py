@@ -266,17 +266,36 @@ def main() -> int:
                 discovered_pids: set[str] = set()
 
                 with engine.begin() as conn:
-                    conn.execute(
-                        funds.update().where(funds.c.fund_id == fund["fund_id"]).values(
-                            stated_thesis=enrichment.thesis_summary,
-                            stated_stage_focus=enrichment.stated_stage_focus,
-                            check_size_range=enrichment.check_size_range,
-                            kill_signals="; ".join(enrichment.explicit_kill_signals)
-                            or None,
-                            source_urls="; ".join(
-                                str(u) for u in enrichment.source_urls_used),
-                            last_updated=_now(),
+                    # Batch 11 (#412/#413): only update fields where the new
+                    # enrichment actually has a value. Previously a sparse
+                    # re-run (LLM missed a field this time, site changed) would
+                    # blank out richer prior enrichment with None, so the
+                    # operator lost the better extraction. Preserve-on-empty
+                    # means re-runs strictly improve the fund row.
+                    update_values = {
+                        "last_updated": _now(),
+                        "source_urls": "; ".join(
+                            str(u) for u in enrichment.source_urls_used
+                        ),
+                    }
+                    if enrichment.thesis_summary:
+                        update_values["stated_thesis"] = enrichment.thesis_summary
+                    if enrichment.stated_stage_focus:
+                        update_values["stated_stage_focus"] = (
+                            enrichment.stated_stage_focus
                         )
+                    if enrichment.check_size_range:
+                        update_values["check_size_range"] = (
+                            enrichment.check_size_range
+                        )
+                    if enrichment.explicit_kill_signals:
+                        update_values["kill_signals"] = "; ".join(
+                            enrichment.explicit_kill_signals
+                        )
+                    conn.execute(
+                        funds.update()
+                        .where(funds.c.fund_id == fund["fund_id"])
+                        .values(**update_values)
                     )
                     for p in enrichment.current_partners:
                         pid = partner_id_for(fund["domain"], p.name)
