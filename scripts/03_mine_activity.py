@@ -24,17 +24,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import delete, select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
+from core.config_loader import add_workspace_arg
+from core.stage_runner import stage_run
 from core.db import (
     ambiguous_matches, deal_attribution_overrides, deal_attributions,
-    funds, get_engine, partners,
+    funds, partners,
 )
 from core.http_client import HttpClient
 from core.ids import normalize_name, partner_id_for
-from core.llm.client import MODEL_BATCH, LLMClient
-from core.runs import RunLogger
+from core.llm.client import MODEL_BATCH
 from core.similarity import token_set_similarity
 from schemas.deal_attribution import DealAttribution
 
@@ -299,40 +297,37 @@ def main() -> int:
              "distinguish them from confirmed records.",
     )
     args = parser.parse_args()
+    # Refactor sweep: stage_run() collapses workspace/preflight/banner/
+    # engine/llm/RunLogger boilerplate.
+    with stage_run(
+        args, stage=STAGE,
+        require_anthropic=not args.fixtures,
+    ) as ctx:
+        ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(
-        ws, stage=STAGE, require_anthropic=not args.fixtures,
-    )
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
+        # Lookup maps for fund + partner resolution.
+        with engine.begin() as conn:
+            fund_rows = list(conn.execute(select(funds.c.fund_id, funds.c.name, funds.c.domain)))
+            partner_rows = list(conn.execute(select(partners.c.partner_id)))
+        funds_by_name = {normalize_name(r.name): r.fund_id for r in fund_rows}
+        fund_id_to_domain = {r.fund_id: r.domain for r in fund_rows}
+        known_partner_ids = {r.partner_id for r in partner_rows}
 
-    # Lookup maps for fund + partner resolution.
-    with engine.begin() as conn:
-        fund_rows = list(conn.execute(select(funds.c.fund_id, funds.c.name, funds.c.domain)))
-        partner_rows = list(conn.execute(select(partners.c.partner_id)))
-    funds_by_name = {normalize_name(r.name): r.fund_id for r in fund_rows}
-    fund_id_to_domain = {r.fund_id: r.domain for r in fund_rows}
-    known_partner_ids = {r.partner_id for r in partner_rows}
+        # Batch 34: load operator overrides keyed on source_url. The
+        # Stage 3 per-announcement loop consults this BEFORE asking the
+        # LLM so operator decisions survive re-runs.
+        overrides_by_url: dict[str, dict] = {}
+        with engine.begin() as conn:
+            for r in conn.execute(select(deal_attribution_overrides)):
+                overrides_by_url[r.source_url] = {
+                    "action": r.action,
+                    "lead_fund_id": r.lead_fund_id,
+                    "attributed_partner_id": r.attributed_partner_id,
+                    "reason": r.reason,
+                }
 
-    # Batch 34: load operator overrides keyed on source_url. The Stage 3
-    # per-announcement loop consults this BEFORE asking the LLM so
-    # operator decisions survive re-runs.
-    overrides_by_url: dict[str, dict] = {}
-    with engine.begin() as conn:
-        for r in conn.execute(select(deal_attribution_overrides)):
-            overrides_by_url[r.source_url] = {
-                "action": r.action,
-                "lead_fund_id": r.lead_fund_id,
-                "attributed_partner_id": r.attributed_partner_id,
-                "reason": r.reason,
-            }
-
-    feeds = ws.sources.get("funding_announcement_feeds") or []
-    prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
-    with RunLogger(engine, ws.name, STAGE) as run:
-        run.attach_llm_usage(llm.usage)
+        feeds = ws.sources.get("funding_announcement_feeds") or []
+        prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
         # Source announcements (enter RunLogger BEFORE the ingest check so the
         # run row records the failure visibly in `runs` / status.py).
         if args.fixtures:
@@ -343,29 +338,28 @@ def main() -> int:
             announcements = _fetch_live_rss_announcements(feeds)
             if not announcements:
                 if feeds:
-                    msg = (
-                        f"FAIL: {len(feeds)} feed(s) configured but 0 usable "
-                        f"announcements ingested. Check feed reachability + "
-                        f"recent-item dates."
+                    ctx.refuse(
+                        f"FAIL: {len(feeds)} feed(s) configured but 0 "
+                        f"usable announcements ingested. Check feed "
+                        f"reachability + recent-item dates."
                     )
-                    print(f"[stage 3] {msg}")
-                    run.note(msg)
+                    # Preserve historical run.failed = N (not just 1)
+                    # so cron audits show the actual feed count.
                     run.failed = len(feeds)
-                    return 2
+                    print(f"[stage 3] REFUSED: see runs.error_summary")
+                    return ctx.exit_code
                 print(
                     "[stage 3] no announcements ingested; sources.yaml has no "
                     "funding_announcement_feeds and --fixtures wasn't passed"
                 )
             if llm.stub and announcements:
-                msg = (
+                ctx.refuse(
                     f"REFUSED: {len(announcements)} live announcements "
                     f"fetched but llm is in stub mode (no ANTHROPIC_API_KEY). "
                     f"Set the key, or run with --fixtures."
                 )
-                print(f"[stage 3] {msg}")
-                run.note(msg)
-                run.failed = 1
-                return 2
+                print(f"[stage 3] REFUSED: see runs.error_summary")
+                return ctx.exit_code
         partner_attributed = 0
         for ann in announcements:
             run.processed += 1
@@ -641,9 +635,7 @@ def main() -> int:
         print(f"[stage 3] llm stub mode: {llm.stub}")
         # Batch 35: non-zero exit when any per-announcement attribution
         # failed so cron / wrapping scripts notice partial Stage 3 failures.
-        any_failed = run.failed > 0
-
-    return 2 if any_failed else 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

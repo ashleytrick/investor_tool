@@ -32,13 +32,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from selectolax.parser import HTMLParser
 from sqlalchemy import and_, select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
-from core.db import funds, get_engine, partners, signals, source_snapshots
+from core.config_loader import add_workspace_arg
+from core.stage_runner import stage_run
+from core.db import funds, partners, signals, source_snapshots
 from core.http_client import HttpClient
-from core.llm.client import MODEL_BATCH, LLMClient
-from core.runs import RunLogger
+from core.llm.client import MODEL_BATCH
 from schemas.partner_signals import PartnerSignalsOutput
 
 STAGE = "04_mine_partner_signals"
@@ -272,34 +270,30 @@ def main() -> int:
              "drafted a subset.",
     )
     args = parser.parse_args()
+    # Refactor sweep: stage_run() boilerplate collapse.
+    with stage_run(
+        args, stage=STAGE,
+        require_anthropic=not args.fixtures,
+    ) as ctx:
+        ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(
-        ws, stage=STAGE, require_anthropic=not args.fixtures,
-    )
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
+        with engine.begin() as conn:
+            # Include reachability fields so the "no fresh content"
+            # branch can decide whether to clear stale partials
+            # (Batch 11 #348).
+            partner_rows = list(conn.execute(
+                select(
+                    partners.c.partner_id, partners.c.name, partners.c.fund_id,
+                    partners.c.cold_reachability_partial_score,
+                    partners.c.cold_reachability_partial_evidence,
+                )
+            ))
+            fund_name_by_id = {
+                r.fund_id: r.name for r in conn.execute(select(funds.c.fund_id, funds.c.name))
+            }
 
-    with engine.begin() as conn:
-        # Include reachability fields so the "no fresh content" branch can
-        # decide whether to clear stale partials (Batch 11 #348).
-        partner_rows = list(conn.execute(
-            select(
-                partners.c.partner_id, partners.c.name, partners.c.fund_id,
-                partners.c.cold_reachability_partial_score,
-                partners.c.cold_reachability_partial_evidence,
-            )
-        ))
-        fund_name_by_id = {
-            r.fund_id: r.name for r in conn.execute(select(funds.c.fund_id, funds.c.name))
-        }
-
-    template = PROMPT_PATH.read_text(encoding="utf-8")
-    axes_block = build_axes_block(ws.axes)
-
-    with RunLogger(engine, ws.name, STAGE) as run:
-        run.attach_llm_usage(llm.usage)
+        template = PROMPT_PATH.read_text(encoding="utf-8")
+        axes_block = build_axes_block(ws.axes)
         # Source content (inside RunLogger so failures land in `runs`).
         if args.fixtures:
             fixture = json.loads(
@@ -314,8 +308,9 @@ def main() -> int:
                 )
             except ValueError as exc:
                 # CSV schema validation refusal -- already logged.
+                ctx.refuse(f"CSV schema invalid: {exc}")
                 print(f"[stage 4] REFUSED: {exc}")
-                return 2
+                return ctx.exit_code
             csv_path = ws.path / PARTNER_CONTENT_URLS_PATH
             configured_rows = 0
             if csv_path.exists():
@@ -326,30 +321,29 @@ def main() -> int:
                     )
             if not fixture:
                 if configured_rows > 0:
-                    msg = (
+                    ctx.refuse(
                         f"FAIL: {configured_rows} url(s) configured in "
-                        f"{PARTNER_CONTENT_URLS_PATH} but 0 sources fetched. "
-                        f"Check URL reachability."
+                        f"{PARTNER_CONTENT_URLS_PATH} but 0 sources "
+                        f"fetched. Check URL reachability."
                     )
-                    print(f"[stage 4] {msg}")
-                    run.note(msg)
+                    # Preserve historical run.failed = configured_rows so
+                    # cron audits show the actual URL count.
                     run.failed = configured_rows
-                    return 2
+                    print(f"[stage 4] REFUSED: see runs.error_summary")
+                    return ctx.exit_code
                 print(
                     f"[stage 4] no live content fetched; populate "
                     f"{PARTNER_CONTENT_URLS_PATH} (cols: partner_id, "
                     f"source_type, source_url) or run with --fixtures."
                 )
             if llm.stub and fixture:
-                msg = (
+                ctx.refuse(
                     f"REFUSED: {sum(len(v.get('sources', [])) for v in fixture.values())} "
                     f"live content sources fetched but llm is in stub mode. "
                     f"Set ANTHROPIC_API_KEY, or run with --fixtures."
                 )
-                print(f"[stage 4] {msg}")
-                run.note(msg)
-                run.failed = 1
-                return 2
+                print(f"[stage 4] REFUSED: see runs.error_summary")
+                return ctx.exit_code
         # Batch 36 (#9): safety gate on stale-reachability clearing.
         # Batch 11 added the clear, but if the operator runs Stage 4
         # with a partial CSV (e.g. only the 5 most recent partners), we
@@ -525,11 +519,7 @@ def main() -> int:
             f"{total_signals} new signal rows"
         )
         print(f"[stage 4] llm stub mode: {llm.stub}")
-        # Batch 35: non-zero exit when any per-partner extraction failed
-        # so cron / wrapping scripts notice partial Stage 4 failures.
-        any_failed = run.failed > 0
-
-    return 2 if any_failed else 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

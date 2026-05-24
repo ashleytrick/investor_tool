@@ -18,12 +18,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
-from core.db import get_engine, signals
-from core.llm.client import LLMClient
-from core.runs import RunLogger
+from core.config_loader import add_workspace_arg
+from core.db import signals
+from core.stage_runner import stage_run
 from core.signal_quality import score_signal
 from core.verification import verify_signal
 
@@ -62,28 +59,27 @@ def main() -> int:
             "--allow-verification-rate-outside-band requires --reason \"...\""
         )
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(ws, stage=STAGE)
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
-    company_name = ws.company["company"]["name"]
-    company_desc = ws.company["company"]["description"]
+    # Refactor sweep: stage_run() boilerplate collapse.
+    with stage_run(args, stage=STAGE) as ctx:
+        ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
+        company_name = ws.company["company"]["name"]
+        company_desc = ws.company["company"]["description"]
 
-    with engine.begin() as conn:
-        cond = (
-            (signals.c.verified.is_(False))
-            | (signals.c.signal_quality_score.is_(None))
-        )
-        if args.force:
-            cond = None
-        stmt = select(signals)
-        if cond is not None:
-            stmt = stmt.where(cond)
-        rows = list(conn.execute(stmt))
+        with engine.begin() as conn:
+            cond = (
+                (signals.c.verified.is_(False))
+                | (signals.c.signal_quality_score.is_(None))
+            )
+            if args.force:
+                cond = None
+            stmt = select(signals)
+            if cond is not None:
+                stmt = stmt.where(cond)
+            rows = list(conn.execute(stmt))
 
-    with RunLogger(engine, ws.name, STAGE) as run:
-        run.attach_llm_usage(llm.usage)
+        verified_count = 0
+        quality2_plus = 0
+        method_counts: dict[str, int] = {}
         verified_count = 0
         quality2_plus = 0
         method_counts: dict[str, int] = {}
@@ -184,22 +180,17 @@ def main() -> int:
             print(f"[stage 5] {note}")
             run.note(note)
         else:
-            msg = (
-                f"FAIL: verification rate {pct:.0f}% outside 50-80% band on "
-                f"live data (n={run.processed}). Recalibrate Stage 4 prompts "
-                f"OR pass --allow-verification-rate-outside-band --reason ..."
+            ctx.refuse(
+                f"FAIL: verification rate {pct:.0f}% outside 50-80% band "
+                f"on live data (n={run.processed}). Recalibrate Stage 4 "
+                f"prompts OR pass --allow-verification-rate-outside-band "
+                f"--reason ..."
             )
-            print(f"[stage 5] {msg}")
-            run.note(msg)
-            run.failed = max(run.failed, 1)
+            print(f"[stage 5] REFUSED: see runs.error_summary")
             print(f"[stage 5] llm stub mode: {llm.stub}")
-            return 2
+            return ctx.exit_code
         print(f"[stage 5] llm stub mode: {llm.stub}")
-        # Batch 35: non-zero exit when any per-signal verification failed
-        # so cron / wrapping scripts notice partial Stage 5 failures.
-        any_failed = run.failed > 0
-
-    return 2 if any_failed else 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":
