@@ -502,40 +502,27 @@ def main() -> int:
                     new_values["manual_override_reason"] = (
                         existing.manual_override_reason if existing else None
                     )
-                    # If --force-rescore reached an overridden record, log every
-                    # changed field to force_refresh_log before the upsert.
+                    # Persistence owned by core/scoring/persistence.py
+                    # (Refactor 7/13).
+                    from core.scoring.persistence import (
+                        log_force_refresh_diff, persist_partner_score,
+                    )
                     if args.force_rescore and existing and (
                         existing_score_override or existing_rec_override
                     ):
-                        with engine.begin() as conn:
-                            for field, new_v in new_values.items():
-                                if field == "scored_at":
-                                    continue
-                                old_v = getattr(existing, field, None)
-                                if old_v != new_v:
-                                    conn.execute(force_refresh_log.insert().values(
-                                        partner_id=p.partner_id,
-                                        field_name=field,
-                                        old_value=str(old_v),
-                                        new_value=str(new_v),
-                                        reason=args.reason,
-                                        refreshed_at=_now(),
-                                    ))
-                    with engine.begin() as conn:
-                        upsert(conn, partner_score_summaries, ["partner_id"], new_values)
-                        # Replace per-axis scores for this partner.
-                        conn.execute(delete(scores).where(scores.c.partner_id == p.partner_id))
-                        for ax_id, ax_data in cs.axis_scores.items():
-                            if ax_data.score is None:
-                                continue
-                            conn.execute(scores.insert().values(
-                                partner_id=p.partner_id,
-                                axis_id=ax_id,
-                                score=ax_data.score,
-                                supporting_signal_ids=json.dumps(ax_data.supporting_signal_ids),
-                                confidence=ax_data.confidence,
-                                scored_at=_now(),
-                            ))
+                        log_force_refresh_diff(
+                            engine,
+                            partner_id=p.partner_id,
+                            existing=existing,
+                            new_values=new_values,
+                            reason=args.reason,
+                        )
+                    persist_partner_score(
+                        engine,
+                        partner_id=p.partner_id,
+                        summary_values=new_values,
+                        axis_scores=cs.axis_scores,
+                    )
 
                     print(
                         f"[stage 6] {p.name}: composite={composite} "
