@@ -74,20 +74,20 @@ def main() -> int:
         return 2
     founder_email = (ws.company.get("company") or {}).get("founder_email")
 
-    try:
-        gmail = GmailClient.from_workspace(ws)
-    except GmailNotConfigured:
-        print(
-            f"[gmail_drafts] Gmail not linked for workspace {ws.name!r}.\n"
-            f"  Run: uv run scripts/connect_gmail.py "
-            f"--workspace {args.workspace or ws.path}\n"
-            f"  That script walks through the one-time GCP setup."
-        )
-        # Treat as skip not failure -- consistent with attio_sync and
-        # outcome_sync no-op paths.
-        return 0
-
     with RunLogger(engine, ws.name, STAGE) as run:
+        try:
+            gmail = GmailClient.from_workspace(ws)
+        except GmailNotConfigured:
+            msg = (
+                f"Gmail not linked for workspace {ws.name!r}. "
+                f"Run: uv run scripts/connect_gmail.py "
+                f"--workspace {args.workspace or ws.path}"
+            )
+            print(f"[gmail_drafts] {msg}")
+            run.failed = 1
+            run.note("gmail_not_configured")
+            return 2
+
         with engine.begin() as conn:
             rows = list(conn.execute(
                 select(
@@ -202,7 +202,7 @@ def main() -> int:
             f"skipped={run.skipped} failed={run.failed}\n"
             f"Open https://mail.google.com/mail/u/0/#drafts to review and send."
         )
-    return 0
+        return 2 if run.failed else 0
 
 
 if __name__ == "__main__":
