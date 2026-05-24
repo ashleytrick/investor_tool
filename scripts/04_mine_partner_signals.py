@@ -429,19 +429,25 @@ def main() -> int:
                     # through so source_snapshots.final_url captures the
                     # post-redirect URL on successful snapshots, not just
                     # on the failure path.
+                    # Snapshot each source + remember url -> snapshot_id
+                    # for downstream dedup. Content assembly + signal
+                    # shaping + reachability payload live in
+                    # core/partner_evidence.py (Refactor item 7/12).
+                    from core.partner_evidence import (
+                        build_reachability_payload,
+                        format_content_block,
+                        partner_reachability_values,
+                        signal_insert_values,
+                        signal_update_values,
+                    )
                     url_to_snap: dict[str, int] = {}
-                    content_parts: list[str] = []
                     for src in entry.get("sources", []):
                         sid = upsert_snapshot(
                             engine, src["source_url"], src["text"],
                             final_url=src.get("final_url"),
                         )
                         url_to_snap[src["source_url"]] = sid
-                        content_parts.append(
-                            f'--- {src["source_url"]} ({src["source_type"]}, '
-                            f'{src.get("quote_date","?")}) ---\n{src["text"]}'
-                        )
-                    content = "\n\n".join(content_parts)
+                    content = format_content_block(entry.get("sources", []))
 
                     prompt = render_prompt(
                         template,
@@ -458,74 +464,56 @@ def main() -> int:
                         stub_response=entry.get("_extraction"),
                     )
 
-                    # Persist thesis signals (dedup on partner_id + source_url + quote).
+                    # Persist thesis signals (dedup on partner_id +
+                    # source_url + quote).
                     inserted_here = 0
+                    now = _now()
                     with engine.begin() as conn:
                         for s in output.signals:
                             url = str(s.source_url)
                             snap_id = url_to_snap.get(url)
                             exists = conn.execute(
-                                select(signals.c.signal_id, signals.c.snapshot_id).where(and_(
+                                select(
+                                    signals.c.signal_id,
+                                    signals.c.snapshot_id,
+                                ).where(and_(
                                     signals.c.partner_id == p.partner_id,
                                     signals.c.source_url == url,
                                     signals.c.quoted_text == s.quoted_text,
                                 ))
                             ).first()
                             if exists:
-                                # On dedup hit, REFRESH the metadata fields so a
-                                # corrected LLM run actually updates axis_relevance
-                                # / source_type / signal_direction / quote_date.
-                                # Previously these were frozen at first insertion
-                                # even when a later run produced better tags.
-                                # verified + signal_quality_score are preserved
-                                # (set by Stage 5; not for us to overwrite here).
-                                update_values = {
-                                    "source_type": s.source_type,
-                                    "quote_date": s.quote_date,
-                                    "axis_relevance": json.dumps(s.axis_relevance),
-                                    "signal_direction": s.signal_direction,
-                                }
-                                if exists.snapshot_id is None and snap_id is not None:
-                                    update_values["snapshot_id"] = snap_id
                                 conn.execute(
                                     signals.update()
                                     .where(signals.c.signal_id == exists.signal_id)
-                                    .values(**update_values)
+                                    .values(**signal_update_values(
+                                        existing_snapshot_id=exists.snapshot_id,
+                                        new_signal=s,
+                                        new_snapshot_id=snap_id,
+                                    ))
                                 )
                                 continue
                             conn.execute(signals.insert().values(
-                                partner_id=p.partner_id,
-                                snapshot_id=url_to_snap.get(url),
-                                source_type=s.source_type,
-                                source_url=url,
-                                quoted_text=s.quoted_text,
-                                quote_date=s.quote_date,
-                                axis_relevance=json.dumps(s.axis_relevance),
-                                signal_direction=s.signal_direction,
-                                verified=False,
-                                captured_at=_now(),
+                                **signal_insert_values(
+                                    partner_id=p.partner_id,
+                                    signal=s,
+                                    snapshot_id=snap_id,
+                                    captured_at=now,
+                                )
                             ))
                             inserted_here += 1
 
-                        # Persist reachability partial info on the partner row.
-                        reach_payload = {
-                            "reasoning": output.cold_reachability_reasoning,
-                            "signals": [
-                                {
-                                    "evidence": e.evidence,
-                                    "source_url": str(e.source_url),
-                                    "direction": e.direction,
-                                }
-                                for e in output.reachability_signals
-                            ],
-                        }
+                        # Persist reachability partial info on the
+                        # partner row.
+                        reach_payload = build_reachability_payload(output)
                         conn.execute(
-                            partners.update().where(partners.c.partner_id == p.partner_id)
-                            .values(
-                                cold_reachability_partial_score=output.cold_reachability_partial_score,
-                                cold_reachability_partial_evidence=json.dumps(reach_payload),
-                                last_updated=_now(),
-                            )
+                            partners.update()
+                            .where(partners.c.partner_id == p.partner_id)
+                            .values(**partner_reachability_values(
+                                score=output.cold_reachability_partial_score,
+                                payload=reach_payload,
+                                now=now,
+                            ))
                         )
 
                     total_signals += inserted_here
