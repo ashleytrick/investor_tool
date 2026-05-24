@@ -1068,150 +1068,148 @@ def main() -> int:
         partner_outputs: list[tuple[dict, EmailOutput, list[str]]] = []
 
         for row in rows:
-            run.processed += 1
-            partner_id = row.partner_id
-            try:
-                p_signals = signals_by_partner.get(partner_id, [])
-                p_deals = deals_by_partner.get(partner_id, [])
+            with run.attempt():
+                partner_id = row.partner_id
+                try:
+                    p_signals = signals_by_partner.get(partner_id, [])
+                    p_deals = deals_by_partner.get(partner_id, [])
 
-                # ---- strategy eligibility ----
-                # signal_led / contrarian_thesis_led need a partner quote
-                # the email can riff on positively. A negative-direction
-                # quote ("regulation kills startups") at quality=3 does NOT
-                # unlock signal_led -- it's evidence of MISFIT, not signal.
-                positive_signals = [
-                    s for s in p_signals
-                    if (s.get("direction") or "").lower() == "positive"
-                ]
-                has_q3 = any(s["quality"] >= 3 for s in positive_signals)
-                has_q2 = any(s["quality"] >= 2 for s in positive_signals)
-                # Loose single-keyword match is too generous (e.g. "infrastructure"
-                # matches both Foundry-style climate-infra and Northbeam-style
-                # fintech-infra). Require >=2 target-sector keyword hits.
-                # Batch 24 (#420): substring matching causes "art" -> "smart"
-                # and "ai" -> "stairwell" false positives. Use word-
-                # boundary matching against tokenized thesis so multi-word
-                # sectors like "design partners" still hit correctly.
-                thesis_lower = (row.stated_thesis or "").lower()
-                fund_adjacent = sum(
-                    1 for kw in target_sectors
-                    if kw and _word_boundary_hit(thesis_lower, kw)
-                ) >= 2
-                # partner_led_in_target: partner has a named-lead deal at a fund
-                # whose thesis is target-adjacent.
-                partner_led_in_target = bool(p_deals) and fund_adjacent
-                # market_shift_led eligibility: partner has POSITIVE-direction
-                # signal tagged with an axis whose name/description signals
-                # timing-driven category conviction (resolved from axes.yaml;
-                # previously hardcoded to axis_4 and ignored direction).
-                market_window_match = bool(market_shift_axes) and any(
-                    set(s.get("axes") or []) & market_shift_axes
-                    for s in positive_signals
-                )
-                # Finding 11: traction_led requires BOTH the company having
-                # current traction in config AND THIS partner having a
-                # metrics-oriented signal in their quoted_text. Previously
-                # this was hardcoded True, which would have flagged
-                # traction_led for partners with no metric vocabulary in
-                # their public signal.
-                company_traction_proof = (
-                    has_company_traction(ws.company)
-                    and has_metrics_oriented_signal(p_signals)
-                )
-
-                elig = compute_eligibility(
-                    has_q3=has_q3,
-                    has_q2=has_q2,
-                    fund_adjacent=fund_adjacent,
-                    partner_led_in_target=partner_led_in_target,
-                    market_window_match=market_window_match,
-                    company_traction_proof=company_traction_proof,
-                )
-                strategies = pick_strategies(elig)
-                if not strategies:
-                    run.skipped += 1
-                    run.log_error(
-                        partner_id, "no_eligible_strategies",
-                        f"strategy eligibility: {elig}"
+                    # ---- strategy eligibility ----
+                    # signal_led / contrarian_thesis_led need a partner quote
+                    # the email can riff on positively. A negative-direction
+                    # quote ("regulation kills startups") at quality=3 does NOT
+                    # unlock signal_led -- it's evidence of MISFIT, not signal.
+                    positive_signals = [
+                        s for s in p_signals
+                        if (s.get("direction") or "").lower() == "positive"
+                    ]
+                    has_q3 = any(s["quality"] >= 3 for s in positive_signals)
+                    has_q2 = any(s["quality"] >= 2 for s in positive_signals)
+                    # Loose single-keyword match is too generous (e.g. "infrastructure"
+                    # matches both Foundry-style climate-infra and Northbeam-style
+                    # fintech-infra). Require >=2 target-sector keyword hits.
+                    # Batch 24 (#420): substring matching causes "art" -> "smart"
+                    # and "ai" -> "stairwell" false positives. Use word-
+                    # boundary matching against tokenized thesis so multi-word
+                    # sectors like "design partners" still hit correctly.
+                    thesis_lower = (row.stated_thesis or "").lower()
+                    fund_adjacent = sum(
+                        1 for kw in target_sectors
+                        if kw and _word_boundary_hit(thesis_lower, kw)
+                    ) >= 2
+                    # partner_led_in_target: partner has a named-lead deal at a fund
+                    # whose thesis is target-adjacent.
+                    partner_led_in_target = bool(p_deals) and fund_adjacent
+                    # market_shift_led eligibility: partner has POSITIVE-direction
+                    # signal tagged with an axis whose name/description signals
+                    # timing-driven category conviction (resolved from axes.yaml;
+                    # previously hardcoded to axis_4 and ignored direction).
+                    market_window_match = bool(market_shift_axes) and any(
+                        set(s.get("axes") or []) & market_shift_axes
+                        for s in positive_signals
                     )
-                    continue
-
-                # ---- generate (live LLM or stub) ----
-                stub = build_stub_response(partner_id, strategies)
-                # Stub mode (no ANTHROPIC_API_KEY): EMAIL_BANK miss means we
-                # can't produce variants offline. WARN + skip (Brief Rule 14:
-                # no silent failures), count as skipped not succeeded.
-                # Live mode: stub being None is fine -- the LLM runs against
-                # prompts/generate_email.txt and stub_response is unused.
-                if stub is None and llm.stub:
-                    print(
-                        f"[stage 7] WARN: partner {partner_id} "
-                        f"({row.partner_name}) has no entry in stub "
-                        "EMAIL_BANK; no variants generated. A live LLM "
-                        "would handle this partner via prompts/generate_email.txt."
+                    # Finding 11: traction_led requires BOTH the company having
+                    # current traction in config AND THIS partner having a
+                    # metrics-oriented signal in their quoted_text. Previously
+                    # this was hardcoded True, which would have flagged
+                    # traction_led for partners with no metric vocabulary in
+                    # their public signal.
+                    company_traction_proof = (
+                        has_company_traction(ws.company)
+                        and has_metrics_oriented_signal(p_signals)
                     )
-                    run.skipped += 1
-                    run.log_error(
-                        partner_id, "stub_bank_miss",
-                        "stub mode: no EMAIL_BANK entry for this partner",
-                    )
-                    continue
-                # Live mode would build the full prompt; in stub mode the
-                # client validates the stub directly. Finding 5: surface
-                # composite/round_fit/lead_likelihood scores, per-axis
-                # summary, and fund kill_signals into the prompt so the
-                # live LLM strategy picker is properly grounded.
-                axes_for_p = sorted(
-                    axis_scores_by_partner.get(partner_id, []),
-                    key=lambda a: -(a[1] or 0),
-                )
-                axes_summary = ", ".join(
-                    f"{ax_id} ({score:.1f})" for ax_id, score in axes_for_p
-                    if score is not None
-                )
-                prompt = build_live_prompt(
-                    company_cfg=ws.company,
-                    partner_name=row.partner_name,
-                    fund_name=row.fund_name,
-                    partner_bio=getattr(row, "bio", None),
-                    composite_score=getattr(row, "composite_fit_score", None),
-                    round_fit_score=getattr(row, "round_fit_score", None),
-                    round_fit_reasoning=getattr(row, "round_fit_reasoning", None),
-                    lead_likelihood_score=getattr(row, "lead_likelihood_score", None),
-                    axes_summary=axes_summary,
-                    fund_kill_signals=getattr(row, "fund_kill_signals", None),
-                    signals_for_partner=p_signals,
-                    deals_for_partner=p_deals,
-                    examples_dir=ws.examples_dir,
-                )
-                output: EmailOutput = llm.complete_json(
-                    prompt=prompt,
-                    schema=EmailOutput,
-                    model=MODEL_EMAIL,
-                    stub_response=stub,
-                )
 
-                # Track drafts for batch QA.
-                draft_recs: list[str] = []
-                for v in output.variants:
-                    is_rec = (v.strategy == output.recommended_variant_strategy)
-                    draft_recs.append(v.strategy)
-                    rec = {
-                        "partner_id": partner_id,
-                        "partner_name": row.partner_name,
-                        "strategy": v.strategy,
-                        "subject": v.subject,
-                        "body": v.body,
-                        "is_recommended": is_rec,
-                    }
-                    all_drafts.append(rec)
-                    if is_rec:
-                        recommended_drafts.append(rec)
-                partner_outputs.append((dict(row._mapping), output, draft_recs))
-                run.succeeded += 1
-            except Exception as exc:  # noqa: BLE001
-                run.failed += 1
-                run.log_error(partner_id, type(exc).__name__, str(exc))
+                    elig = compute_eligibility(
+                        has_q3=has_q3,
+                        has_q2=has_q2,
+                        fund_adjacent=fund_adjacent,
+                        partner_led_in_target=partner_led_in_target,
+                        market_window_match=market_window_match,
+                        company_traction_proof=company_traction_proof,
+                    )
+                    strategies = pick_strategies(elig)
+                    if not strategies:
+                        run.skip()
+                        run.log_error(
+                            partner_id, "no_eligible_strategies",
+                            f"strategy eligibility: {elig}"
+                        )
+                        continue
+
+                    # ---- generate (live LLM or stub) ----
+                    stub = build_stub_response(partner_id, strategies)
+                    # Stub mode (no ANTHROPIC_API_KEY): EMAIL_BANK miss means we
+                    # can't produce variants offline. WARN + skip (Brief Rule 14:
+                    # no silent failures), count as skipped not succeeded.
+                    # Live mode: stub being None is fine -- the LLM runs against
+                    # prompts/generate_email.txt and stub_response is unused.
+                    if stub is None and llm.stub:
+                        print(
+                            f"[stage 7] WARN: partner {partner_id} "
+                            f"({row.partner_name}) has no entry in stub "
+                            "EMAIL_BANK; no variants generated. A live LLM "
+                            "would handle this partner via prompts/generate_email.txt."
+                        )
+                        run.skip()
+                        run.log_error(
+                            partner_id, "stub_bank_miss",
+                            "stub mode: no EMAIL_BANK entry for this partner",
+                        )
+                        continue
+                    # Live mode would build the full prompt; in stub mode the
+                    # client validates the stub directly. Finding 5: surface
+                    # composite/round_fit/lead_likelihood scores, per-axis
+                    # summary, and fund kill_signals into the prompt so the
+                    # live LLM strategy picker is properly grounded.
+                    axes_for_p = sorted(
+                        axis_scores_by_partner.get(partner_id, []),
+                        key=lambda a: -(a[1] or 0),
+                    )
+                    axes_summary = ", ".join(
+                        f"{ax_id} ({score:.1f})" for ax_id, score in axes_for_p
+                        if score is not None
+                    )
+                    prompt = build_live_prompt(
+                        company_cfg=ws.company,
+                        partner_name=row.partner_name,
+                        fund_name=row.fund_name,
+                        partner_bio=getattr(row, "bio", None),
+                        composite_score=getattr(row, "composite_fit_score", None),
+                        round_fit_score=getattr(row, "round_fit_score", None),
+                        round_fit_reasoning=getattr(row, "round_fit_reasoning", None),
+                        lead_likelihood_score=getattr(row, "lead_likelihood_score", None),
+                        axes_summary=axes_summary,
+                        fund_kill_signals=getattr(row, "fund_kill_signals", None),
+                        signals_for_partner=p_signals,
+                        deals_for_partner=p_deals,
+                        examples_dir=ws.examples_dir,
+                    )
+                    output: EmailOutput = llm.complete_json(
+                        prompt=prompt,
+                        schema=EmailOutput,
+                        model=MODEL_EMAIL,
+                        stub_response=stub,
+                    )
+
+                    # Track drafts for batch QA.
+                    draft_recs: list[str] = []
+                    for v in output.variants:
+                        is_rec = (v.strategy == output.recommended_variant_strategy)
+                        draft_recs.append(v.strategy)
+                        rec = {
+                            "partner_id": partner_id,
+                            "partner_name": row.partner_name,
+                            "strategy": v.strategy,
+                            "subject": v.subject,
+                            "body": v.body,
+                            "is_recommended": is_rec,
+                        }
+                        all_drafts.append(rec)
+                        if is_rec:
+                            recommended_drafts.append(rec)
+                    partner_outputs.append((dict(row._mapping), output, draft_recs))
+                except Exception as exc:  # noqa: BLE001
+                    run.fail(partner_id, type(exc).__name__, str(exc))
 
         # ---- batch QA ----
         qa = evaluate_batch(recommended_drafts, all_drafts)
