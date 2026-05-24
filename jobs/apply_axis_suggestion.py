@@ -45,25 +45,50 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _rotate_backups(config_dir: pathlib.Path, keep: int = BACKUP_KEEP) -> int:
-    """Keep `keep` most-recent axes.yaml.bak.* files; delete the rest."""
+def _rotate_backups(
+    config_dir: pathlib.Path,
+    keep: int = BACKUP_KEEP,
+    *,
+    run=None,
+) -> int:
+    """Keep `keep` most-recent axes.yaml.bak.* files; delete the rest.
+
+    Batch 15 (#298): the deletion was silent -- the operator couldn't tell
+    which backups had been rotated out. Now each removed file is logged
+    to stdout AND to run.note (when a RunLogger is supplied) so the audit
+    trail captures which historical state vanished.
+    """
     backups = sorted(
         config_dir.glob("axes.yaml.bak.*"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     removed = 0
+    removed_names: list[str] = []
     for old in backups[keep:]:
         try:
+            name = old.name
             old.unlink()
             removed += 1
-        except OSError:
-            pass
+            removed_names.append(name)
+        except OSError as exc:
+            print(f"[apply] WARN: rotate kept {old.name}: {exc}")
+    if removed_names:
+        msg = (
+            f"rotated {removed} backup(s) (keeping {keep} most recent): "
+            f"{removed_names}"
+        )
+        print(f"[apply] {msg}")
+        if run is not None:
+            run.note(msg)
     return removed
 
 
 def _apply_one(
-    engine, ws, row, run, *, allow_already_approved: bool = False,
+    engine, ws, row, run, *,
+    allow_already_approved: bool = False,
+    approved_by: str = "unknown",
+    approval_reason: str | None = None,
 ) -> bool:
     """Apply one suggestion row. Returns True on success."""
     axes_path = ws.config_dir / "axes.yaml"
@@ -108,15 +133,22 @@ def _apply_one(
         conn.execute(
             axis_weight_suggestions.update()
             .where(axis_weight_suggestions.c.suggestion_id == row.suggestion_id)
-            .values(approved=True, approved_at=_now())
+            .values(
+                approved=True, approved_at=_now(),
+                approved_by=approved_by,
+                approval_reason=approval_reason,
+            )
         )
     print(
         f"[apply] suggestion_id={row.suggestion_id} axis {row.axis_id}: "
-        f"weight {old_w} -> {row.suggested_weight} | backup={backup_path.name}"
+        f"weight {old_w} -> {row.suggested_weight} | backup={backup_path.name} "
+        f"| approved_by={approved_by!r}"
     )
     run.note(
         f"applied_suggestion_id={row.suggestion_id} "
-        f"axis={row.axis_id} {old_w}->{row.suggested_weight}"
+        f"axis={row.axis_id} {old_w}->{row.suggested_weight} "
+        f"approved_by={approved_by!r} "
+        f"reason={(approval_reason or '-')!r}"
     )
     return True
 
@@ -138,7 +170,25 @@ def main() -> int:
              "Finding 67: low-confidence suggestions are operator-discretion "
              "and shouldn't be applied silently.",
     )
+    # Batch 15 #296: record who approved and why.
+    parser.add_argument(
+        "--approved-by", default=None,
+        help="Operator identifier recorded with the approval (defaults to "
+             "$USER or 'unknown' if unset).",
+    )
+    parser.add_argument(
+        "--approval-reason", default=None,
+        help="Operator rationale recorded alongside the generated reason. "
+             "Optional but strongly encouraged for audit.",
+    )
     args = parser.parse_args()
+    import os as _os
+    approver = (
+        args.approved_by
+        or _os.environ.get("USER")
+        or _os.environ.get("USERNAME")
+        or "unknown"
+    )
 
     ws = load_workspace(args.workspace)
     preflight_or_exit(ws, stage=STAGE)
@@ -163,8 +213,11 @@ def main() -> int:
                     f"confidence={r.confidence} n={r.sample_size} "
                     f"| {r.reason}"
                 )
-            run.processed = len(pending)
-            run.succeeded = run.processed
+            # Batch 15 #292: --list is a read-only listing. Recording
+            # `processed = len(pending)` made every list invocation look
+            # like a real apply-run in the audit, cluttering history.
+            # Surface the count via run.note instead.
+            run.note(f"listed {len(pending)} pending suggestion(s)")
             return 0
 
         # ---- --all-above mode ----
@@ -197,13 +250,17 @@ def main() -> int:
                         f"include low-confidence suggestions in --all-above)"
                     )
                     continue
-                if _apply_one(engine, ws, row, run):
+                if _apply_one(
+                    engine, ws, row, run,
+                    approved_by=approver,
+                    approval_reason=args.approval_reason,
+                ):
                     applied += 1
                     run.succeeded += 1
                 else:
                     failed += 1
                     run.failed += 1
-            _rotate_backups(ws.config_dir)
+            _rotate_backups(ws.config_dir, run=run)
             print(
                 f"[apply] applied {applied}/{len(pending)} pending suggestions "
                 f"at confidence>={args.all_above} "
@@ -247,9 +304,13 @@ def main() -> int:
             run.failed = 1
             return 2
         run.processed = 1
-        if _apply_one(engine, ws, row, run):
+        if _apply_one(
+            engine, ws, row, run,
+            approved_by=approver,
+            approval_reason=args.approval_reason,
+        ):
             run.succeeded = 1
-            _rotate_backups(ws.config_dir)
+            _rotate_backups(ws.config_dir, run=run)
         elif row.approved:
             run.skipped = 1
         else:

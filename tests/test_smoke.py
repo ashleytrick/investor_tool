@@ -1451,6 +1451,195 @@ def test_batch14_workspace_safety_and_clis():
             shutil.rmtree(REPO_ROOT / "clients" / ws_name, ignore_errors=True)
 
 
+def test_batch15_manual_override_polish():
+    """Batch 15: warm-path requires contact, --clear-* scopes the clear,
+    multi-type reasons are namespaced + preserved across overrides."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        pid = "northbeam.example_priya_anand"
+
+        # #290: warm-path without --warm-path-contact must refuse.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "manual_override.py"),
+             "--workspace", ws, "--partner-id", pid, "--warm-path",
+             "--reason", "warm intro via board chair"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode != 0
+        assert "--warm-path-contact" in (res.stderr + res.stdout)
+
+        # Set warm-path with contact -> success.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "manual_override.py"),
+             "--workspace", ws, "--partner-id", pid, "--warm-path",
+             "--reason", "warm intro via board chair",
+             "--warm-path-contact", "ashley@example.com knows them"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+
+        # Set score override too; reasons should be namespaced AND coexist.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "manual_override.py"),
+             "--workspace", ws, "--partner-id", pid, "--score",
+             "--reason", "hand-tuned after meeting"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+
+        c = sqlite3.connect(db)
+        reason = c.execute(
+            "select manual_override_reason from partner_score_summaries "
+            "where partner_id=?", (pid,),
+        ).fetchone()[0]
+        assert reason, "reason field should not be NULL after dual override"
+        assert "score:" in reason, f"expected namespaced score; got {reason!r}"
+        assert "warm:" in reason, (
+            f"warm reason should persist after score override; got {reason!r}"
+        )
+        c.close()
+
+        # #287: --clear --clear-score should drop only the score namespace
+        # AND keep warm_path_available=TRUE.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "manual_override.py"),
+             "--workspace", ws, "--partner-id", pid, "--clear",
+             "--clear-score"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        c = sqlite3.connect(db)
+        score_flag, reason = c.execute(
+            "select manual_score_override, manual_override_reason "
+            "from partner_score_summaries where partner_id=?", (pid,),
+        ).fetchone()
+        assert score_flag == 0
+        # Warm reason should still be there; score namespace should be gone.
+        if reason:
+            assert "score:" not in reason
+            assert "warm:" in reason
+        warm = c.execute(
+            "select warm_path_available from partners where partner_id=?",
+            (pid,),
+        ).fetchone()[0]
+        c.close()
+        assert warm == 1, "warm_path_available should survive --clear-score"
+
+        # #287: global --clear (no slice flags) drops everything.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "manual_override.py"),
+             "--workspace", ws, "--partner-id", pid, "--clear"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        c = sqlite3.connect(db)
+        score_flag, rec_flag, reason = c.execute(
+            "select manual_score_override, manual_recommended_override, "
+            "manual_override_reason from partner_score_summaries "
+            "where partner_id=?", (pid,),
+        ).fetchone()
+        warm = c.execute(
+            "select warm_path_available from partners where partner_id=?",
+            (pid,),
+        ).fetchone()[0]
+        c.close()
+        assert score_flag == 0 and rec_flag == 0
+        assert reason is None
+        assert warm is None
+
+
+def test_batch15_apply_records_approver():
+    """Batch 15: apply_axis_suggestion records approved_by + approval_reason
+    on the row, and --list doesn't pollute run.processed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+            ("06_score_candidates.py", ()),
+            ("07_generate_emails.py", ("--top", "5",
+                                        "--allow-example-domains")),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Seed fixture outcomes and generate suggestions.
+        subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "jobs" / "monthly_learning_report.py"),
+             "--workspace", ws, "--seed-fixture-outcomes",
+             "--include-fixture-outcomes"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+
+        c = sqlite3.connect(db)
+        sid = c.execute(
+            "select suggestion_id from axis_weight_suggestions "
+            "where approved is null order by suggestion_id limit 1"
+        ).fetchone()
+        assert sid is not None, "expected at least one pending suggestion"
+        sid = sid[0]
+        c.close()
+
+        # --list: should NOT show processed in run.
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "jobs" / "apply_axis_suggestion.py"),
+             "--workspace", ws, "--list"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        c = sqlite3.connect(db)
+        proc = c.execute(
+            "select records_processed from runs where stage='apply_axis_suggestion' "
+            "order by run_id desc limit 1"
+        ).fetchone()[0]
+        assert proc in (0, None), (
+            f"--list should not record records_processed; got {proc}"
+        )
+        c.close()
+
+        # Apply with --approved-by + --approval-reason
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "jobs" / "apply_axis_suggestion.py"),
+             "--workspace", ws, "--suggestion-id", str(sid),
+             "--accept-low-confidence",
+             "--approved-by", "ashley", "--approval-reason",
+             "validated against last 3 batches"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        approved_by, approval_reason = c.execute(
+            "select approved_by, approval_reason from axis_weight_suggestions "
+            "where suggestion_id=?", (sid,),
+        ).fetchone()
+        c.close()
+        assert approved_by == "ashley"
+        assert approval_reason == "validated against last 3 batches"
+
+
 def test_batch14_new_clis_against_fixture():
     """Batch 14: set_employment_status, set_fund_inactive,
     set_partner_linkedin, list_missing_fields, list_blocked_recommendations."""

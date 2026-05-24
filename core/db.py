@@ -389,6 +389,11 @@ axis_weight_suggestions = Table(
     Column("sample_size", Integer),
     Column("approved", Boolean, default=None),
     Column("approved_at", DateTime),
+    # Batch 15 (#296): who approved and why. The reason is operator-
+    # supplied at apply time so the rationale lands alongside the
+    # generated `reason` column from the learning report.
+    Column("approved_by", Text),
+    Column("approval_reason", Text),
     Index("ix_axis_weight_suggestions_approved", "approved"),
 )
 

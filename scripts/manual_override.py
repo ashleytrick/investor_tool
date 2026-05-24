@@ -62,7 +62,10 @@ def main() -> int:
     g.add_argument("--list", action="store_true",
                    help="List all partners with any override flag set.")
     g.add_argument("--clear", action="store_true",
-                   help="Clear all overrides on --partner-id.")
+                   help="Clear overrides on --partner-id. By default clears "
+                        "score + recommendation + warm-path. Use "
+                        "--clear-score / --clear-rec / --clear-warm to limit "
+                        "scope (Batch 15 #287).")
     g.add_argument("--score", action="store_true",
                    help="Set manual_score_override=TRUE on --partner-id.")
     g.add_argument("--recommend", choices=("yes", "no"),
@@ -72,14 +75,26 @@ def main() -> int:
                         "leaves it alone going forward.")
     g.add_argument("--warm-path", action="store_true",
                    help="Set partners.warm_path_available=TRUE on --partner-id. "
-                        "Stage 7 will emit outreach_status=warm_path_needed.")
+                        "Stage 7 will emit outreach_status=warm_path_needed. "
+                        "Requires --warm-path-contact (Batch 15 #290).")
 
     parser.add_argument("--partner-id", default=None,
                         help="Target partner_id (required for non-list ops).")
     parser.add_argument("--reason", default=None,
                         help="Required for --score / --recommended / --warm-path.")
     parser.add_argument("--warm-path-contact", default=None,
-                        help="Optional note: who has the warm intro.")
+                        help="REQUIRED for --warm-path: who has the warm intro. "
+                             "Warm-path routing is unactionable without contact "
+                             "detail; the override is rejected if omitted.")
+    # Batch 15 #287: per-flag scoping for --clear so the operator doesn't
+    # accidentally wipe the warm-path side when they only wanted to drop
+    # the score lock.
+    parser.add_argument("--clear-score", action="store_true",
+                        help="With --clear: only clear manual_score_override.")
+    parser.add_argument("--clear-rec", action="store_true",
+                        help="With --clear: only clear manual_recommended_override.")
+    parser.add_argument("--clear-warm", action="store_true",
+                        help="With --clear: only clear warm_path_available.")
     args = parser.parse_args()
 
     if not args.list and not args.partner_id:
@@ -87,6 +102,16 @@ def main() -> int:
     requires_reason = args.score or bool(args.recommend) or args.warm_path
     if requires_reason and not args.reason:
         parser.error("--reason is required when setting an override")
+    # Batch 15 #290: warm-path is hard to act on without contact detail.
+    if args.warm_path and not (args.warm_path_contact or "").strip():
+        parser.error(
+            "--warm-path requires --warm-path-contact (e.g. "
+            "'ashley@example.com knows them via Series A board')"
+        )
+    if (args.clear_score or args.clear_rec or args.clear_warm) and not args.clear:
+        parser.error(
+            "--clear-score / --clear-rec / --clear-warm require --clear"
+        )
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
@@ -174,6 +199,14 @@ def main() -> int:
                         last_updated=_now(),
                     )
                 )
+                # Batch 15 #288/#289: persist the warm-path reason in the
+                # partner-summary override reason so the warm-path rationale
+                # isn't lost when score/rec overrides also get set. Reasons
+                # are namespaced "warm: ...", "score: ...", "rec: ..." so
+                # multiple types can coexist.
+                _append_override_reason(
+                    conn, pid, "warm", args.reason,
+                )
             print(f"[overrides] {pid}: warm_path=TRUE; reason logged: {args.reason!r}")
             run.note(f"warm_path set on {pid}: {args.reason!r}")
             run.succeeded = 1
@@ -196,43 +229,98 @@ def main() -> int:
                     run.failed = 1
                     run.log_error(pid, "not_found", "no such partner")
                     return 2
-                conn.execute(
-                    partner_score_summaries.update()
-                    .where(partner_score_summaries.c.partner_id == pid)
-                    .values(
-                        manual_score_override=False,
-                        manual_recommended_override=False,
-                        manual_override_reason=None,
-                    )
+                # Batch 15 #287: per-flag scoping. If none of the
+                # --clear-* flags are set, behave like the old global clear
+                # (drop everything). Otherwise drop only the selected slices.
+                clear_all = not (
+                    args.clear_score or args.clear_rec or args.clear_warm
                 )
-                conn.execute(
-                    partners.update().where(partners.c.partner_id == pid).values(
-                        warm_path_available=None,
-                        warm_path_contact=None,
+                summary_updates: dict = {}
+                if clear_all or args.clear_score:
+                    summary_updates["manual_score_override"] = False
+                if clear_all or args.clear_rec:
+                    summary_updates["manual_recommended_override"] = False
+                # Reset the reason only when ALL slices are cleared, or when
+                # both score+rec are explicitly cleared. Warm-path reason
+                # lives alongside in the same field; namespaced clearing
+                # keeps non-cleared slices' reasons.
+                if clear_all:
+                    summary_updates["manual_override_reason"] = None
+                elif args.clear_score and args.clear_rec:
+                    # Drop score+rec namespaces; preserve warm.
+                    _drop_override_reason_namespaces(
+                        conn, pid, drop=("score", "rec"),
                     )
+                elif args.clear_score:
+                    _drop_override_reason_namespaces(
+                        conn, pid, drop=("score",),
+                    )
+                elif args.clear_rec:
+                    _drop_override_reason_namespaces(
+                        conn, pid, drop=("rec",),
+                    )
+                if summary_updates:
+                    conn.execute(
+                        partner_score_summaries.update()
+                        .where(partner_score_summaries.c.partner_id == pid)
+                        .values(**summary_updates)
+                    )
+                if clear_all or args.clear_warm:
+                    conn.execute(
+                        partners.update().where(partners.c.partner_id == pid)
+                        .values(
+                            warm_path_available=None,
+                            warm_path_contact=None,
+                        )
+                    )
+                    if not clear_all:
+                        # Targeted warm clear: drop only that namespace from
+                        # the summary reason.
+                        _drop_override_reason_namespaces(
+                            conn, pid, drop=("warm",),
+                        )
+            label = (
+                "all overrides cleared" if clear_all
+                else "cleared: " + "+".join(
+                    n for n, on in (
+                        ("score", args.clear_score),
+                        ("rec", args.clear_rec),
+                        ("warm", args.clear_warm),
+                    ) if on
                 )
-            print(f"[overrides] {pid}: all overrides cleared")
-            run.note(f"cleared overrides on {pid}")
+            )
+            print(f"[overrides] {pid}: {label}")
+            run.note(f"{label} on {pid}")
             run.succeeded = 1
             return 0
 
         # --score or --recommend
-        update = {"manual_override_reason": args.reason}
         if args.score:
-            update["manual_score_override"] = True
+            with engine.begin() as conn:
+                _append_override_reason(conn, pid, "score", args.reason)
+                conn.execute(
+                    partner_score_summaries.update()
+                    .where(partner_score_summaries.c.partner_id == pid)
+                    .values(manual_score_override=True)
+                )
             label = "manual_score_override=TRUE"
-        else:
-            # --recommend yes|no: BOTH set the value AND lock it (Finding 2).
-            new_value = (args.recommend == "yes")
-            update["manual_recommended_override"] = True
-            update["recommended_to_send"] = new_value
-            update["recommendation_reasoning"] = (
+            print(f"[overrides] {pid}: {label}; reason={args.reason!r}")
+            run.note(f"{label} on {pid}: {args.reason!r}")
+            run.succeeded = 1
+            return 0
+        # --recommend yes|no: BOTH set the value AND lock it (Finding 2).
+        new_value = (args.recommend == "yes")
+        update = {
+            "manual_recommended_override": True,
+            "recommended_to_send": new_value,
+            "recommendation_reasoning": (
                 f"manual override ({args.recommend}): {args.reason}"
-            )
-            label = (
-                f"recommended_to_send={new_value} + "
-                f"manual_recommended_override=TRUE"
-            )
+            ),
+        }
+        label = (
+            f"recommended_to_send={new_value} + "
+            f"manual_recommended_override=TRUE"
+        )
         with engine.begin() as conn:
             existing = conn.execute(
                 select(partner_score_summaries.c.partner_id).where(
@@ -252,11 +340,80 @@ def main() -> int:
                 .where(partner_score_summaries.c.partner_id == pid)
                 .values(**update)
             )
+            _append_override_reason(conn, pid, "rec", args.reason)
         print(f"[overrides] {pid}: {label}; reason={args.reason!r}")
         run.note(f"{label} on {pid}: {args.reason!r}")
         run.succeeded = 1
 
     return 0
+
+
+def _append_override_reason(conn, pid: str, namespace: str, reason: str) -> None:
+    """Append a namespaced reason to manual_override_reason without losing
+    previously-set reasons for other namespaces. Batch 15 #288: the field
+    used to be wholesale-overwritten so a `--score` after a `--warm-path`
+    lost the warm-path rationale. We now store reasons as `"score: ...;
+    warm: ..."` so each type's justification survives the others.
+
+    Replaces the existing entry for `namespace` if one exists.
+    """
+    row = conn.execute(
+        select(partner_score_summaries.c.manual_override_reason)
+        .where(partner_score_summaries.c.partner_id == pid)
+    ).first()
+    if row is None:
+        # No summary row yet (warm-path on a partner without Stage 6); skip
+        # write -- the warm-path branch writes to partners only.
+        return
+    current = (row.manual_override_reason or "").strip()
+    entries: dict[str, str] = {}
+    if current:
+        # Parse "name: text; name: text"
+        for part in current.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                k, v = part.split(":", 1)
+                entries[k.strip()] = v.strip()
+            else:
+                entries.setdefault("_legacy", part)
+    entries[namespace] = reason
+    merged = "; ".join(f"{k}: {v}" for k, v in entries.items())
+    conn.execute(
+        partner_score_summaries.update()
+        .where(partner_score_summaries.c.partner_id == pid)
+        .values(manual_override_reason=merged)
+    )
+
+
+def _drop_override_reason_namespaces(
+    conn, pid: str, drop: tuple[str, ...]
+) -> None:
+    """Remove the named namespaces from manual_override_reason; preserve
+    the rest. Used by --clear with --clear-* scoping (Batch 15 #287)."""
+    row = conn.execute(
+        select(partner_score_summaries.c.manual_override_reason)
+        .where(partner_score_summaries.c.partner_id == pid)
+    ).first()
+    if row is None or not (row.manual_override_reason or "").strip():
+        return
+    entries: dict[str, str] = {}
+    for part in row.manual_override_reason.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            k, v = part.split(":", 1)
+            entries[k.strip()] = v.strip()
+    for ns in drop:
+        entries.pop(ns, None)
+    merged = "; ".join(f"{k}: {v}" for k, v in entries.items()) or None
+    conn.execute(
+        partner_score_summaries.update()
+        .where(partner_score_summaries.c.partner_id == pid)
+        .values(manual_override_reason=merged)
+    )
 
 
 if __name__ == "__main__":
