@@ -1693,7 +1693,10 @@ def test_batch36_stage4_csv_validation_and_unknown_partner():
         env = {**os.environ, "ANTHROPIC_API_KEY": "fake-key-for-csv-tests"}
 
         # #10: write a malformed CSV missing the partner_id column.
+        # data/raw/ isn't tracked in git (empty dir), so on a fresh CI
+        # checkout the parent doesn't exist. Create it before writing.
         bad = ws_dst / "data" / "raw" / "partner_content_urls.csv"
+        bad.parent.mkdir(parents=True, exist_ok=True)
         bad.write_text("source_type,source_url\nblog,https://x.example/p\n",
                        encoding="utf-8")
         res = subprocess.run(
