@@ -1665,6 +1665,67 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch17_stage7_refuses_stale_stage6():
+    """Inventory #363/#364/#970: Stage 7 must refuse when Stage 6 is older
+    than its upstreams (Stage 5 / Stage 3), OR when Stage 6 hasn't
+    completed at all. --skip-freshness-check --reason bypasses."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+
+        # Sanity: Stage 7 succeeds when the chain is fresh.
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+
+        # Inject staleness: mark Stage 6's completed_at older than Stage 5's.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update runs set completed_at = '2020-01-01 00:00:00' "
+            "where stage = '06_score_candidates'"
+        )
+        c.commit()
+        c.close()
+
+        # Stage 7 should now refuse with exit 2.
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "07_generate_emails.py"),
+             "--workspace", ws, "--top", "5", "--allow-example-domains"],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        assert res.returncode == 2, (
+            f"Stage 7 should refuse with stale Stage 6; got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout}\n"
+        )
+        assert "FRESHNESS REFUSED" in res.stdout
+
+        # --skip-freshness-check --reason bypasses + records the bypass.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "07_generate_emails.py"),
+             "--workspace", ws, "--top", "5", "--allow-example-domains",
+             "--skip-freshness-check", "--reason", "smoke test bypass"],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        assert res.returncode == 0, (
+            f"Stage 7 with --skip-freshness-check should succeed; got "
+            f"{res.returncode}\nSTDOUT:\n{res.stdout}"
+        )
+        c = sqlite3.connect(db)
+        note = c.execute(
+            "select error_summary from runs where stage='07_generate_emails' "
+            "order by run_id desc limit 1"
+        ).fetchone()[0]
+        c.close()
+        assert note and "FRESHNESS_SKIPPED" in note
+
+
 def test_batch16_doctor_invariant_for_orphan_summary_via_drift():
     """Inventory #907 + #503: doctor surfaces an orphan summary when the
     partners row is deleted out from under it (simulating an older DB

@@ -241,6 +241,31 @@ def main() -> int:
             print(f"  {_fmt_ts(e.occurred_at)} {e.record_id:40s} "
                   f"{e.error_type}: {msg}")
 
+    # Batch 17 (#499/#500): stale-stage warnings. Compare each downstream
+    # stage's last completion against its upstream and flag staleness.
+    stale_pairs = (
+        ("05_verify_and_quality", "04_mine_partner_signals"),
+        ("06_score_candidates", "05_verify_and_quality"),
+        ("06_score_candidates", "03_mine_activity"),
+        ("07_generate_emails", "06_score_candidates"),
+    )
+    stale: list[str] = []
+    for downstream, upstream in stale_pairs:
+        d = last_by_stage.get(downstream)
+        u = last_by_stage.get(upstream)
+        if d is None or u is None:
+            continue
+        if d.completed_at and u.completed_at and d.completed_at < u.completed_at:
+            stale.append(
+                f"{downstream} is OLDER than {upstream} "
+                f"(last completed {d.completed_at} vs {u.completed_at})"
+            )
+    if stale:
+        print()
+        print("== STAGE FRESHNESS WARNINGS ==")
+        for s in stale:
+            print(f"  - {s}")
+
     # Recommended next command.
     print()
     # Finding 10: don't suggest moving forward if a recent run failed.

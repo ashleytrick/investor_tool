@@ -731,6 +731,78 @@ READY_TO_SEND_DAILY_CEILING = 25
 TOP_BEFORE_CALIBRATION_REQUIRED = 10
 CALIBRATION_WINDOW_DAYS = 60
 
+# Batch 17 (#363/#364/#365): refuse Stage 7 when the dependency stages
+# are stale relative to each other. STALE_STAGE6_HOURS bounds Stage 6
+# freshness; STAGE_DEPENDENCIES enforces "Stage Y must run AFTER Stage X"
+# so a re-run of Stage 4 followed directly by Stage 7 (without re-running
+# Stage 5 verification + Stage 6 scoring) gets refused.
+STALE_STAGE6_HOURS = 24
+STAGE_DEPENDENCIES = (
+    # (downstream, upstream) -- downstream must have completed after upstream
+    ("05_verify_and_quality", "04_mine_partner_signals"),
+    ("06_score_candidates", "05_verify_and_quality"),
+    ("06_score_candidates", "03_mine_activity"),
+)
+
+
+def _check_stage_freshness(engine) -> list[str]:
+    """Return human-readable reasons Stage 7 should refuse to run.
+
+    Empty list means upstream stages are in a consistent, recent state.
+    Each reason names the specific stage problem so the operator can
+    re-run the right script.
+    """
+    from datetime import timedelta as _td
+    from core.db import runs as _runs
+    from sqlalchemy import desc as _desc, select as _select
+    problems: list[str] = []
+
+    def _latest_completed(stage: str):
+        with engine.begin() as conn:
+            row = conn.execute(
+                _select(_runs.c.completed_at, _runs.c.records_failed)
+                .where(_runs.c.stage == stage,
+                       _runs.c.completed_at.isnot(None))
+                .order_by(_desc(_runs.c.run_id)).limit(1)
+            ).first()
+        return row
+
+    s6 = _latest_completed("06_score_candidates")
+    if s6 is None:
+        problems.append("Stage 6 has never completed")
+    else:
+        if (s6.records_failed or 0) > 0:
+            problems.append(
+                f"Stage 6 last run had records_failed={s6.records_failed}; "
+                f"fix and re-run scripts/06_score_candidates.py first"
+            )
+        # SQLite stores naive datetimes; compare both sides naively.
+        age_hours = (
+            datetime.now(timezone.utc).replace(tzinfo=None) - s6.completed_at
+        ).total_seconds() / 3600.0
+        if age_hours > STALE_STAGE6_HOURS:
+            problems.append(
+                f"Stage 6 last completed {age_hours:.1f}h ago "
+                f"(threshold {STALE_STAGE6_HOURS}h); re-run "
+                f"scripts/06_score_candidates.py"
+            )
+
+    for downstream, upstream in STAGE_DEPENDENCIES:
+        d = _latest_completed(downstream)
+        u = _latest_completed(upstream)
+        if d is None or u is None:
+            # Already covered by "never completed" check above (or upstream
+            # not yet run, which Stage 7 would surface via empty results).
+            continue
+        if d.completed_at < u.completed_at:
+            problems.append(
+                f"{downstream} (last completed {d.completed_at}) is "
+                f"OLDER than its upstream {upstream} "
+                f"(last completed {u.completed_at}); re-run "
+                f"scripts/{downstream}.py"
+            )
+    return problems
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 7 email generation + CSV write.")
@@ -758,10 +830,19 @@ def main() -> int:
              "deciding ready_to_send. Use for fixture / smoke-test runs "
              "ONLY; production workspaces should configure real domains.",
     )
+    # Batch 17 #363/#364/#365.
+    parser.add_argument(
+        "--skip-freshness-check", action="store_true",
+        help="Skip the stage-freshness preflight (Batch 17). Use only "
+             "when you knowingly want to regenerate emails against a "
+             "stale Stage 6. Requires --reason.",
+    )
     args = parser.parse_args()
-    if (args.approve_bulk_ready or args.skip_calibration) and not args.reason:
+    if (args.approve_bulk_ready or args.skip_calibration
+        or args.skip_freshness_check) and not args.reason:
         parser.error(
-            "--approve-bulk-ready / --skip-calibration require --reason \"...\""
+            "--approve-bulk-ready / --skip-calibration / "
+            "--skip-freshness-check require --reason \"...\""
         )
 
     ws = load_workspace(args.workspace)
@@ -852,6 +933,25 @@ def main() -> int:
         # with run.failed=1 and an audit note. The previous early-returns
         # produced no run row -- the most important refusals were invisible
         # to status.py / audit.
+
+        # Batch 17 (#363/#364/#365): stage-freshness preflight.
+        if not args.skip_freshness_check:
+            fresh_problems = _check_stage_freshness(engine)
+            if fresh_problems:
+                msg = (
+                    "FRESHNESS REFUSED: "
+                    + "; ".join(fresh_problems)
+                    + " (re-run the upstream stage, OR pass "
+                      "--skip-freshness-check --reason '...')"
+                )
+                print(f"[stage 7] {msg}")
+                run.note(msg)
+                run.failed = max(run.failed, 1)
+                return 2
+        elif args.skip_freshness_check:
+            run.note(
+                f"FRESHNESS_SKIPPED reason={args.reason!r}"
+            )
 
         # Gate 5.5: scaling beyond mid-tier without a recent Green cal.
         if args.top > TOP_BEFORE_CALIBRATION_REQUIRED and not args.skip_calibration:
