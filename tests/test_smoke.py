@@ -1665,6 +1665,51 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch27_stage3_unresolved_partner_audit():
+    """Inventory #345: when Stage 3's LLM names a partner the local DB
+    doesn't know about, the partner-level attribution is correctly
+    dropped (Stage 2 will backfill), but the run must log a note
+    naming the missed attribution so the operator sees it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        # Reset Stage 1 + 2 so partners exist for fixture funds, then
+        # erase one partner so the Stage 3 announcement naming them
+        # becomes unresolvable.
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+        # Drop a partner that Stage 3's fixture references; the announcements
+        # fixture lists named partners, so removing them forces the
+        # unresolved-partner audit path.
+        c = sqlite3.connect(db)
+        c.execute("delete from partners")
+        c.commit()
+        c.close()
+
+        _run("03_mine_activity.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        note = c.execute(
+            "select error_summary from runs "
+            "where stage='03_mine_activity' order by run_id desc limit 1"
+        ).fetchone()[0]
+        c.close()
+        # The note may be empty if no announcements named known partners;
+        # but at least one of the fixture announcements should have named
+        # somebody, so the note text should mention "unresolved partner".
+        assert note and "unresolved partner" in note, (
+            f"expected unresolved partner note; got {note!r}"
+        )
+
+
 def test_batch26_do_not_contact_and_new_clis():
     """Inventory #441, #684, #687, #692-#695: do_not_contact flag, warm-
     path contact edit without flag flip, and list_partners_for_action."""

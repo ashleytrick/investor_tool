@@ -237,6 +237,12 @@ def main() -> int:
                 lead_fund_id = match_fund(deal.lead_investor, funds_by_name)
                 sector_tags_json = json.dumps(deal.sector_tags or [])
                 rows: list[dict] = []
+                # Batch 27 (#345): when the LLM named partners that we
+                # can't resolve to existing partners rows (Stage 2 hasn't
+                # discovered them yet), record an audit note so the
+                # operator sees "we lost partner attribution for X at
+                # fund Y" instead of silently dropping it.
+                dropped_partners: list[str] = []
                 for ap in deal.attributed_partners:
                     ap_fund_id = match_fund(ap.fund, funds_by_name)
                     pid = resolve_partner_id(
@@ -254,6 +260,17 @@ def main() -> int:
                             "sector_tags": sector_tags_json,
                             "captured_at": _now(),
                         })
+                    else:
+                        dropped_partners.append(
+                            f"{ap.name!r}@{ap.fund!r}"
+                        )
+                if dropped_partners:
+                    run.note(
+                        f"unresolved partner(s) for {source_url}: "
+                        + ", ".join(dropped_partners)
+                        + " (Stage 2 hasn't discovered these partners; "
+                        "re-run after enrichment to backfill attribution)"
+                    )
                 if not rows and lead_fund_id:
                     rows.append({
                         "company": deal.company,
