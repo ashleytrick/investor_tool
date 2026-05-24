@@ -339,6 +339,33 @@ def main() -> int:
     print("next: edit the above, then run:")
     print(f"  export INVESTOR_WORKSPACE=clients/{name}")
     print("  uv run scripts/01_aggregate_sources.py")
+    # Batch 40 (#71): production-readiness checklist appended to init
+    # output so the operator has a defined "what's left before this is
+    # safe for real outreach" list, not just "edit configs".
+    print()
+    print("== production readiness checklist ==")
+    print("  [ ] Replace ALL {PLACEHOLDER} strings in config/*.yaml")
+    print("  [ ] Set mode: prod in config/company.yaml (default is 'dev')")
+    print("  [ ] Edit prompts/examples/*.md with real founder-voice examples")
+    print("       (>=1 each of signal_led, portfolio_led, market_shift_led,")
+    print("        round_pattern_led, traction_led, follow_up,")
+    print("        deck_request_response)")
+    print("  [ ] Set ANTHROPIC_API_KEY in .env (live LLM mode)")
+    print("  [ ] If syncing to Attio:")
+    print("       - fill config/attio.yaml with object slugs + attributes")
+    print("       - set ATTIO_API_KEY in .env")
+    print("       - run scripts/00_verify_attio_schema.py to confirm match")
+    print("  [ ] If using Gmail drafts:")
+    print("       - run scripts/connect_gmail.py for OAuth")
+    print("       - set per-partner emails via scripts/set_partner_email.py")
+    print("  [ ] Run scripts/doctor.py to confirm DB invariants are clean")
+    print("  [ ] Verify config/company.yaml meeting_ask.preferred_scheduling_link")
+    print("       points at a real, HTTPS scheduling URL (not cal.example)")
+    print("  [ ] Declare required_systems in company.yaml (e.g. ['anthropic',")
+    print("       'attio', 'gmail']) so preflight refuses runs missing creds")
+    print("  [ ] Run a calibration cohort (scripts/calibration.py --start)")
+    print("       before scaling beyond top-10 partners per batch")
+    print("  [ ] Confirm scripts/status.py shows no stale-stage warnings")
     return 0
 
 

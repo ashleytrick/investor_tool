@@ -21,6 +21,7 @@ The validator never mutates anything; it only reports.
 """
 from __future__ import annotations
 
+import pathlib
 import re
 from typing import Any
 
@@ -147,6 +148,54 @@ def _check_company(company_cfg: dict, issues: list[str]) -> None:
     ts = co.get("target_sectors") or []
     if not isinstance(ts, list) or len(ts) < 1:
         issues.append("company.yaml: company.target_sectors must list >=1 sector")
+
+
+def _check_required_systems(ws, company_cfg: dict, issues: list[str]) -> None:
+    """Batch 40 (#74): operators declare which external systems the
+    workspace REQUIRES via company.yaml `required_systems: [list]`.
+    Recognized: 'anthropic', 'attio', 'gmail'. Preflight refuses if a
+    required system is missing config or credentials, regardless of
+    which stage is being run."""
+    req = (company_cfg or {}).get("required_systems") or []
+    if not isinstance(req, list):
+        issues.append(
+            f"company.yaml: required_systems must be a list (got {req!r})"
+        )
+        return
+    valid = {"anthropic", "attio", "gmail"}
+    for r in req:
+        if r not in valid:
+            issues.append(
+                f"company.yaml: required_systems entry {r!r} not in "
+                f"{sorted(valid)}"
+            )
+            continue
+        if r == "anthropic" and not ws.env("ANTHROPIC_API_KEY"):
+            issues.append(
+                "required_systems=anthropic but ANTHROPIC_API_KEY is not "
+                "set in workspace .env, root .env, or process env"
+            )
+        if r == "attio":
+            if not ws.attio:
+                issues.append(
+                    "required_systems=attio but no attio.yaml present"
+                )
+            if not ws.env("ATTIO_API_KEY"):
+                issues.append(
+                    "required_systems=attio but ATTIO_API_KEY is not set"
+                )
+        if r == "gmail":
+            ws_path = getattr(ws, "path", None)
+            creds = (
+                pathlib.Path(ws_path) / ".gmail_credentials.json"
+                if ws_path is not None else None
+            )
+            if creds is None or not creds.exists():
+                issues.append(
+                    "required_systems=gmail but "
+                    ".gmail_credentials.json missing in workspace dir; "
+                    "run scripts/connect_gmail.py first"
+                )
 
 
 def _check_scoring(company_cfg: dict, issues: list[str]) -> None:
@@ -433,6 +482,7 @@ def validate_workspace_config(
         _check_company(ws.company, issues)
         _check_raise_context(ws.company, issues)
         _check_scoring(ws.company, issues)
+        _check_required_systems(ws, ws.company, issues)
         _check_meeting_ask(ws.company, issues)
         _scan_placeholders(ws.company, "company.yaml", issues)
 
