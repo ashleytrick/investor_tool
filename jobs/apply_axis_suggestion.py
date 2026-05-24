@@ -228,34 +228,40 @@ def main() -> int:
             applied = 0
             failed = 0
             for row in pending:
-                run.processed += 1
-                rank = CONFIDENCE_RANK.get(row.confidence, -1)
-                if rank < min_rank:
-                    run.skipped += 1
-                    continue
-                # Finding 67: even in --all-above mode, low-confidence
-                # suggestions need explicit operator opt-in.
-                if (
-                    row.confidence == "low"
-                    and not args.accept_low_confidence
-                ):
-                    run.skipped += 1
-                    print(
-                        f"[apply] skip suggestion_id={row.suggestion_id} "
-                        f"(confidence=low; pass --accept-low-confidence to "
-                        f"include low-confidence suggestions in --all-above)"
-                    )
-                    continue
-                if _apply_one(
-                    engine, ws, row, run,
-                    approved_by=approver,
-                    approval_reason=args.approval_reason,
-                ):
-                    applied += 1
-                    run.succeeded += 1
-                else:
-                    failed += 1
-                    run.failed += 1
+                with run.attempt():
+                    rank = CONFIDENCE_RANK.get(row.confidence, -1)
+                    if rank < min_rank:
+                        run.skip()
+                        continue
+                    # Finding 67: even in --all-above mode, low-confidence
+                    # suggestions need explicit operator opt-in.
+                    if (
+                        row.confidence == "low"
+                        and not args.accept_low_confidence
+                    ):
+                        run.skip()
+                        print(
+                            f"[apply] skip suggestion_id={row.suggestion_id} "
+                            f"(confidence=low; pass --accept-low-confidence to "
+                            f"include low-confidence suggestions in --all-above)"
+                        )
+                        continue
+                    if _apply_one(
+                        engine, ws, row, run,
+                        approved_by=approver,
+                        approval_reason=args.approval_reason,
+                    ):
+                        applied += 1
+                        # Implicit succeed on clean exit.
+                    else:
+                        failed += 1
+                        # _apply_one already logged the specific reason via
+                        # run.log_error; flag the attempt as failed so the
+                        # implicit-succeed branch doesn't fire.
+                        run.fail(
+                            str(row.suggestion_id), "apply_failed",
+                            "see prior run_errors row from _apply_one",
+                        )
             _rotate_backups(ws.config_dir, run=run)
             print(
                 f"[apply] applied {applied}/{len(pending)} pending suggestions "
