@@ -117,6 +117,23 @@ def production_gate_for_ready_to_send(
     return fails
 
 
+# Batch 38 (#50): catch malformed fund domains BEFORE sending the upsert
+# payload. Attio's domain field expects a clean DNS-style host; values
+# like "https://example.com/" or "example.com:443" silently confuse the
+# matching logic. The regex is intentionally loose -- it accepts the
+# shape we expect (label.label[.label...]) and rejects URLs, paths,
+# whitespace, and ports.
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$"
+)
+
+
+def looks_like_clean_domain(domain: str | None) -> bool:
+    if not domain:
+        return False
+    return bool(_DOMAIN_RE.match(domain.strip().lower()))
+
+
 def production_gate_for_attio_sync(
     *,
     fund_domain: str | None,
@@ -129,6 +146,16 @@ def production_gate_for_attio_sync(
             f"fund_domain {fund_domain!r} is an example/reserved domain "
             f"(fixture data must not be synced to real Attio)"
         )
+    if fund_domain and not is_example_domain(fund_domain):
+        # Don't double-flag .example domains; the example-domain check
+        # already says enough. For everything else, require a clean
+        # DNS-style host.
+        if not looks_like_clean_domain(fund_domain):
+            fails.append(
+                f"fund_domain {fund_domain!r} is not a valid host (looks "
+                f"like a URL, has a port, or has invalid characters); "
+                f"Attio matching needs a clean DNS-style host"
+            )
     if partner_email and is_example_email(partner_email):
         fails.append(
             f"partner email {partner_email!r} uses an example/reserved "

@@ -118,33 +118,32 @@ def _company_primary_domain(company_cfg: dict) -> str | None:
     """Best-effort: extract the company's primary domain from the
     scheduling link (post-redirect host) or fall back to the founder
     email's domain. Returns lowercase host, no port. Used by Stage 7's
-    founder-email-alignment check (Batch 37 #35)."""
+    founder-email-alignment check (Batch 37 #35).
+
+    When the scheduling link points at a third-party scheduling service
+    (cal.com, calendly.com, etc.) OR an RFC 2606 reserved TLD (.example),
+    the link doesn't carry the company's primary domain -- fall through
+    to the founder email's domain instead.
+    """
     co = (company_cfg or {}).get("company") or {}
     link = (co.get("meeting_ask") or {}).get("preferred_scheduling_link") or ""
+    scheduling_hosts = (
+        "cal.com", "calendly.com", "savvycal.com", "hubspot.com",
+        "google.com", "x.ai", "tldv.io",
+    )
+    reserved_tlds = (".example", ".test", ".invalid", ".localhost")
     if "://" in link:
         rest = link.split("://", 1)[1]
         for sep in ("/", "?", "#", ":"):
             if sep in rest:
                 rest = rest.split(sep, 1)[0]
         rest = rest.strip().lower()
-        # Strip well-known scheduling-service hosts so we don't compare
-        # against cal.com / calendly.com / savvycal.com etc.
-        scheduling_hosts = (
-            "cal.com", "calendly.com", "savvycal.com", "hubspot.com",
-            "google.com", "x.ai", "tldv.io",
+        is_scheduling_service = rest in scheduling_hosts or any(
+            rest.endswith(suffix) for suffix in reserved_tlds
         )
-        # Batch 37: also treat any host on an RFC 2606 reserved TLD as
-        # a scheduling-service-like host (the fixture uses cal.example).
-        if rest and (
-            rest in scheduling_hosts
-            or any(
-                rest.endswith(suffix)
-                for suffix in (".example", ".test", ".invalid", ".localhost")
-            )
-        ):
-            return None
-        if rest:
+        if rest and not is_scheduling_service:
             return rest
+        # Scheduling-service host: fall through to founder email below.
     fe = (co.get("founder_email") or "").strip().lower()
     if "@" in fe:
         return fe.split("@", 1)[1] or None

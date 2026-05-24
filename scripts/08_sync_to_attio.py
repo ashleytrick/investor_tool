@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
 from core.config_loader import add_workspace_arg, load_workspace
@@ -221,6 +221,15 @@ def main() -> int:
              "company.yaml has `mode: fixture` -- prevents accidental syncs "
              "of fictional data to real Attio.",
     )
+    # Batch 38 (#46): production workspaces should fail HARD when Attio
+    # isn't configured, not skip. Distinct from --allow-skip on Stage 0:
+    # Stage 0 is a verification, Stage 8 is the actual write.
+    parser.add_argument(
+        "--require-attio", action="store_true",
+        help="Refuse to skip when attio.yaml or ATTIO_API_KEY is missing. "
+             "Use in production cron entries that depend on a real Attio "
+             "sync (Batch 38 #46).",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -244,13 +253,29 @@ def main() -> int:
     attio_cfg = cfg.get("attio") or cfg
 
     with RunLogger(engine, ws.name, STAGE) as run:
+        # Batch 38 (#46): --require-attio turns the skip-on-missing-config
+        # path into a hard failure. ws.mode == "prod" also implies
+        # require-attio so a prod workspace can't quietly skip its CRM
+        # sync without the operator noticing.
+        require = args.require_attio or ws.mode == "prod"
         if not attio_cfg:
-            print(f"[stage 8] no attio.yaml in workspace {ws.name!r}; skipping")
+            msg = f"no attio.yaml in workspace {ws.name!r}"
+            if require:
+                print(f"[stage 8] REFUSED: {msg} (require-attio)")
+                run.note(f"REFUSED: {msg}")
+                run.failed = 1
+                return 2
+            print(f"[stage 8] {msg}; skipping")
             run.skipped = 1
             return 0
         try:
             client = AttioClient.from_workspace(ws)
         except AttioNotConfigured as exc:
+            if require:
+                print(f"[stage 8] REFUSED: {exc} (require-attio)")
+                run.note(f"REFUSED: {exc}")
+                run.failed = 1
+                return 2
             print(f"[stage 8] {exc}; skipping")
             run.skipped = 1
             return 0
@@ -322,10 +347,27 @@ def main() -> int:
             custom_payload = build_payload(fund_attr_map, source)
             payload = {**base_payload, **custom_payload}
             try:
+                # Batch 38 (#52): record the payload to attio_sync_log
+                # BEFORE the API call so the operator can replay / debug.
+                # In dry-run mode this is the only record of what would
+                # have been sent.
+                log_sync(
+                    engine, object_type="company", local_id=f.fund_id,
+                    attio_record_id=None,
+                    operation="dry_run_preview" if args.dry_run else "upsert_attempt",
+                    success=True,
+                    error_message=f"payload_keys={sorted(payload.keys())}",
+                )
                 if args.dry_run:
+                    # Batch 38 (#47): dry-run no longer increments
+                    # success eagerly. We log the preview above, but
+                    # actual success only after a real call returns a
+                    # record_id (in live mode). Keep dry-run counted as
+                    # skipped so the audit doesn't claim live successes.
                     print(f"[stage 8] DRY-RUN: would upsert company "
-                          f"{f.fund_id} with {len(payload)} attrs")
-                    run.succeeded += 1
+                          f"{f.fund_id} with {len(payload)} attrs "
+                          f"(keys={sorted(payload.keys())})")
+                    run.skipped += 1
                     continue
                 result = client.upsert_record(
                     fund_object, matching[fund_object], payload
@@ -661,8 +703,30 @@ def main() -> int:
         # and the unconditional client.close() leaked the underlying httpx
         # session. RunLogger's __exit__ still records the failed run.
         try:
-            print(f"[stage 8] synced {run.succeeded} record(s); "
-                  f"failed={run.failed} skipped={run.skipped}")
+            # Batch 38 (#54): surface preserve-stripped counts in the
+            # summary so the operator can see how often the preserve-
+            # on-outreach-started logic kicked in this run.
+            with engine.begin() as conn:
+                preserved_count = conn.execute(
+                    select(func.count()).select_from(attio_sync_log)
+                    .where(
+                        attio_sync_log.c.operation == "preserve_stripped",
+                        attio_sync_log.c.synced_at >= run._t0_dt
+                        if hasattr(run, "_t0_dt") else (
+                            attio_sync_log.c.synced_at.isnot(None)
+                        ),
+                    )
+                ).scalar() or 0
+            print(
+                f"[stage 8] synced {run.succeeded} record(s); "
+                f"failed={run.failed} skipped={run.skipped} "
+                f"preserve_stripped_events={preserved_count}"
+            )
+            if preserved_count:
+                run.note(
+                    f"preserve_stripped fired {preserved_count} time(s) "
+                    f"this run"
+                )
         finally:
             try:
                 client.close()
