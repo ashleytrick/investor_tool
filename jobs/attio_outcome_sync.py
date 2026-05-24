@@ -162,22 +162,53 @@ def main() -> int:
                     run.skipped += 1
                     continue
                 values = rec.get("values", {})
+                # Batch 41 (#56): wire external_event_id. Attio's record
+                # id alone isn't unique per OUTCOME event (the same
+                # person record is modified many times). Build a stable
+                # hash over (record_id + the meaningful state fields)
+                # so retries / cron overlaps don't double-insert the
+                # same observed state.
+                import hashlib as _hash
+                outreach_status = _option_title(values, "outreach_status")
+                reply_type = _option_title(values, "reply_type")
+                meeting_booked = _bool(values, "meeting_booked")
+                meeting_date = _date(values, "meeting_date")
+                meeting_outcome = _option_title(values, "meeting_outcome")
+                event_payload = "|".join((
+                    str(rec_id),
+                    str(outreach_status),
+                    str(reply_type),
+                    str(meeting_booked),
+                    str(meeting_date),
+                    str(meeting_outcome),
+                ))
+                ext_event_id = (
+                    "attio:" + _hash.sha1(event_payload.encode()).hexdigest()[:16]
+                )
                 row = {
                     "partner_id": pid,
-                    "outreach_status": _option_title(values, "outreach_status"),
-                    "reply_type": _option_title(values, "reply_type"),
-                    "meeting_booked": _bool(values, "meeting_booked"),
-                    "meeting_date": _date(values, "meeting_date"),
-                    "meeting_outcome": _option_title(values, "meeting_outcome"),
+                    "outreach_status": outreach_status,
+                    "reply_type": reply_type,
+                    "meeting_booked": meeting_booked,
+                    "meeting_date": meeting_date,
+                    "meeting_outcome": meeting_outcome,
                     "synced_from_attio_at": _now(),
                     "source": "attio",
+                    "external_event_id": ext_event_id,
                 }
-                # Finding 34: dedupe vs the latest outcome row for this
-                # partner. If nothing meaningful has changed since the last
-                # sync, skip the insert -- the previous append-only
-                # behavior was producing duplicate snapshots on every cron
-                # tick and polluting the learning report.
+                # Batch 41 (#57): dedupe against ALL outcomes for this
+                # partner (not just the latest), using external_event_id
+                # if the row carries one OR the legacy field-match
+                # heuristic for older rows that pre-date Batch 41.
                 with engine.begin() as conn:
+                    by_event = conn.execute(
+                        select(outcomes.c.outcome_id).where(
+                            outcomes.c.external_event_id == ext_event_id,
+                        )
+                    ).first()
+                    if by_event:
+                        run.skipped += 1
+                        continue
                     latest = conn.execute(
                         select(outcomes).where(outcomes.c.partner_id == pid)
                         .order_by(outcomes.c.outcome_id.desc()).limit(1)

@@ -334,6 +334,29 @@ def _check_recommended_has_draft(engine) -> list[tuple[Severity, str]]:
     )]
 
 
+def _check_orphan_outcomes(engine) -> list[tuple[Severity, str]]:
+    """Batch 41 (#67): outcomes intentionally don't cascade-delete with
+    partners (we keep history), but reports / CLIs that join through
+    outcomes need to know about orphans so the join-failure mode is
+    visible. Surfaced as warn, not error -- this is by-design state."""
+    with engine.begin() as conn:
+        n = conn.execute(
+            select(func.count()).select_from(outcomes)
+            .where(~outcomes.c.partner_id.in_(select(partners.c.partner_id)))
+        ).scalar()
+    if not n:
+        return []
+    return [(
+        "warn",
+        f"{n} outcomes row(s) reference a partner_id not in partners "
+        f"(intentional non-cascade -- history preserved across partner "
+        f"removal). Reports must left-join or .get() defensively. "
+        f"SQL: SELECT outcome_id, partner_id, outreach_status FROM "
+        f"outcomes WHERE partner_id NOT IN "
+        f"(SELECT partner_id FROM partners);",
+    )]
+
+
 def _check_orphan_snapshots(engine) -> list[tuple[Severity, str]]:
     """515: snapshots that no signal references and aren't recent."""
     with engine.begin() as conn:
@@ -406,6 +429,7 @@ CHECKS = [
     _check_warm_path_not_ready,
     _check_recommended_has_draft,
     _check_orphan_snapshots,
+    _check_orphan_outcomes,
     _check_placeholders_in_recommended_drafts,
 ]
 
