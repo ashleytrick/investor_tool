@@ -73,68 +73,71 @@ def main() -> int:
         public_lists = ws.sources.get("public_lists") or []
         seen: dict[str, dict] = {}  # domain -> fund row (first source wins)
         for src in public_lists:
-            run.processed += 1
-            name = src.get("name", "?")
-            parser_kind = src.get("parser")
-            try:
-                if "path" in src:
-                    src_path = (ws.path / src["path"]).resolve()
-                    # Refuse paths that escape the workspace -- sources.yaml
-                    # is operator-edited config, so a stray "../../etc/passwd"
-                    # is a tenant-isolation hole.
-                    ws_root = ws.path.resolve()
-                    if not str(src_path).startswith(str(ws_root) + "/") \
-                            and src_path != ws_root:
-                        raise ValueError(
-                            f"source path {src['path']!r} escapes workspace "
-                            f"({ws_root}); refusing to read."
-                        )
-                    if not src_path.exists():
-                        raise FileNotFoundError(src_path)
-                    if parser_kind == "csv":
-                        parsed = _parse_csv(src_path)
-                    elif parser_kind == "markdown":
-                        parsed = _parse_markdown(src_path.read_text(encoding="utf-8"))
+            with run.attempt():
+                name = src.get("name", "?")
+                parser_kind = src.get("parser")
+                try:
+                    if "path" in src:
+                        src_path = (ws.path / src["path"]).resolve()
+                        # Refuse paths that escape the workspace -- sources.yaml
+                        # is operator-edited config, so a stray "../../etc/passwd"
+                        # is a tenant-isolation hole.
+                        ws_root = ws.path.resolve()
+                        if not str(src_path).startswith(str(ws_root) + "/") \
+                                and src_path != ws_root:
+                            raise ValueError(
+                                f"source path {src['path']!r} escapes workspace "
+                                f"({ws_root}); refusing to read."
+                            )
+                        if not src_path.exists():
+                            raise FileNotFoundError(src_path)
+                        if parser_kind == "csv":
+                            parsed = _parse_csv(src_path)
+                        elif parser_kind == "markdown":
+                            parsed = _parse_markdown(src_path.read_text(encoding="utf-8"))
+                        else:
+                            raise ValueError(f"unsupported parser: {parser_kind}")
+                    elif "url" in src:
+                        # Live URL source. Fetch via http_client; parse based on
+                        # parser_kind (markdown today; CSV at-URL trivially added).
+                        client = HttpClient()
+                        res = asyncio.run(client.fetch(src["url"]))
+                        if res.status != 200 or not res.text:
+                            raise RuntimeError(
+                                f"URL fetch returned HTTP {res.status} / empty body"
+                            )
+                        if parser_kind == "markdown":
+                            parsed = _parse_markdown(res.text)
+                        elif parser_kind == "csv":
+                            # CSV body served at a URL: parse from string.
+                            parsed = list(_parse_csv_text(res.text))
+                        else:
+                            raise ValueError(
+                                f"unsupported URL parser: {parser_kind!r}"
+                            )
                     else:
-                        raise ValueError(f"unsupported parser: {parser_kind}")
-                elif "url" in src:
-                    # Live URL source. Fetch via http_client; parse based on
-                    # parser_kind (markdown today; CSV at-URL trivially added).
-                    client = HttpClient()
-                    res = asyncio.run(client.fetch(src["url"]))
-                    if res.status != 200 or not res.text:
-                        raise RuntimeError(
-                            f"URL fetch returned HTTP {res.status} / empty body"
-                        )
-                    if parser_kind == "markdown":
-                        parsed = _parse_markdown(res.text)
-                    elif parser_kind == "csv":
-                        # CSV body served at a URL: parse from string.
-                        parsed = list(_parse_csv_text(res.text))
-                    else:
                         raise ValueError(
-                            f"unsupported URL parser: {parser_kind!r}"
+                            f"source {name!r} has neither `path` nor `url`"
                         )
-                else:
-                    raise ValueError(
-                        f"source {name!r} has neither `path` nor `url`"
-                    )
-            except Exception as exc:  # noqa: BLE001 - logged, run continues
-                run.skipped += 1
-                run.log_error(name, type(exc).__name__, str(exc))
-                # Batch 36 (#7): sources.yaml entries can declare
-                # `required: true`. A required source that fails to load
-                # is fatal; optional sources just count as skipped.
-                if src.get("required"):
-                    run.failed += 1
-                    print(
-                        f"[stage 1] REQUIRED source {name!r} failed: {exc}"
-                    )
-                continue
+                except Exception as exc:  # noqa: BLE001 - logged, run continues
+                    # Batch 36 (#7): sources.yaml entries can declare
+                    # `required: true`. A required source that fails to load
+                    # is fatal (fail); optional sources just count as skipped.
+                    # Previous code bumped BOTH skipped AND failed on a
+                    # required failure -- mutually exclusive now.
+                    if src.get("required"):
+                        print(
+                            f"[stage 1] REQUIRED source {name!r} failed: {exc}"
+                        )
+                        run.fail(name, type(exc).__name__, str(exc))
+                    else:
+                        run.log_error(name, type(exc).__name__, str(exc))
+                        run.skip()
+                    continue
 
-            for row in parsed:
-                seen.setdefault(row["domain"], row)
-            run.succeeded += 1
+                for row in parsed:
+                    seen.setdefault(row["domain"], row)
+                # Implicit succeed on clean exit from the with-block.
 
         # Upsert deduped funds.
         with engine.begin() as conn:
