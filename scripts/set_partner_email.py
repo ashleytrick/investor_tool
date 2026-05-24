@@ -67,32 +67,29 @@ def main() -> int:
 
         with engine.begin() as conn:
             for pid, email in rows:
-                run.processed += 1
-                if pid not in known:
-                    run.failed += 1
-                    run.log_error(pid, "unknown_partner", "not in partners table")
-                    continue
-                # Batch 35: validate email shape before writing. A typo
-                # ("priya at northbeam") used to write garbage that only
-                # failed at Gmail draft time with a cryptic API error.
-                if not _looks_like_email(email):
-                    run.failed += 1
-                    run.log_error(
-                        pid, "invalid_email",
-                        f"{email!r} does not look like an email address",
+                with run.attempt():
+                    if pid not in known:
+                        run.fail(pid, "unknown_partner", "not in partners table")
+                        continue
+                    # Batch 35: validate email shape before writing. A typo
+                    # ("priya at northbeam") used to write garbage that only
+                    # failed at Gmail draft time with a cryptic API error.
+                    if not _looks_like_email(email):
+                        run.fail(
+                            pid, "invalid_email",
+                            f"{email!r} does not look like an email address",
+                        )
+                        print(
+                            f"[set_partner_email] {pid}: REFUSED -- "
+                            f"{email!r} is not a valid email shape"
+                        )
+                        continue
+                    conn.execute(
+                        partners.update().where(partners.c.partner_id == pid).values(
+                            email=email, last_updated=_now(),
+                        )
                     )
-                    print(
-                        f"[set_partner_email] {pid}: REFUSED -- "
-                        f"{email!r} is not a valid email shape"
-                    )
-                    continue
-                conn.execute(
-                    partners.update().where(partners.c.partner_id == pid).values(
-                        email=email, last_updated=_now(),
-                    )
-                )
-                run.succeeded += 1
-                print(f"[set_partner_email] {pid} -> {email}")
+                    print(f"[set_partner_email] {pid} -> {email}")
 
         print(
             f"[set_partner_email] processed={run.processed} "
