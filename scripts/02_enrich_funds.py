@@ -273,9 +273,15 @@ def main() -> int:
                             f"{fund['fund_id']}:{url}", "fetch_failed", reason
                         )
                     if not pages:
-                        run.skip()
-                        run.log_error(fund["fund_id"], "no_pages",
-                                      "no pages fetched for fund")
+                        # A fund with zero fetched pages has nothing for
+                        # the LLM to enrich from. Previously this counted
+                        # as a `skip`, so a workspace where EVERY live
+                        # fetch returned 0 pages exited 0 -- a silent
+                        # "degraded cleanly" failure mode. Treat per-fund
+                        # as a fail so cron / wrappers notice when
+                        # enrichment has degraded across the board.
+                        run.fail(fund["fund_id"], "no_pages",
+                                 "no pages fetched for fund")
                         continue
 
                     snaps = store_snapshots(engine, pages)
