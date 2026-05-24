@@ -36,6 +36,7 @@ from core.db import (
     force_refresh_log,
     funds,
     get_engine,
+    outcomes,
     partner_score_summaries,
     partners,
     scores,
@@ -256,8 +257,54 @@ def evaluate_recommended(
     cold_reachability_score: float | None,
     warm_path_available: bool | None,
     today: date,
+    # Batch 19 (#1101-#1103, #1125): suppress when an active outreach
+    # cycle already exists for this partner. The outcomes table is the
+    # source of truth; Stage 8 isn't (its preserve-on-outreach-started
+    # logic depends on Attio state). Any of these latest-outcome
+    # conditions means "don't re-recommend":
+    #   - meeting_booked=True   (#1103)
+    #   - reply_type=passed_*    (#1104) - they declined
+    #   - reply_type=wrong_stage (#1105) - they're not the right partner
+    #   - outreach_status in {sent, replied, meeting_booked} and the
+    #     last outcome is within `latest_outcome_window_days`
+    #     (default 30) -- prevents re-outreach within a month (#1101/#1102)
+    latest_outcome: dict | None = None,
+    latest_outcome_window_days: int = 30,
 ) -> tuple[bool, str]:
     fails: list[str] = []
+    if latest_outcome:
+        # Hard suppressions: terminal states regardless of recency.
+        if bool(latest_outcome.get("meeting_booked")):
+            fails.append(
+                "meeting already booked (outcomes row present); "
+                "do not re-recommend"
+            )
+        reply_type = (latest_outcome.get("reply_type") or "")
+        if reply_type.startswith("passed"):
+            fails.append(
+                f"partner replied reply_type={reply_type!r} (passed); "
+                "do not re-outreach"
+            )
+        if reply_type == "wrong_stage":
+            fails.append(
+                "partner replied reply_type='wrong_stage'; do not re-outreach"
+            )
+        # Recent active outreach (sent / replied / in flight) -> wait.
+        status = latest_outcome.get("outreach_status")
+        ts = latest_outcome.get("synced_from_attio_at")
+        if status in ("sent", "replied", "meeting_booked") and ts is not None:
+            try:
+                # SQLite returns naive datetimes; compare consistently.
+                from datetime import datetime as _dt
+                age_days = (_dt.utcnow() - ts).days
+            except (AttributeError, TypeError):
+                age_days = None
+            if age_days is not None and age_days < latest_outcome_window_days:
+                fails.append(
+                    f"active outreach: outreach_status={status!r} {age_days}d "
+                    f"ago (< {latest_outcome_window_days}d window); "
+                    f"do not re-recommend"
+                )
     if composite is None or composite < 6.5:
         fails.append(f"composite_fit_score ({composite}) < 6.5")
     if round_fit_score < 6.0 or disqualifier_present:
@@ -392,6 +439,25 @@ def main() -> int:
                 "announcement_date": d.announcement_date,
                 "source_url": d.source_url,
             })
+        # Batch 19: latest outcome per partner so evaluate_recommended can
+        # suppress re-outreach when a partner is in active or terminal
+        # outreach state. Iterate ascending so the LAST iteration wins =
+        # most recent by synced_from_attio_at (with outcome_id as tiebreak).
+        latest_outcome_by_partner: dict[str, dict] = {}
+        for o in conn.execute(
+            select(outcomes).order_by(
+                outcomes.c.synced_from_attio_at, outcomes.c.outcome_id,
+            )
+        ):
+            latest_outcome_by_partner[o.partner_id] = {
+                "outreach_status": o.outreach_status,
+                "reply_type": o.reply_type,
+                "meeting_booked": o.meeting_booked,
+                "meeting_date": o.meeting_date,
+                "meeting_outcome": o.meeting_outcome,
+                "synced_from_attio_at": o.synced_from_attio_at,
+                "source": o.source,
+            }
 
     cutoff_18mo = today - timedelta(days=ACTIVITY_WINDOW_DAYS)
 
@@ -609,6 +675,7 @@ def main() -> int:
                     major_kill=major_kill,
                     cold_reachability_score=cold_reachability,
                     warm_path_available=p.warm_path_available,
+                    latest_outcome=latest_outcome_by_partner.get(p.partner_id),
                     today=today,
                 )
 

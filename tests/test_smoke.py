@@ -1665,6 +1665,100 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch19_outcome_suppresses_recommendation():
+    """Inventory #1101-#1105/#1125: a partner with a terminal outcome
+    (passed, wrong_stage, meeting_booked) or recent active outreach
+    (sent/replied within window) must NOT be re-recommended on the
+    next Stage 6 run, regardless of their score."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+            ("06_score_candidates.py", ()),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        # Baseline: pick a recommended partner.
+        c = sqlite3.connect(db)
+        pid = c.execute(
+            "select partner_id from partner_score_summaries "
+            "where recommended_to_send=1 limit 1"
+        ).fetchone()[0]
+
+        # Insert a "passed_no_fit" outcome.
+        from datetime import datetime as _dt
+        c.execute(
+            "insert into outcomes (partner_id, outreach_status, reply_type, "
+            "meeting_booked, synced_from_attio_at, source) values "
+            "(?, 'replied', 'passed_no_fit', 0, ?, 'manual')",
+            (pid, _dt.utcnow().isoformat()),
+        )
+        c.commit()
+        c.close()
+
+        _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        recommended, reasoning = c.execute(
+            "select recommended_to_send, recommendation_reasoning "
+            "from partner_score_summaries where partner_id=?",
+            (pid,),
+        ).fetchone()
+        c.close()
+        assert recommended == 0, (
+            f"partner with passed_no_fit outcome should NOT be recommended; "
+            f"got recommended={recommended}, reasoning={reasoning!r}"
+        )
+        assert "passed" in reasoning, (
+            f"reasoning should mention the passed reply_type; got {reasoning!r}"
+        )
+
+        # Pick a different recommended partner; inject a booked meeting.
+        c = sqlite3.connect(db)
+        other_pid = c.execute(
+            "select partner_id from partner_score_summaries "
+            "where recommended_to_send=1 and partner_id != ? limit 1",
+            (pid,),
+        ).fetchone()
+        if not other_pid:
+            # Fixture only had one left after first suppression; skip the
+            # booked-meeting half of the test.
+            c.close()
+            return
+        other_pid = other_pid[0]
+        c.execute(
+            "insert into outcomes (partner_id, outreach_status, reply_type, "
+            "meeting_booked, synced_from_attio_at, source) values "
+            "(?, 'meeting_booked', 'booked', 1, ?, 'manual')",
+            (other_pid, _dt.utcnow().isoformat()),
+        )
+        c.commit()
+        c.close()
+
+        _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        rec2, reason2 = c.execute(
+            "select recommended_to_send, recommendation_reasoning "
+            "from partner_score_summaries where partner_id=?",
+            (other_pid,),
+        ).fetchone()
+        c.close()
+        assert rec2 == 0
+        assert "meeting already booked" in reason2
+
+
 def test_batch18_attio_api_base_allowlist():
     """Inventory #653/#654/#655: AttioClient refuses to send the bearer
     token to any host outside ALLOWED_API_BASE_HOSTS unless explicitly
