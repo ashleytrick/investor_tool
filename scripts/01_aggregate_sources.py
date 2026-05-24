@@ -18,13 +18,11 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
-from core.db import funds, get_engine, upsert
+from core.config_loader import add_workspace_arg
+from core.db import funds, upsert
 from core.http_client import HttpClient
 from core.ids import fund_id_for, normalize_domain
-from core.runs import RunLogger
+from core.stage_runner import stage_run
 
 STAGE = "01_aggregate_sources"
 _MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
@@ -67,13 +65,12 @@ def main() -> int:
     add_workspace_arg(parser)
     args = parser.parse_args()
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(ws, stage=STAGE)
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    public_lists = ws.sources.get("public_lists") or []
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    # Refactor Batch A: stage_run() replaces ~10 lines of
+    # load_workspace + preflight + banner + engine + RunLogger
+    # boilerplate. require_llm=False because Stage 1 never calls an LLM.
+    with stage_run(args, stage=STAGE, require_llm=False) as ctx:
+        ws, engine, run = ctx.ws, ctx.engine, ctx.run
+        public_lists = ws.sources.get("public_lists") or []
         seen: dict[str, dict] = {}  # domain -> fund row (first source wins)
         for src in public_lists:
             run.processed += 1
@@ -127,10 +124,7 @@ def main() -> int:
                 run.log_error(name, type(exc).__name__, str(exc))
                 # Batch 36 (#7): sources.yaml entries can declare
                 # `required: true`. A required source that fails to load
-                # turns into a hard run failure -- partial ingestion is
-                # only acceptable for sources the operator explicitly
-                # marked optional. Default behavior (no `required` key)
-                # is OPTIONAL, preserving back-compat.
+                # is fatal; optional sources just count as skipped.
                 if src.get("required"):
                     run.failed += 1
                     print(
@@ -152,26 +146,31 @@ def main() -> int:
                     "last_updated": _now(),
                 })
         # Loud failure: sources were configured but produced nothing usable.
-        # Quiet success of an empty pipeline is the old "no silent failures"
-        # trap wearing a new jacket -- exit 2 so wrappers notice.
-        # Batch 36 (#7): a required-source failure trips run.failed
-        # inside the loop; surface it as exit 2 here too.
+        # ctx.refuse() drives the exit code via stage_run; we no longer
+        # `return 2` directly here.
         if run.failed > 0:
+            ctx.refuse(
+                f"{run.failed} REQUIRED source(s) failed; refusing to "
+                f"publish a partial fund universe."
+            )
             print(
                 f"[stage 1] {run.failed} REQUIRED source(s) failed; "
                 f"refusing to publish a partial fund universe."
             )
-            return 2
-        if not seen and run.processed > 0:
+        elif not seen and run.processed > 0:
+            ctx.refuse(
+                f"{run.processed} source(s) configured but 0 usable funds "
+                f"ingested."
+            )
             print(
                 f"[stage 1] FAIL: {run.processed} source(s) configured but "
                 f"0 usable funds ingested. Check sources.yaml + recent errors."
             )
-            run.note("zero funds ingested from configured sources")
-            return 2
-        print(f"[stage 1] {len(seen)} unique funds aggregated -> funds table")
-
-    return 0
+        else:
+            print(
+                f"[stage 1] {len(seen)} unique funds aggregated -> funds table"
+            )
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

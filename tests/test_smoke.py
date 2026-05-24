@@ -1673,6 +1673,64 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_refactor_batch_a_stage_runner_basic():
+    """Refactor Batch A: stage_run() context manager. Smoke-test the
+    happy path + the ctx.refuse() exit-code wiring."""
+    import argparse
+    from core.stage_runner import stage_run, StageContext
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        # Hand-build an args namespace to drive stage_run directly
+        # (Stage 1's CLI uses it via argparse).
+        args = argparse.Namespace(workspace=str(ws_dst))
+
+        # Happy path: empty stage body, no failures, exit_code == 0.
+        with stage_run(args, stage="test_runner_happy",
+                       require_llm=False) as ctx:
+            assert isinstance(ctx, StageContext)
+            assert ctx.ws.path == ws_dst
+            assert ctx.engine is not None
+            assert ctx.llm is None  # require_llm=False
+            assert ctx.run is not None
+            ctx.run.processed = 3
+            ctx.run.succeeded = 3
+        assert ctx.exit_code == 0
+
+        # Failure path: any run.failed -> exit_code 2.
+        with stage_run(args, stage="test_runner_fail",
+                       require_llm=False) as ctx:
+            ctx.run.processed = 2
+            ctx.run.succeeded = 1
+            ctx.run.failed = 1
+        assert ctx.exit_code == 2
+
+        # Refuse path: ctx.refuse() sets exit_code AND records a note.
+        with stage_run(args, stage="test_runner_refuse",
+                       require_llm=False) as ctx:
+            ctx.refuse("synthetic safety gate fired", exit_code=2)
+        assert ctx.exit_code == 2
+
+        # Verify the runs table got three rows (happy + fail + refuse).
+        c = sqlite3.connect(db)
+        rows = c.execute(
+            "select stage, records_failed, error_summary "
+            "from runs where stage like 'test_runner_%' order by run_id"
+        ).fetchall()
+        c.close()
+        assert len(rows) == 3
+        assert rows[0][1] == 0       # happy: failed=0
+        assert rows[1][1] == 1       # fail: failed=1
+        assert rows[2][1] == 1       # refuse: forced to 1
+        assert "synthetic safety gate fired" in (rows[2][2] or "")
+
+
 def test_batch43_stage2_partial_failure_exits_nonzero():
     """Inventory #83: Stage 2 exits 2 when any per-fund enrichment
     raises. Verifies the Batch 35 fix is wired through enrich()."""
