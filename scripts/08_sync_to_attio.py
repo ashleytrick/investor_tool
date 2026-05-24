@@ -315,96 +315,93 @@ def main() -> int:
             ))
         fund_attio_ids: dict[str, str] = {}
         for f in fund_rows:
-            run.processed += 1
-            # Batch 9 production guard: refuse to push fictional fixture
-            # data (.example/.test/.invalid domains) to a real Attio
-            # workspace. --allow-example-domains lets fixture / smoke
-            # runs through.
-            prod_fails = production_gate_for_attio_sync(
-                fund_domain=f.domain, partner_email=None,
-            )
-            if prod_fails and not args.allow_example_domains:
-                run.skipped += 1
-                msg = (
-                    f"refused fund {f.fund_id}: "
-                    + "; ".join(prod_fails)
-                    + " (pass --allow-example-domains to override)"
+            with run.attempt():
+                # Batch 9 production guard: refuse to push fictional fixture
+                # data (.example/.test/.invalid domains) to a real Attio
+                # workspace. --allow-example-domains lets fixture / smoke
+                # runs through.
+                prod_fails = production_gate_for_attio_sync(
+                    fund_domain=f.domain, partner_email=None,
                 )
-                print(f"[stage 8] PROD GUARD: {msg}")
-                run.note(msg)
-                log_sync(
-                    engine, object_type="company", local_id=f.fund_id,
-                    attio_record_id=None, operation="skip_prod_guard",
-                    success=False, error_message="; ".join(prod_fails),
-                )
-                continue
-            source = dict(f._mapping)
-            # `domains` on Attio takes a list of {domain: "..."} objects.
-            base_payload = {
-                "name": [{"value": f.name}],
-                "domains": [{"domain": f.domain}] if f.domain else None,
-            }
-            base_payload = {k: v for k, v in base_payload.items() if v is not None}
-            custom_payload = build_payload(fund_attr_map, source)
-            payload = {**base_payload, **custom_payload}
-            try:
-                # Batch 38 (#52): record the payload to attio_sync_log
-                # BEFORE the API call so the operator can replay / debug.
-                # In dry-run mode this is the only record of what would
-                # have been sent.
-                log_sync(
-                    engine, object_type="company", local_id=f.fund_id,
-                    attio_record_id=None,
-                    operation="dry_run_preview" if args.dry_run else "upsert_attempt",
-                    success=True,
-                    error_message=f"payload_keys={sorted(payload.keys())}",
-                )
-                if args.dry_run:
-                    # Batch 38 (#47): dry-run no longer increments
-                    # success eagerly. We log the preview above, but
-                    # actual success only after a real call returns a
-                    # record_id (in live mode). Keep dry-run counted as
-                    # skipped so the audit doesn't claim live successes.
-                    print(f"[stage 8] DRY-RUN: would upsert company "
-                          f"{f.fund_id} with {len(payload)} attrs "
-                          f"(keys={sorted(payload.keys())})")
-                    run.skipped += 1
-                    continue
-                result = client.upsert_record(
-                    fund_object, matching[fund_object], payload
-                )
-                attio_id = (result.get("data") or {}).get("id", {}).get("record_id")
-                # Findings 29 + 45: a 2xx without a returned record_id is
-                # NOT a success. Refuse to claim it.
-                if not attio_id:
+                if prod_fails and not args.allow_example_domains:
+                    run.skip()
+                    msg = (
+                        f"refused fund {f.fund_id}: "
+                        + "; ".join(prod_fails)
+                        + " (pass --allow-example-domains to override)"
+                    )
+                    print(f"[stage 8] PROD GUARD: {msg}")
+                    run.note(msg)
                     log_sync(
                         engine, object_type="company", local_id=f.fund_id,
-                        attio_record_id=None, operation="upsert",
-                        success=False,
-                        error_message="Attio returned 2xx with no record_id",
-                    )
-                    run.failed += 1
-                    run.log_error(
-                        f.fund_id, "no_record_id",
-                        "Attio upsert returned 2xx with no record_id",
+                        attio_record_id=None, operation="skip_prod_guard",
+                        success=False, error_message="; ".join(prod_fails),
                     )
                     continue
-                fund_attio_ids[f.fund_id] = attio_id
-                with engine.begin() as conn:
-                    conn.execute(
-                        funds.update().where(funds.c.fund_id == f.fund_id).values(
-                            attio_record_id=attio_id, last_updated=_now(),
-                        )
+                source = dict(f._mapping)
+                # `domains` on Attio takes a list of {domain: "..."} objects.
+                base_payload = {
+                    "name": [{"value": f.name}],
+                    "domains": [{"domain": f.domain}] if f.domain else None,
+                }
+                base_payload = {k: v for k, v in base_payload.items() if v is not None}
+                custom_payload = build_payload(fund_attr_map, source)
+                payload = {**base_payload, **custom_payload}
+                try:
+                    # Batch 38 (#52): record the payload to attio_sync_log
+                    # BEFORE the API call so the operator can replay / debug.
+                    # In dry-run mode this is the only record of what would
+                    # have been sent.
+                    log_sync(
+                        engine, object_type="company", local_id=f.fund_id,
+                        attio_record_id=None,
+                        operation="dry_run_preview" if args.dry_run else "upsert_attempt",
+                        success=True,
+                        error_message=f"payload_keys={sorted(payload.keys())}",
                     )
-                log_sync(engine, object_type="company", local_id=f.fund_id,
-                         attio_record_id=attio_id, operation="upsert", success=True)
-                run.succeeded += 1
-            except AttioError as exc:
-                log_sync(engine, object_type="company", local_id=f.fund_id,
-                         attio_record_id=None, operation="upsert", success=False,
-                         error_message=str(exc))
-                run.failed += 1
-                run.log_error(f.fund_id, "AttioError", str(exc))
+                    if args.dry_run:
+                        # Batch 38 (#47): dry-run no longer increments
+                        # success eagerly. We log the preview above, but
+                        # actual success only after a real call returns a
+                        # record_id (in live mode). Keep dry-run counted as
+                        # skipped so the audit doesn't claim live successes.
+                        print(f"[stage 8] DRY-RUN: would upsert company "
+                              f"{f.fund_id} with {len(payload)} attrs "
+                              f"(keys={sorted(payload.keys())})")
+                        run.skip()
+                        continue
+                    result = client.upsert_record(
+                        fund_object, matching[fund_object], payload
+                    )
+                    attio_id = (result.get("data") or {}).get("id", {}).get("record_id")
+                    # Findings 29 + 45: a 2xx without a returned record_id is
+                    # NOT a success. Refuse to claim it.
+                    if not attio_id:
+                        log_sync(
+                            engine, object_type="company", local_id=f.fund_id,
+                            attio_record_id=None, operation="upsert",
+                            success=False,
+                            error_message="Attio returned 2xx with no record_id",
+                        )
+                        run.fail(
+                            f.fund_id, "no_record_id",
+                            "Attio upsert returned 2xx with no record_id",
+                        )
+                        continue
+                    fund_attio_ids[f.fund_id] = attio_id
+                    with engine.begin() as conn:
+                        conn.execute(
+                            funds.update().where(funds.c.fund_id == f.fund_id).values(
+                                attio_record_id=attio_id, last_updated=_now(),
+                            )
+                        )
+                    log_sync(engine, object_type="company", local_id=f.fund_id,
+                             attio_record_id=attio_id, operation="upsert", success=True)
+                except AttioError as exc:
+                    log_sync(engine, object_type="company", local_id=f.fund_id,
+                             attio_record_id=None, operation="upsert", success=False,
+                             error_message=str(exc))
+                    run.fail(f.fund_id, "AttioError", str(exc))
 
         # ---- 2) Sync partners as people, top-N by send_now_priority ----
         with engine.begin() as conn:
@@ -452,252 +449,246 @@ def main() -> int:
                 deck_by_partner[d.partner_id] = d.body
 
         for p in partner_rows:
-            run.processed += 1
-            try:
-                drafts = drafts_by_partner.get(p.partner_id, {})
-                # Findings 42, 43: --require-ready-to-send only syncs
-                # partners whose recommended draft passed Stage 7 QA AND
-                # whose recommended_to_send is True. Prevents pushing
-                # known-bad drafts as ready-to-send into Attio.
-                if args.require_ready_to_send:
-                    rec_draft = drafts.get("recommended")
-                    if not p.recommended_to_send:
-                        run.skipped += 1
-                        continue
-                    if rec_draft is None or rec_draft.qa_status != "pass":
-                        log_sync(
-                            engine, object_type="person",
-                            local_id=p.partner_id, attio_record_id=None,
-                            operation="skip_qa_fail", success=False,
-                            error_message=(
-                                "draft qa_status != 'pass'; --require-ready-to-send "
-                                "refused to sync"
-                            ),
-                        )
-                        run.skipped += 1
-                        continue
-                rec = drafts.get("recommended")
-                alt = drafts.get("alternate")
-                source = dict(p._mapping)
-                source.update({
-                    "outreach_email_draft": rec.body if rec else None,
-                    "email_strategy_used": rec.strategy if rec else None,
-                    "email_subject_line": rec.subject if rec else None,
-                    "conversion_hypothesis": rec.conversion_hypothesis if rec else None,
-                    "likely_objection": rec.likely_objection if rec else None,
-                    "objection_preempted": rec.objection_preempted if rec else None,
-                    "email_draft_alternate": alt.body if alt else None,
-                    "email_alternate_strategy": alt.strategy if alt else None,
-                    "template_smell": rec.template_smell if rec else None,
-                    "followup_email_draft": followups_by_partner.get(p.partner_id),
-                    "deck_request_response": deck_by_partner.get(p.partner_id),
-                })
-                custom_payload = build_payload(partner_attr_map, source)
+            with run.attempt():
+                try:
+                    drafts = drafts_by_partner.get(p.partner_id, {})
+                    # Findings 42, 43: --require-ready-to-send only syncs
+                    # partners whose recommended draft passed Stage 7 QA AND
+                    # whose recommended_to_send is True. Prevents pushing
+                    # known-bad drafts as ready-to-send into Attio.
+                    if args.require_ready_to_send:
+                        rec_draft = drafts.get("recommended")
+                        if not p.recommended_to_send:
+                            run.skip()
+                            continue
+                        if rec_draft is None or rec_draft.qa_status != "pass":
+                            log_sync(
+                                engine, object_type="person",
+                                local_id=p.partner_id, attio_record_id=None,
+                                operation="skip_qa_fail", success=False,
+                                error_message=(
+                                    "draft qa_status != 'pass'; --require-ready-to-send "
+                                    "refused to sync"
+                                ),
+                            )
+                            run.skip()
+                            continue
+                    rec = drafts.get("recommended")
+                    alt = drafts.get("alternate")
+                    source = dict(p._mapping)
+                    source.update({
+                        "outreach_email_draft": rec.body if rec else None,
+                        "email_strategy_used": rec.strategy if rec else None,
+                        "email_subject_line": rec.subject if rec else None,
+                        "conversion_hypothesis": rec.conversion_hypothesis if rec else None,
+                        "likely_objection": rec.likely_objection if rec else None,
+                        "objection_preempted": rec.objection_preempted if rec else None,
+                        "email_draft_alternate": alt.body if alt else None,
+                        "email_alternate_strategy": alt.strategy if alt else None,
+                        "template_smell": rec.template_smell if rec else None,
+                        "followup_email_draft": followups_by_partner.get(p.partner_id),
+                        "deck_request_response": deck_by_partner.get(p.partner_id),
+                    })
+                    custom_payload = build_payload(partner_attr_map, source)
 
-                fund_attio_id = (
-                    fund_attio_ids.get(p.fund_id)
-                    or _lookup_fund_attio_id(engine, p.fund_id)
-                )
-                base_payload = {
-                    "name": [{"value": p.partner_name}],
-                }
-                if fund_attio_id:
-                    base_payload["company"] = [{
-                        "target_object": fund_object,
-                        "target_record_id": fund_attio_id,
-                    }]
-                payload = {**base_payload, **custom_payload}
+                    fund_attio_id = (
+                        fund_attio_ids.get(p.fund_id)
+                        or _lookup_fund_attio_id(engine, p.fund_id)
+                    )
+                    base_payload = {
+                        "name": [{"value": p.partner_name}],
+                    }
+                    if fund_attio_id:
+                        base_payload["company"] = [{
+                            "target_object": fund_object,
+                            "target_record_id": fund_attio_id,
+                        }]
+                    payload = {**base_payload, **custom_payload}
 
-                # Match cascade for an existing Attio record:
-                #   0. partners.attio_record_id (from a prior sync) -> GET it
-                #      directly. This is the strongest signal -- if the
-                #      cascade below fails (LinkedIn URL changed, name typo,
-                #      company link broken), we'd otherwise create a
-                #      duplicate. Finding #1 fix.
-                #   1. email
-                #   2. linkedin_url query
-                #   3. name + company-link query
-                match = None
-                op = None
-                if p.known_attio_id:
-                    try:
-                        rec = client.get_record(person_object, p.known_attio_id)
-                        if rec:
-                            match = rec
-                    except AttioError as exc:
-                        # Stale local id -- record may have been deleted in
-                        # Attio. Clear the local link and fall through to
-                        # the cascade.
-                        log_sync(
-                            engine, object_type="person",
-                            local_id=p.partner_id,
-                            attio_record_id=p.known_attio_id,
-                            operation="known_id_stale", success=False,
-                            error_message=str(exc),
+                    # Match cascade for an existing Attio record:
+                    #   0. partners.attio_record_id (from a prior sync) -> GET it
+                    #      directly. This is the strongest signal -- if the
+                    #      cascade below fails (LinkedIn URL changed, name typo,
+                    #      company link broken), we'd otherwise create a
+                    #      duplicate. Finding #1 fix.
+                    #   1. email
+                    #   2. linkedin_url query
+                    #   3. name + company-link query
+                    match = None
+                    op = None
+                    if p.known_attio_id:
+                        try:
+                            rec = client.get_record(person_object, p.known_attio_id)
+                            if rec:
+                                match = rec
+                        except AttioError as exc:
+                            # Stale local id -- record may have been deleted in
+                            # Attio. Clear the local link and fall through to
+                            # the cascade.
+                            log_sync(
+                                engine, object_type="person",
+                                local_id=p.partner_id,
+                                attio_record_id=p.known_attio_id,
+                                operation="known_id_stale", success=False,
+                                error_message=str(exc),
+                            )
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    partners.update()
+                                    .where(partners.c.partner_id == p.partner_id)
+                                    .values(attio_record_id=None)
+                                )
+                    if match is None:
+                        match = find_partner_record(
+                            client, person_object,
+                            email=p.partner_email,
+                            linkedin_url=p.linkedin_url,
+                            name=p.partner_name,
+                            company_record_id=fund_attio_id,
                         )
+                    attio_id = None
+                    if match and match.get("_conflict"):
+                        # Finding 37, 44: multiple matches is a real audit
+                        # event, not just a skip. Count as failure so the
+                        # process exits non-zero AND surface prominently.
+                        cand_count = len(match['candidates'])
+                        err_msg = (
+                            f"{cand_count} candidate matches for {p.partner_name!r} "
+                            f"at {fund_attio_id!r}; refusing to create a duplicate"
+                        )
+                        print(f"[stage 8] CONFLICT: {p.partner_id}: {err_msg}")
+                        log_sync(engine, object_type="person", local_id=p.partner_id,
+                                 attio_record_id=None, operation="skip_conflict",
+                                 success=False, error_message=err_msg)
+                        run.fail(p.partner_id, "person_conflict", err_msg)
+                        continue
+                    if match:
+                        existing_state = existing_partner_state(match)
+                        payload, removed = strip_preserved_fields(
+                            payload, existing_state, attio_cfg, partner_attr_map
+                        )
+                        # Finding 38: log what got stripped so the operator can
+                        # audit "I patched, but these fields stayed alone".
+                        if removed:
+                            log_sync(
+                                engine, object_type="person",
+                                local_id=p.partner_id,
+                                attio_record_id=match.get("id", {}).get("record_id"),
+                                operation="preserve_stripped", success=True,
+                                error_message=(
+                                    f"preserved on-outreach-started: {sorted(removed)}"
+                                ),
+                            )
+                        attio_id = match.get("id", {}).get("record_id")
+                        op = "patch"
+                        if args.dry_run:
+                            print(f"[stage 8] DRY-RUN: would PATCH person "
+                                  f"{p.partner_id} attio_id={attio_id} "
+                                  f"with {len(payload)} attrs "
+                                  f"(preserved: {sorted(removed)})")
+                            continue
+                        if attio_id and payload:
+                            client.update_record(person_object, attio_id, payload)
+                        elif attio_id and not payload:
+                            # Batch 12 (#383): an empty payload is a NO-OP, not a
+                            # silent success. Log it so the operator can see that
+                            # nothing was sent and the preserved-fields logic is
+                            # working as intended (or, conversely, that something
+                            # else upstream blanked the payload).
+                            log_sync(
+                                engine, object_type="person",
+                                local_id=p.partner_id,
+                                attio_record_id=attio_id,
+                                operation="patch_noop", success=True,
+                                error_message=(
+                                    "all writable fields preserved or empty; "
+                                    "no remote PATCH issued"
+                                ),
+                            )
+                    else:
+                        if args.dry_run:
+                            print(f"[stage 8] DRY-RUN: would CREATE person "
+                                  f"{p.partner_id} with {len(payload)} attrs")
+                            continue
+                        result = client.create_record(person_object, payload)
+                        attio_id = (result.get("data") or {}).get("id", {}).get("record_id")
+                        op = "create"
+                    # Findings 29 + 45: don't claim success when Attio
+                    # returned 2xx with no record_id.
+                    if not attio_id:
+                        log_sync(
+                            engine, object_type="person", local_id=p.partner_id,
+                            attio_record_id=None, operation=op or "?",
+                            success=False,
+                            error_message="Attio returned 2xx with no record_id",
+                        )
+                        run.fail(
+                            p.partner_id, "no_record_id",
+                            f"Attio {op} returned 2xx with no record_id",
+                        )
+                        continue
+
+                    if attio_id:
+                        now = _now()
                         with engine.begin() as conn:
                             conn.execute(
-                                partners.update()
-                                .where(partners.c.partner_id == p.partner_id)
-                                .values(attio_record_id=None)
+                                partners.update().where(
+                                    partners.c.partner_id == p.partner_id
+                                ).values(
+                                    attio_record_id=attio_id, last_updated=now,
+                                )
                             )
-                if match is None:
-                    match = find_partner_record(
-                        client, person_object,
-                        email=p.partner_email,
-                        linkedin_url=p.linkedin_url,
-                        name=p.partner_name,
-                        company_record_id=fund_attio_id,
-                    )
-                attio_id = None
-                if match and match.get("_conflict"):
-                    # Finding 37, 44: multiple matches is a real audit
-                    # event, not just a skip. Count as failure so the
-                    # process exits non-zero AND surface prominently.
-                    cand_count = len(match['candidates'])
-                    err_msg = (
-                        f"{cand_count} candidate matches for {p.partner_name!r} "
-                        f"at {fund_attio_id!r}; refusing to create a duplicate"
-                    )
-                    print(f"[stage 8] CONFLICT: {p.partner_id}: {err_msg}")
+                            # Batch 12 (#379/#380/#381): record pushed_to_attio_at
+                            # on the LATEST recommended/alternate draft + the
+                            # latest followup + the latest deck-response for this
+                            # partner so the operator (and `status.py`) can see
+                            # exactly which artifact was synced and when. Without
+                            # this the timestamp column stayed NULL forever.
+                            rec_draft = drafts.get("recommended")
+                            if rec_draft is not None:
+                                conn.execute(
+                                    email_drafts.update()
+                                    .where(email_drafts.c.draft_id == rec_draft.draft_id)
+                                    .values(pushed_to_attio_at=now)
+                                )
+                            alt_draft = drafts.get("alternate")
+                            if alt_draft is not None:
+                                conn.execute(
+                                    email_drafts.update()
+                                    .where(email_drafts.c.draft_id == alt_draft.draft_id)
+                                    .values(pushed_to_attio_at=now)
+                                )
+                            latest_followup_id = conn.execute(
+                                select(followup_drafts.c.followup_id)
+                                .where(followup_drafts.c.partner_id == p.partner_id)
+                                .order_by(followup_drafts.c.followup_id.desc())
+                                .limit(1)
+                            ).scalar()
+                            if latest_followup_id is not None:
+                                conn.execute(
+                                    followup_drafts.update()
+                                    .where(followup_drafts.c.followup_id == latest_followup_id)
+                                    .values(pushed_to_attio_at=now)
+                                )
+                            latest_deck_id = conn.execute(
+                                select(deck_request_responses.c.response_id)
+                                .where(deck_request_responses.c.partner_id == p.partner_id)
+                                .order_by(deck_request_responses.c.response_id.desc())
+                                .limit(1)
+                            ).scalar()
+                            if latest_deck_id is not None:
+                                conn.execute(
+                                    deck_request_responses.update()
+                                    .where(deck_request_responses.c.response_id == latest_deck_id)
+                                    .values(pushed_to_attio_at=now)
+                                )
                     log_sync(engine, object_type="person", local_id=p.partner_id,
-                             attio_record_id=None, operation="skip_conflict",
-                             success=False, error_message=err_msg)
-                    run.failed += 1
-                    run.log_error(p.partner_id, "person_conflict", err_msg)
-                    continue
-                if match:
-                    existing_state = existing_partner_state(match)
-                    payload, removed = strip_preserved_fields(
-                        payload, existing_state, attio_cfg, partner_attr_map
-                    )
-                    # Finding 38: log what got stripped so the operator can
-                    # audit "I patched, but these fields stayed alone".
-                    if removed:
-                        log_sync(
-                            engine, object_type="person",
-                            local_id=p.partner_id,
-                            attio_record_id=match.get("id", {}).get("record_id"),
-                            operation="preserve_stripped", success=True,
-                            error_message=(
-                                f"preserved on-outreach-started: {sorted(removed)}"
-                            ),
-                        )
-                    attio_id = match.get("id", {}).get("record_id")
-                    op = "patch"
-                    if args.dry_run:
-                        print(f"[stage 8] DRY-RUN: would PATCH person "
-                              f"{p.partner_id} attio_id={attio_id} "
-                              f"with {len(payload)} attrs "
-                              f"(preserved: {sorted(removed)})")
-                        run.succeeded += 1
-                        continue
-                    if attio_id and payload:
-                        client.update_record(person_object, attio_id, payload)
-                    elif attio_id and not payload:
-                        # Batch 12 (#383): an empty payload is a NO-OP, not a
-                        # silent success. Log it so the operator can see that
-                        # nothing was sent and the preserved-fields logic is
-                        # working as intended (or, conversely, that something
-                        # else upstream blanked the payload).
-                        log_sync(
-                            engine, object_type="person",
-                            local_id=p.partner_id,
-                            attio_record_id=attio_id,
-                            operation="patch_noop", success=True,
-                            error_message=(
-                                "all writable fields preserved or empty; "
-                                "no remote PATCH issued"
-                            ),
-                        )
-                else:
-                    if args.dry_run:
-                        print(f"[stage 8] DRY-RUN: would CREATE person "
-                              f"{p.partner_id} with {len(payload)} attrs")
-                        run.succeeded += 1
-                        continue
-                    result = client.create_record(person_object, payload)
-                    attio_id = (result.get("data") or {}).get("id", {}).get("record_id")
-                    op = "create"
-                # Findings 29 + 45: don't claim success when Attio
-                # returned 2xx with no record_id.
-                if not attio_id:
-                    log_sync(
-                        engine, object_type="person", local_id=p.partner_id,
-                        attio_record_id=None, operation=op or "?",
-                        success=False,
-                        error_message="Attio returned 2xx with no record_id",
-                    )
-                    run.failed += 1
-                    run.log_error(
-                        p.partner_id, "no_record_id",
-                        f"Attio {op} returned 2xx with no record_id",
-                    )
-                    continue
-
-                if attio_id:
-                    now = _now()
-                    with engine.begin() as conn:
-                        conn.execute(
-                            partners.update().where(
-                                partners.c.partner_id == p.partner_id
-                            ).values(
-                                attio_record_id=attio_id, last_updated=now,
-                            )
-                        )
-                        # Batch 12 (#379/#380/#381): record pushed_to_attio_at
-                        # on the LATEST recommended/alternate draft + the
-                        # latest followup + the latest deck-response for this
-                        # partner so the operator (and `status.py`) can see
-                        # exactly which artifact was synced and when. Without
-                        # this the timestamp column stayed NULL forever.
-                        rec_draft = drafts.get("recommended")
-                        if rec_draft is not None:
-                            conn.execute(
-                                email_drafts.update()
-                                .where(email_drafts.c.draft_id == rec_draft.draft_id)
-                                .values(pushed_to_attio_at=now)
-                            )
-                        alt_draft = drafts.get("alternate")
-                        if alt_draft is not None:
-                            conn.execute(
-                                email_drafts.update()
-                                .where(email_drafts.c.draft_id == alt_draft.draft_id)
-                                .values(pushed_to_attio_at=now)
-                            )
-                        latest_followup_id = conn.execute(
-                            select(followup_drafts.c.followup_id)
-                            .where(followup_drafts.c.partner_id == p.partner_id)
-                            .order_by(followup_drafts.c.followup_id.desc())
-                            .limit(1)
-                        ).scalar()
-                        if latest_followup_id is not None:
-                            conn.execute(
-                                followup_drafts.update()
-                                .where(followup_drafts.c.followup_id == latest_followup_id)
-                                .values(pushed_to_attio_at=now)
-                            )
-                        latest_deck_id = conn.execute(
-                            select(deck_request_responses.c.response_id)
-                            .where(deck_request_responses.c.partner_id == p.partner_id)
-                            .order_by(deck_request_responses.c.response_id.desc())
-                            .limit(1)
-                        ).scalar()
-                        if latest_deck_id is not None:
-                            conn.execute(
-                                deck_request_responses.update()
-                                .where(deck_request_responses.c.response_id == latest_deck_id)
-                                .values(pushed_to_attio_at=now)
-                            )
-                log_sync(engine, object_type="person", local_id=p.partner_id,
-                         attio_record_id=attio_id, operation=op, success=True)
-                run.succeeded += 1
-            except AttioError as exc:
-                log_sync(engine, object_type="person", local_id=p.partner_id,
-                         attio_record_id=None, operation="error",
-                         success=False, error_message=str(exc))
-                run.failed += 1
-                run.log_error(p.partner_id, "AttioError", str(exc))
+                             attio_record_id=attio_id, operation=op, success=True)
+                except AttioError as exc:
+                    log_sync(engine, object_type="person", local_id=p.partner_id,
+                             attio_record_id=None, operation="error",
+                             success=False, error_message=str(exc))
+                    run.fail(p.partner_id, "AttioError", str(exc))
 
         # Batch 12 (#385): close the Attio client even on unexpected
         # exception paths. Previously a crash between "begin partners loop"
