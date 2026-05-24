@@ -316,11 +316,14 @@ def main() -> int:
                 (ws.fixtures_dir / "partner_signals_seed.json").read_text(encoding="utf-8")
             )
         else:
+            # WorkspacePolicy routes the CSV strictness decision (item 10).
+            from core.workspace_policy import WorkspacePolicy
+            policy = WorkspacePolicy.from_workspace_and_args(ws, args)
             known_pids = {p.partner_id for p in partner_rows}
             try:
                 fixture = _fetch_live_partner_content(
                     ws, engine, run, known_pids,
-                    strict_unknown_partners=not args.allow_unknown_partner_ids,
+                    strict_unknown_partners=not policy.allow_unknown_partner_ids,
                 )
             except ValueError as exc:
                 # CSV schema validation refusal -- already logged.
