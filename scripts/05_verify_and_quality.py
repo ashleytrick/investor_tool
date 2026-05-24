@@ -85,66 +85,64 @@ def main() -> int:
         method_counts: dict[str, int] = {}
 
         for s in rows:
-            run.processed += 1
-            try:
-                ver = verify_signal(
-                    engine, s.source_url, s.quoted_text, s.snapshot_id,
-                    offline=args.offline,
-                )
-                method_counts[ver.verification_method] = (
-                    method_counts.get(ver.verification_method, 0) + 1
-                )
-                if ver.verified:
-                    verified_count += 1
-                    import json as _json
-                    axes = _json.loads(s.axis_relevance or "[]")
-                    quality = score_signal(
-                        llm,
-                        quoted_text=s.quoted_text,
-                        axis_relevance=axes,
-                        quote_date=s.quote_date.isoformat() if s.quote_date else None,
-                        source_url=s.source_url,
-                        signal_direction=s.signal_direction or "positive",
-                        confidence="high",
-                        company_description=company_desc,
-                        company_name=company_name,
+            with run.attempt():
+                try:
+                    ver = verify_signal(
+                        engine, s.source_url, s.quoted_text, s.snapshot_id,
+                        offline=args.offline,
                     )
-                    if quality.signal_quality_score >= 2:
-                        quality2_plus += 1
-                    with engine.begin() as conn:
-                        conn.execute(
-                            signals.update().where(signals.c.signal_id == s.signal_id)
-                            .values(
-                                verified=True,
-                                verification_method=ver.verification_method,
-                                verification_error=None,
-                                signal_quality_score=quality.signal_quality_score,
-                                quality_reasoning=quality.quality_reasoning,
-                            )
+                    method_counts[ver.verification_method] = (
+                        method_counts.get(ver.verification_method, 0) + 1
+                    )
+                    if ver.verified:
+                        verified_count += 1
+                        import json as _json
+                        axes = _json.loads(s.axis_relevance or "[]")
+                        quality = score_signal(
+                            llm,
+                            quoted_text=s.quoted_text,
+                            axis_relevance=axes,
+                            quote_date=s.quote_date.isoformat() if s.quote_date else None,
+                            source_url=s.source_url,
+                            signal_direction=s.signal_direction or "positive",
+                            confidence="high",
+                            company_description=company_desc,
+                            company_name=company_name,
                         )
-                else:
-                    # Batch 11 (#351/#352): when verification flips to False,
-                    # the previously-set signal_quality_score and
-                    # quality_reasoning become misleading -- they describe a
-                    # quote that no longer verifies. Clear them so Stage 6's
-                    # quality>=2 filter and Stage 7's signal_led eligibility
-                    # don't pick up an unverified signal that still carries
-                    # a stale quality score.
-                    with engine.begin() as conn:
-                        conn.execute(
-                            signals.update().where(signals.c.signal_id == s.signal_id)
-                            .values(
-                                verified=False,
-                                verification_method=ver.verification_method,
-                                verification_error=ver.verification_error,
-                                signal_quality_score=None,
-                                quality_reasoning=None,
+                        if quality.signal_quality_score >= 2:
+                            quality2_plus += 1
+                        with engine.begin() as conn:
+                            conn.execute(
+                                signals.update().where(signals.c.signal_id == s.signal_id)
+                                .values(
+                                    verified=True,
+                                    verification_method=ver.verification_method,
+                                    verification_error=None,
+                                    signal_quality_score=quality.signal_quality_score,
+                                    quality_reasoning=quality.quality_reasoning,
+                                )
                             )
-                        )
-                run.succeeded += 1
-            except Exception as exc:  # noqa: BLE001 - logged, continue
-                run.failed += 1
-                run.log_error(str(s.signal_id), type(exc).__name__, str(exc))
+                    else:
+                        # Batch 11 (#351/#352): when verification flips to False,
+                        # the previously-set signal_quality_score and
+                        # quality_reasoning become misleading -- they describe a
+                        # quote that no longer verifies. Clear them so Stage 6's
+                        # quality>=2 filter and Stage 7's signal_led eligibility
+                        # don't pick up an unverified signal that still carries
+                        # a stale quality score.
+                        with engine.begin() as conn:
+                            conn.execute(
+                                signals.update().where(signals.c.signal_id == s.signal_id)
+                                .values(
+                                    verified=False,
+                                    verification_method=ver.verification_method,
+                                    verification_error=ver.verification_error,
+                                    signal_quality_score=None,
+                                    quality_reasoning=None,
+                                )
+                            )
+                except Exception as exc:  # noqa: BLE001 - logged, continue
+                    run.fail(str(s.signal_id), type(exc).__name__, str(exc))
 
         total = max(run.processed, 1)
         pct = verified_count * 100.0 / total
