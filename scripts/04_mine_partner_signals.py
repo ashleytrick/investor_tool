@@ -368,151 +368,149 @@ def main() -> int:
         partners_with_signals = 0
         total_signals = 0
         for p in partner_rows:
-            entry = fixture.get(p.partner_id)
-            if not entry:
-                # Batch 11 (#348): a partner with no fresh content this run
-                # used to keep their stale cold_reachability_partial_score
-                # forever, so Stage 6's send_now_priority kept boosting a
-                # partner whose evidence was N runs old. Clear the partial
-                # score + evidence so Stage 6 treats reachability as unknown
-                # (post-Batch 5: unknown contributes 0, not 5).
-                # Batch 36 (#9): gated by `clear_stale_partials` so a
-                # partial CSV can't accidentally wipe reachability for
-                # every absent partner.
-                if (
-                    clear_stale_partials
-                    and (
-                        p.cold_reachability_partial_score is not None
-                        or p.cold_reachability_partial_evidence is not None
+            with run.attempt():
+                entry = fixture.get(p.partner_id)
+                if not entry:
+                    # Batch 11 (#348): a partner with no fresh content this run
+                    # used to keep their stale cold_reachability_partial_score
+                    # forever, so Stage 6's send_now_priority kept boosting a
+                    # partner whose evidence was N runs old. Clear the partial
+                    # score + evidence so Stage 6 treats reachability as unknown
+                    # (post-Batch 5: unknown contributes 0, not 5).
+                    # Batch 36 (#9): gated by `clear_stale_partials` so a
+                    # partial CSV can't accidentally wipe reachability for
+                    # every absent partner.
+                    if (
+                        clear_stale_partials
+                        and (
+                            p.cold_reachability_partial_score is not None
+                            or p.cold_reachability_partial_evidence is not None
+                        )
+                    ):
+                        with engine.begin() as conn:
+                            conn.execute(
+                                partners.update()
+                                .where(partners.c.partner_id == p.partner_id)
+                                .values(
+                                    cold_reachability_partial_score=None,
+                                    cold_reachability_partial_evidence=None,
+                                    last_updated=_now(),
+                                )
+                            )
+                        run.note(
+                            f"cleared stale reachability partial for "
+                            f"{p.partner_id} (no fresh content)"
+                        )
+                    run.skip()
+                    continue
+                try:
+                    # Snapshot each source; remember url -> snapshot_id.
+                    url_to_snap: dict[str, int] = {}
+                    content_parts: list[str] = []
+                    for src in entry.get("sources", []):
+                        sid = upsert_snapshot(engine, src["source_url"], src["text"])
+                        url_to_snap[src["source_url"]] = sid
+                        content_parts.append(
+                            f'--- {src["source_url"]} ({src["source_type"]}, '
+                            f'{src.get("quote_date","?")}) ---\n{src["text"]}'
+                        )
+                    content = "\n\n".join(content_parts)
+
+                    prompt = render_prompt(
+                        template,
+                        company=ws.company,
+                        partner_row=p,
+                        fund_name=fund_name_by_id.get(p.fund_id, "?"),
+                        axes_block=axes_block,
+                        content=content,
                     )
-                ):
+                    output: PartnerSignalsOutput = llm.complete_json(
+                        prompt=prompt,
+                        schema=PartnerSignalsOutput,
+                        model=MODEL_BATCH,
+                        stub_response=entry.get("_extraction"),
+                    )
+
+                    # Persist thesis signals (dedup on partner_id + source_url + quote).
+                    inserted_here = 0
                     with engine.begin() as conn:
+                        for s in output.signals:
+                            url = str(s.source_url)
+                            snap_id = url_to_snap.get(url)
+                            exists = conn.execute(
+                                select(signals.c.signal_id, signals.c.snapshot_id).where(and_(
+                                    signals.c.partner_id == p.partner_id,
+                                    signals.c.source_url == url,
+                                    signals.c.quoted_text == s.quoted_text,
+                                ))
+                            ).first()
+                            if exists:
+                                # On dedup hit, REFRESH the metadata fields so a
+                                # corrected LLM run actually updates axis_relevance
+                                # / source_type / signal_direction / quote_date.
+                                # Previously these were frozen at first insertion
+                                # even when a later run produced better tags.
+                                # verified + signal_quality_score are preserved
+                                # (set by Stage 5; not for us to overwrite here).
+                                update_values = {
+                                    "source_type": s.source_type,
+                                    "quote_date": s.quote_date,
+                                    "axis_relevance": json.dumps(s.axis_relevance),
+                                    "signal_direction": s.signal_direction,
+                                }
+                                if exists.snapshot_id is None and snap_id is not None:
+                                    update_values["snapshot_id"] = snap_id
+                                conn.execute(
+                                    signals.update()
+                                    .where(signals.c.signal_id == exists.signal_id)
+                                    .values(**update_values)
+                                )
+                                continue
+                            conn.execute(signals.insert().values(
+                                partner_id=p.partner_id,
+                                snapshot_id=url_to_snap.get(url),
+                                source_type=s.source_type,
+                                source_url=url,
+                                quoted_text=s.quoted_text,
+                                quote_date=s.quote_date,
+                                axis_relevance=json.dumps(s.axis_relevance),
+                                signal_direction=s.signal_direction,
+                                verified=False,
+                                captured_at=_now(),
+                            ))
+                            inserted_here += 1
+
+                        # Persist reachability partial info on the partner row.
+                        reach_payload = {
+                            "reasoning": output.cold_reachability_reasoning,
+                            "signals": [
+                                {
+                                    "evidence": e.evidence,
+                                    "source_url": str(e.source_url),
+                                    "direction": e.direction,
+                                }
+                                for e in output.reachability_signals
+                            ],
+                        }
                         conn.execute(
-                            partners.update()
-                            .where(partners.c.partner_id == p.partner_id)
+                            partners.update().where(partners.c.partner_id == p.partner_id)
                             .values(
-                                cold_reachability_partial_score=None,
-                                cold_reachability_partial_evidence=None,
+                                cold_reachability_partial_score=output.cold_reachability_partial_score,
+                                cold_reachability_partial_evidence=json.dumps(reach_payload),
                                 last_updated=_now(),
                             )
                         )
-                    run.note(
-                        f"cleared stale reachability partial for "
-                        f"{p.partner_id} (no fresh content)"
+
+                    total_signals += inserted_here
+                    if output.signals:
+                        partners_with_signals += 1
+                    print(
+                        f"[stage 4] {p.name}: {len(output.signals)} thesis signals "
+                        f"({inserted_here} new), reach_partial="
+                        f"{output.cold_reachability_partial_score}"
                     )
-                run.skipped += 1
-                continue
-            run.processed += 1
-            try:
-                # Snapshot each source; remember url -> snapshot_id.
-                url_to_snap: dict[str, int] = {}
-                content_parts: list[str] = []
-                for src in entry.get("sources", []):
-                    sid = upsert_snapshot(engine, src["source_url"], src["text"])
-                    url_to_snap[src["source_url"]] = sid
-                    content_parts.append(
-                        f'--- {src["source_url"]} ({src["source_type"]}, '
-                        f'{src.get("quote_date","?")}) ---\n{src["text"]}'
-                    )
-                content = "\n\n".join(content_parts)
-
-                prompt = render_prompt(
-                    template,
-                    company=ws.company,
-                    partner_row=p,
-                    fund_name=fund_name_by_id.get(p.fund_id, "?"),
-                    axes_block=axes_block,
-                    content=content,
-                )
-                output: PartnerSignalsOutput = llm.complete_json(
-                    prompt=prompt,
-                    schema=PartnerSignalsOutput,
-                    model=MODEL_BATCH,
-                    stub_response=entry.get("_extraction"),
-                )
-
-                # Persist thesis signals (dedup on partner_id + source_url + quote).
-                inserted_here = 0
-                with engine.begin() as conn:
-                    for s in output.signals:
-                        url = str(s.source_url)
-                        snap_id = url_to_snap.get(url)
-                        exists = conn.execute(
-                            select(signals.c.signal_id, signals.c.snapshot_id).where(and_(
-                                signals.c.partner_id == p.partner_id,
-                                signals.c.source_url == url,
-                                signals.c.quoted_text == s.quoted_text,
-                            ))
-                        ).first()
-                        if exists:
-                            # On dedup hit, REFRESH the metadata fields so a
-                            # corrected LLM run actually updates axis_relevance
-                            # / source_type / signal_direction / quote_date.
-                            # Previously these were frozen at first insertion
-                            # even when a later run produced better tags.
-                            # verified + signal_quality_score are preserved
-                            # (set by Stage 5; not for us to overwrite here).
-                            update_values = {
-                                "source_type": s.source_type,
-                                "quote_date": s.quote_date,
-                                "axis_relevance": json.dumps(s.axis_relevance),
-                                "signal_direction": s.signal_direction,
-                            }
-                            if exists.snapshot_id is None and snap_id is not None:
-                                update_values["snapshot_id"] = snap_id
-                            conn.execute(
-                                signals.update()
-                                .where(signals.c.signal_id == exists.signal_id)
-                                .values(**update_values)
-                            )
-                            continue
-                        conn.execute(signals.insert().values(
-                            partner_id=p.partner_id,
-                            snapshot_id=url_to_snap.get(url),
-                            source_type=s.source_type,
-                            source_url=url,
-                            quoted_text=s.quoted_text,
-                            quote_date=s.quote_date,
-                            axis_relevance=json.dumps(s.axis_relevance),
-                            signal_direction=s.signal_direction,
-                            verified=False,
-                            captured_at=_now(),
-                        ))
-                        inserted_here += 1
-
-                    # Persist reachability partial info on the partner row.
-                    reach_payload = {
-                        "reasoning": output.cold_reachability_reasoning,
-                        "signals": [
-                            {
-                                "evidence": e.evidence,
-                                "source_url": str(e.source_url),
-                                "direction": e.direction,
-                            }
-                            for e in output.reachability_signals
-                        ],
-                    }
-                    conn.execute(
-                        partners.update().where(partners.c.partner_id == p.partner_id)
-                        .values(
-                            cold_reachability_partial_score=output.cold_reachability_partial_score,
-                            cold_reachability_partial_evidence=json.dumps(reach_payload),
-                            last_updated=_now(),
-                        )
-                    )
-
-                total_signals += inserted_here
-                if output.signals:
-                    partners_with_signals += 1
-                run.succeeded += 1
-                print(
-                    f"[stage 4] {p.name}: {len(output.signals)} thesis signals "
-                    f"({inserted_here} new), reach_partial="
-                    f"{output.cold_reachability_partial_score}"
-                )
-            except Exception as exc:  # noqa: BLE001 - logged, continue
-                run.failed += 1
-                run.log_error(p.partner_id, type(exc).__name__, str(exc))
+                except Exception as exc:  # noqa: BLE001 - logged, continue
+                    run.fail(p.partner_id, type(exc).__name__, str(exc))
 
         print(
             f"[stage 4] {partners_with_signals} partners with >=1 thesis signal; "
