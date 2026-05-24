@@ -1665,6 +1665,163 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch20_env_precedence():
+    """Inventory #815/#816: env resolution is (process env if non-empty)
+    > workspace .env > root .env. An empty process env value must NOT
+    mask a workspace .env value."""
+    from core.config_loader import Workspace
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        # Inject a key into the workspace .env.
+        (ws_dst / ".env").write_text(
+            "FAKE_TEST_KEY=from_workspace_dotenv\n",
+            encoding="utf-8",
+        )
+
+        # 1. No process env -> workspace .env wins.
+        saved = os.environ.pop("FAKE_TEST_KEY", None)
+        try:
+            ws = Workspace(str(ws_dst))
+            assert ws.env("FAKE_TEST_KEY") == "from_workspace_dotenv"
+
+            # 2. Process env with non-empty value -> overrides.
+            os.environ["FAKE_TEST_KEY"] = "from_process_env"
+            ws = Workspace(str(ws_dst))
+            assert ws.env("FAKE_TEST_KEY") == "from_process_env"
+
+            # 3. Process env with EMPTY value -> falls back to workspace.
+            os.environ["FAKE_TEST_KEY"] = ""
+            ws = Workspace(str(ws_dst))
+            assert ws.env("FAKE_TEST_KEY") == "from_workspace_dotenv", (
+                "empty process env must NOT mask workspace .env value"
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("FAKE_TEST_KEY", None)
+            else:
+                os.environ["FAKE_TEST_KEY"] = saved
+
+
+def test_batch20_fixture_mode_no_key_required():
+    """Inventory #819: --fixtures runs of Stages 2/3/4 must succeed
+    without ANTHROPIC_API_KEY (stub mode + fixture content)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+        ):
+            res = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "scripts" / s),
+                 "--workspace", ws, *extra],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+            assert res.returncode == 0, (
+                f"{s} (fixture mode, no key) should succeed; got "
+                f"{res.returncode}\n{res.stdout}{res.stderr}"
+            )
+
+
+def test_batch20_llm_extract_json_retries_on_malformed():
+    """Inventory #821/#822: LLM client retries up to max_retries times on
+    bad JSON / bad schema before giving up. Drive _raw_call via monkey-
+    patch so we can return bad text first, valid second."""
+    import importlib.util
+    from pathlib import Path as _P
+    from pydantic import BaseModel, Field
+    from core.llm.client import LLMClient, LLMError
+
+    class _Schema(BaseModel):
+        n: int = Field(..., ge=0, le=10)
+
+    # Bypass the workspace/env dance by using a minimal Workspace stand-in.
+    class _FakeWs:
+        def env(self, key, default=None):
+            return "fake-key"  # forces non-stub mode
+
+    client = LLMClient(workspace=_FakeWs())
+    # Sanity: client is in live mode now (api_key is set).
+    assert client.stub is False
+
+    calls = {"n": 0}
+
+    def fake_raw_call(self, prompt, model, max_tokens):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "not json at all"
+        if calls["n"] == 2:
+            return '{"n": 999}'  # schema-invalid (>10)
+        return '{"n": 4}'
+
+    import types
+    client._raw_call = types.MethodType(fake_raw_call, client)
+    result = client.complete_json(
+        prompt="ignored", schema=_Schema, max_retries=3,
+    )
+    assert result.n == 4
+    assert calls["n"] == 3, f"expected 3 attempts, got {calls['n']}"
+
+    # Reset + prove final failure raises LLMError after exhausting retries.
+    calls["n"] = 0
+
+    def always_bad(self, prompt, model, max_tokens):
+        calls["n"] += 1
+        return "still not json"
+
+    client._raw_call = types.MethodType(always_bad, client)
+    import pytest
+    with pytest.raises(LLMError) as exc_info:
+        client.complete_json(
+            prompt="ignored", schema=_Schema, max_retries=3,
+        )
+    assert "schema-valid JSON" in str(exc_info.value)
+    assert calls["n"] == 3
+
+
+def test_batch20_stage7_null_priority_handling():
+    """Inventory #969: Stage 7 ORDER BY send_now_priority.desc() puts
+    NULL priorities in DB-dependent order. Confirm Stage 7 doesn't
+    crash on a partner whose summary row has NULL send_now_priority."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+
+        # Null out one priority.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update partner_score_summaries set send_now_priority=NULL "
+            "where partner_id=(select partner_id from partner_score_summaries limit 1)"
+        )
+        c.commit()
+        c.close()
+
+        # Stage 7 should still run and produce CSV.
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+        csv_path = ws_dst / "exports" / "review_queue.csv"
+        assert csv_path.exists()
+
+
 def test_batch19_outcome_suppresses_recommendation():
     """Inventory #1101-#1105/#1125: a partner with a terminal outcome
     (passed, wrong_stage, meeting_booked) or recent active outreach
