@@ -919,6 +919,13 @@ def main() -> int:
         market_shift_axes = market_shift_axis_ids(ws.axes)
 
         # ---- pull top-N partners + their context ----
+        # Stage 7 generates outreach drafts; it should only operate on
+        # partners that Stage 6 said are recommended_to_send. Previously
+        # the query selected top-N by send_now_priority with NO
+        # recommendation filter, so a partner who failed Stage 6's
+        # criteria 1-9 could still get a draft generated (and consume
+        # one of the --top slots). rec_in_batch only saw the filtered
+        # set for the Rule 16 ceiling gate but the loop saw everyone.
         with engine.begin() as conn:
             rows = list(conn.execute(
                 select(
@@ -937,6 +944,7 @@ def main() -> int:
                 )
                 .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
                 .join(funds, funds.c.fund_id == partners.c.fund_id)
+                .where(partner_score_summaries.c.recommended_to_send.is_(True))
                 .order_by(partner_score_summaries.c.send_now_priority.desc())
                 .limit(args.top)
             ))
@@ -979,7 +987,10 @@ def main() -> int:
                         "lead_fund_id": d.lead_fund_id,
                     })
 
-        rec_in_batch = [r for r in rows if r.recommended_to_send]
+        # Rows are already filtered to recommended_to_send=True by the
+        # query above; this list is kept for the ceiling gate's intent
+        # (count of partners that would land as ready_to_send).
+        rec_in_batch = rows
 
         # Both safety refusals (Gate 5.5 calibration + Rule 16 ceiling) now
         # live inside the RunLogger context so the refusal lands in `runs`
