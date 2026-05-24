@@ -910,6 +910,9 @@ def main() -> int:
     _require_examples = bool(_peek_ws(args.workspace).env("ANTHROPIC_API_KEY"))
     with stage_run(args, stage=STAGE, require_examples=_require_examples) as ctx:
         ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
+        # WorkspacePolicy centralizes mode-driven defaults (item 10).
+        from core.workspace_policy import WorkspacePolicy
+        policy = WorkspacePolicy.from_workspace_and_args(ws, args)
         batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         banned = (ws.company.get("founder_voice") or {}).get("banned_phrases", []) or []
         target_sectors = {
@@ -1470,7 +1473,7 @@ def main() -> int:
                     "founder_email"
                 ),
                 partner_email=None,  # partner email is optional at CSV stage
-                allow_example_domains=args.allow_example_domains,
+                allow_example_domains=policy.allow_example_domains,
             )
             qa_fails.extend(prod_fails)
             # Batch 37 (#44): warn when an email body contains a URL that
