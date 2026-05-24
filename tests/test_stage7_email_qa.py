@@ -66,7 +66,12 @@ def test_batch_qa_failure_blocks_csv_publication():
             "spec = importlib.util.spec_from_file_location("
             f"'s7', {str(REPO_ROOT / 'scripts' / '07_generate_emails.py')!r})\n"
             "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-            "m.SIM_BODY_HARD = 0.0\n"  # any nonzero similarity becomes a failure
+            # Patch the canonical location AND the Stage 7 re-export (the
+            # constant lives in core.email.batch_qa now). Any nonzero
+            # similarity becomes a hard failure for the test.
+            "from core.email import batch_qa as _bq\n"
+            "_bq.SIM_BODY_HARD = 0.0\n"
+            "m.SIM_BODY_HARD = 0.0\n"
             f"sys.argv = ['s7', '--workspace', {ws!r}, '--top', '5']\n"
             "raise SystemExit(m.main())\n"
         )
