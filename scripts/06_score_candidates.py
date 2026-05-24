@@ -26,7 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
@@ -774,10 +774,36 @@ def main() -> int:
                 run.failed += 1
                 run.log_error(p.partner_id, type(exc).__name__, str(exc))
 
-        print(
-            f"[stage 6] {recommended_count} partners recommended_to_send "
-            f"(criteria 1-9; Stage 7 finalizes)"
-        )
+        # Batch 28 (#358/#359/#360): when --partner-id was used, the
+        # legacy summary line said "N partners recommended_to_send" using
+        # `recommended_count` which only counted partners scored THIS RUN.
+        # That number is confusingly small when a filter was applied.
+        # Now we report both a run-scoped count AND the global total from
+        # the table, and we mark filtered runs explicitly so the audit
+        # is unambiguous.
+        if partner_id_filter:
+            with engine.begin() as conn:
+                total_recommended = conn.execute(
+                    select(func.count()).select_from(partner_score_summaries)
+                    .where(partner_score_summaries.c.recommended_to_send.is_(True))
+                ).scalar() or 0
+            print(
+                f"[stage 6] FILTER MODE (--partner-id): scored "
+                f"{run.succeeded} of {len(partner_id_filter)} requested "
+                f"partner(s); {recommended_count} of those are now "
+                f"recommended_to_send. Workspace total: "
+                f"{total_recommended} recommended."
+            )
+            run.note(
+                f"filter mode: requested={len(partner_id_filter)} "
+                f"scored={run.succeeded} run_recommended={recommended_count} "
+                f"workspace_recommended={total_recommended}"
+            )
+        else:
+            print(
+                f"[stage 6] {recommended_count} partners recommended_to_send "
+                f"(criteria 1-9; Stage 7 finalizes)"
+            )
         print(f"[stage 6] llm stub mode: {llm.stub}")
         # Batch 11 (#357): previously returned 0 even when per-partner
         # exceptions had landed in run.failed -- cron / wrapping scripts

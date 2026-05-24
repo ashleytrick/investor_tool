@@ -34,7 +34,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 5 verify + quality.")
     add_workspace_arg(parser)
     parser.add_argument("--force", action="store_true",
-                        help="Re-verify and re-score every signal, not just unprocessed.")
+                        help="Re-verify and re-score every signal, not just "
+                             "unprocessed. With --offline this is fast because "
+                             "no live fetches happen (Batch 28 #353).")
+    parser.add_argument(
+        "--offline", action="store_true",
+        help="Skip live fetch; verify only against captured snapshots "
+             "(Batch 28 #354). Use when the network is unreliable or you "
+             "want to validate that snapshots alone still match. Marks "
+             "snapshot-only verifications with method='snapshot_fallback' "
+             "and unresolved cases with method='no_snapshot_offline' or "
+             "'quote_not_in_snapshot' so the audit reads cleanly.",
+    )
     parser.add_argument(
         "--allow-verification-rate-outside-band", action="store_true",
         help="Bypass the 50-80% live-mode verification-rate gate. Requires "
@@ -81,7 +92,8 @@ def main() -> int:
             run.processed += 1
             try:
                 ver = verify_signal(
-                    engine, s.source_url, s.quoted_text, s.snapshot_id
+                    engine, s.source_url, s.quoted_text, s.snapshot_id,
+                    offline=args.offline,
                 )
                 method_counts[ver.verification_method] = (
                     method_counts.get(ver.verification_method, 0) + 1
@@ -155,11 +167,14 @@ def main() -> int:
         sample_too_small = run.processed < 10
         if in_band:
             print("[stage 5] verification rate within 50-80% expected band")
-        elif llm.stub or sample_too_small:
+        elif llm.stub or sample_too_small or args.offline:
+            # Batch 28: offline runs verify only against snapshots, so the
+            # rate is dominated by snapshot availability, not LLM
+            # hallucination -- the band check doesn't apply.
             print(
                 "[stage 5] verification rate outside 50-80% band -- "
-                "expected for fixture runs (clean snapshots) or small "
-                f"samples (n={run.processed}); not enforced."
+                "expected for fixture runs (clean snapshots), small "
+                f"samples (n={run.processed}), or --offline mode; not enforced."
             )
         elif args.allow_verification_rate_outside_band:
             note = (

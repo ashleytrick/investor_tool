@@ -60,12 +60,22 @@ def verify_signal(
     source_url: str,
     quoted_text: str,
     snapshot_id: Optional[int],
+    *,
+    offline: bool = False,
 ) -> VerificationResult:
-    """Apply the live-then-snapshot gauntlet to one signal."""
-    # 1. Live fetch.
-    live_text = asyncio.run(_fetch_short(source_url))
-    if live_text and substring_match(quoted_text, live_text):
-        return VerificationResult(True, "live_match")
+    """Apply the live-then-snapshot gauntlet to one signal.
+
+    Batch 28 (#354): `offline=True` SKIPS the live fetch and verifies
+    only against the captured snapshot. Useful when (a) the operator
+    is on a flaky network, (b) the source sites all rate-limit them,
+    or (c) running Stage 5 inside a sandbox without outbound network.
+    """
+    # 1. Live fetch (skipped in offline mode).
+    live_text: Optional[str] = None
+    if not offline:
+        live_text = asyncio.run(_fetch_short(source_url))
+        if live_text and substring_match(quoted_text, live_text):
+            return VerificationResult(True, "live_match")
 
     # 2. Snapshot fallback — trusted only when the signal points to a snapshot
     # captured during extraction.
@@ -80,6 +90,18 @@ def verify_signal(
         return VerificationResult(True, "snapshot_fallback")
 
     # 3. Failure cases.
+    if offline:
+        # In offline mode "no snapshot" is its own distinguishable reason
+        # so the operator knows re-running with network would help.
+        if snap_text is None:
+            return VerificationResult(
+                False, "no_snapshot_offline",
+                "offline mode: no snapshot for this signal",
+            )
+        return VerificationResult(
+            False, "quote_not_in_snapshot",
+            "offline mode: quote not found in snapshot",
+        )
     if live_text is None and snap_text is None:
         return VerificationResult(False, "url_failed",
                                   "live fetch failed and no usable snapshot")

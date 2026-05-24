@@ -1665,6 +1665,77 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch28_stage5_offline_mode():
+    """Inventory #354: Stage 5 --offline skips live fetch and verifies
+    only against captured snapshots."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        # --offline run.
+        _run("05_verify_and_quality.py", "--workspace", ws, "--offline",
+             cwd=REPO_ROOT)
+        c = sqlite3.connect(db)
+        # Every verification should use snapshot_fallback (or one of the
+        # offline-failure methods); none should be live_match.
+        methods = c.execute(
+            "select distinct verification_method from signals"
+        ).fetchall()
+        c.close()
+        method_set = {m[0] for m in methods}
+        assert "live_match" not in method_set, (
+            f"offline mode must not produce live_match; got {method_set}"
+        )
+        assert "snapshot_fallback" in method_set, (
+            f"offline mode should produce snapshot_fallback; got {method_set}"
+        )
+
+
+def test_batch28_stage6_filter_mode_audit():
+    """Inventory #358/#359/#360: Stage 6 with --partner-id surfaces the
+    filter explicitly in stdout + run.note instead of misleading the
+    operator with a workspace-wide recommended count."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+
+        pid = "northbeam.example_priya_anand"
+        res = _run(
+            "06_score_candidates.py", "--workspace", ws,
+            "--partner-id", pid, cwd=REPO_ROOT,
+        )
+        assert "FILTER MODE" in res.stdout, (
+            f"filter-mode summary missing; stdout=\n{res.stdout}"
+        )
+        c = sqlite3.connect(db)
+        note = c.execute(
+            "select error_summary from runs "
+            "where stage='06_score_candidates' order by run_id desc limit 1"
+        ).fetchone()[0]
+        c.close()
+        assert note and "filter mode" in note
+
+
 def test_batch27_stage3_unresolved_partner_audit():
     """Inventory #345: when Stage 3's LLM names a partner the local DB
     doesn't know about, the partner-level attribution is correctly
