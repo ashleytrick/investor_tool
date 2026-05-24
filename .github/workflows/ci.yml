@@ -9,10 +9,6 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -46,32 +42,3 @@ jobs:
           name: pytest-log
           path: pytest.log
           if-no-files-found: warn
-      - name: Post pytest tail to PR on failure
-        if: failure() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          PR="${{ github.event.pull_request.number }}"
-          if [ ! -f pytest.log ]; then
-            echo "pytest.log missing; nothing to post"
-            exit 0
-          fi
-          BODY_FILE=$(mktemp)
-          {
-            echo "### smoke CI failure on \`${GITHUB_SHA::7}\`"
-            echo ""
-            echo "Tail of pytest output:"
-            echo '```'
-            tail -150 pytest.log
-            echo '```'
-          } > "$BODY_FILE"
-          PAYLOAD=$(jq -Rs '{body: .}' < "$BODY_FILE")
-          echo "Posting comment to PR $PR (payload bytes: ${#PAYLOAD})"
-          RESPONSE=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-            -d "$PAYLOAD")
-          echo "$RESPONSE" | tail -3
