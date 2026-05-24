@@ -7,7 +7,6 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import csv
 import pathlib
 import sys
 from datetime import datetime, timezone
@@ -18,6 +17,9 @@ from sqlalchemy import select
 
 from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
+from core.csv_ingest import (
+    CsvIngestSchema, ingest_csv, in_set, looks_like_email, require_field,
+)
 from core.db import get_engine, partners
 from core.runs import RunLogger
 from core.validate_config import _looks_like_email
@@ -52,28 +54,50 @@ def main() -> int:
         rows: list[tuple[str, str]] = []
         if args.from_csv:
             path = pathlib.Path(args.from_csv)
-            if not path.exists():
-                print(f"[set_partner_email] file not found: {path}")
+            # core/csv_ingest (Refactor item 4) handles header validation,
+            # row-level partner_id + email shape checks, and produces a
+            # RowError per bad row. Failures land in run_errors and bump
+            # run.failed via the loop below.
+            schema = CsvIngestSchema(
+                required_headers={"partner_id", "email"},
+                row_validators=(
+                    require_field("partner_id"),
+                    require_field("email"),
+                    in_set("partner_id", known,
+                           error_type="unknown_partner"),
+                    looks_like_email("email"),
+                ),
+            )
+            result = ingest_csv(path, schema)
+            if not path.exists() or result.missing_headers:
+                msg = (
+                    f"file not found: {path}" if not path.exists()
+                    else f"CSV missing required column(s): "
+                         f"{result.missing_headers}"
+                )
+                print(f"[set_partner_email] {msg}")
+                run.note(msg)
                 run.failed = 1
                 return 2
-            with path.open(encoding="utf-8") as fh:
-                for r in csv.DictReader(fh):
-                    pid = (r.get("partner_id") or "").strip()
-                    email = (r.get("email") or "").strip()
-                    if pid and email:
-                        rows.append((pid, email))
+            for err in result.row_errors:
+                run.log_error(err.record_id, err.error_type, err.message)
+                run.failed += 1
+                print(
+                    f"[set_partner_email] row {err.row_num}: "
+                    f"{err.error_type}: {err.message}"
+                )
+            rows = [(r["partner_id"], r["email"]) for r in result.rows]
         else:
             rows = [(args.partner_id, args.email)]
 
         with engine.begin() as conn:
             for pid, email in rows:
                 with run.attempt():
+                    # Single-record path still needs the same checks; CSV
+                    # path has already validated its rows via ingest_csv.
                     if pid not in known:
                         run.fail(pid, "unknown_partner", "not in partners table")
                         continue
-                    # Batch 35: validate email shape before writing. A typo
-                    # ("priya at northbeam") used to write garbage that only
-                    # failed at Gmail draft time with a cryptic API error.
                     if not _looks_like_email(email):
                         run.fail(
                             pid, "invalid_email",
