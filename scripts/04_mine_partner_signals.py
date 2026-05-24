@@ -405,10 +405,18 @@ def main() -> int:
                     continue
                 try:
                     # Snapshot each source; remember url -> snapshot_id.
+                    # `final_url` is populated by the live fetch path
+                    # (Batch 36 #14) and absent in fixture mode; pass it
+                    # through so source_snapshots.final_url captures the
+                    # post-redirect URL on successful snapshots, not just
+                    # on the failure path.
                     url_to_snap: dict[str, int] = {}
                     content_parts: list[str] = []
                     for src in entry.get("sources", []):
-                        sid = upsert_snapshot(engine, src["source_url"], src["text"])
+                        sid = upsert_snapshot(
+                            engine, src["source_url"], src["text"],
+                            final_url=src.get("final_url"),
+                        )
                         url_to_snap[src["source_url"]] = sid
                         content_parts.append(
                             f'--- {src["source_url"]} ({src["source_type"]}, '
