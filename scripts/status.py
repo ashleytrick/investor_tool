@@ -163,6 +163,34 @@ def main() -> int:
             ).order_by(desc(run_errors.c.error_id)).limit(5)
         ))
 
+    # Batch 25 (#489-#495, #498): denser draft / outcome / learning view.
+    with engine.begin() as conn:
+        n_recommended_with_draft = conn.execute(
+            select(func.count(func.distinct(email_drafts.c.partner_id)))
+            .where(email_drafts.c.is_recommended.is_(True))
+        ).scalar() or 0
+        n_drafts_fail = conn.execute(
+            select(func.count()).select_from(email_drafts)
+            .where(email_drafts.c.qa_status == "fail")
+        ).scalar() or 0
+        latest_csv_write = conn.execute(
+            select(func.max(email_drafts.c.written_to_csv_at))
+        ).scalar()
+        # outcomes freshness
+        latest_outcome_sync = conn.execute(
+            select(func.max(outcomes.c.synced_from_attio_at))
+        ).scalar()
+        # latest learning run + suggestion summary
+        from core.db import learning_runs as _lr
+        latest_learning = conn.execute(
+            select(
+                _lr.c.generated_at, _lr.c.terminal_outcomes,
+                _lr.c.suggestions_written,
+            )
+            .order_by(desc(_lr.c.run_id)).limit(1)
+        ).first()
+    n_recommended_missing_draft = max(0, n_recommended - n_recommended_with_draft)
+
     print()
     print("== Pipeline counts ==")
     print(f"  funds:                  {n_funds} (active: {n_active_funds})")
@@ -176,9 +204,23 @@ def main() -> int:
           f"(recommended_to_send: {n_recommended})")
     print(f"  manual overrides:       score={n_score_override} "
           f"recommended={n_rec_override}")
-    print(f"  email_drafts (total):   {n_drafts}")
-    print(f"  outcomes recorded:      {n_outcomes}")
+    print(f"  email_drafts:           {n_drafts} total | "
+          f"recommended partners with draft: {n_recommended_with_draft} | "
+          f"qa_status=fail: {n_drafts_fail}")
+    if n_recommended_missing_draft:
+        print(
+            f"  ! {n_recommended_missing_draft} recommended partner(s) "
+            f"have no draft -- run scripts/07_generate_emails.py"
+        )
+    print(f"  outcomes recorded:      {n_outcomes} "
+          f"(latest sync: {_fmt_ts(latest_outcome_sync)})")
     print(f"  pending axis suggestions:{n_pending_suggestions}")
+    if latest_learning:
+        print(
+            f"  last learning run:      {_fmt_ts(latest_learning.generated_at)} "
+            f"(terminal outcomes={latest_learning.terminal_outcomes or 0}, "
+            f"suggestions written={latest_learning.suggestions_written or 0})"
+        )
 
     print()
     print("== Last run per stage ==")
@@ -214,8 +256,32 @@ def main() -> int:
     print()
     print("== CSV review queue ==")
     if csv_path.exists():
-        n_rows = sum(1 for _ in csv_path.open(encoding="utf-8")) - 1  # minus header
-        print(f"  {csv_path} ({n_rows} row(s))")
+        # Batch 25 (#492/#494/#495): show ready_to_send vs draft split
+        # from the file itself + the most recent generation timestamp.
+        ready_count = 0
+        draft_count = 0
+        warm_count = 0
+        total_rows = 0
+        with csv_path.open(encoding="utf-8") as fh:
+            import csv as _csv
+            for r in _csv.DictReader(fh):
+                total_rows += 1
+                st = r.get("outreach_status") or ""
+                if st == "ready_to_send":
+                    ready_count += 1
+                elif st == "warm_path_needed":
+                    warm_count += 1
+                else:
+                    draft_count += 1
+        mtime = datetime.fromtimestamp(csv_path.stat().st_mtime)
+        print(
+            f"  {csv_path} ({total_rows} row(s); ready_to_send={ready_count} "
+            f"draft={draft_count} warm_path_needed={warm_count})"
+        )
+        print(f"  written at:          {mtime:%Y-%m-%d %H:%M}")
+        if latest_csv_write and total_rows > 0:
+            print(f"  drafts last marked written_to_csv_at: "
+                  f"{_fmt_ts(latest_csv_write)}")
     else:
         print(f"  not yet written ({csv_path})")
 
