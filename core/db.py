@@ -142,6 +142,10 @@ source_snapshots = Table(
     "source_snapshots", metadata,
     Column("snapshot_id", Integer, primary_key=True, autoincrement=True),
     Column("source_url", Text, nullable=False),
+    # Batch 29 (#326): final_url after redirect resolution. The verifier
+    # and any future re-fetch step should hit final_url; source_url is
+    # kept for traceability ("what did the operator originally configure").
+    Column("final_url", Text),
     Column("fetched_at", DateTime, nullable=False),
     Column("http_status", Integer),
     Column("content_hash", Text),

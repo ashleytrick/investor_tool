@@ -44,7 +44,15 @@ def substring_match(quote: str, text: str) -> bool:
 
 
 async def _fetch_short(url: str) -> Optional[str]:
-    """Single-attempt fetch with a short timeout. Returns None on any failure."""
+    """Single-attempt fetch with a short timeout. Returns None on any failure.
+
+    Batch 29 (#327): follows redirects (it already did via httpx defaults
+    when follow_redirects=True). The final URL after redirects is
+    available via resp.url but not surfaced today; the verifier only
+    needs the page text. If a future Stage 5 wants to record where the
+    quote was actually found, it can use HttpClient.fetch() instead
+    (whose FetchResult.final_url is populated).
+    """
     try:
         async with httpx.AsyncClient(timeout=VERIFY_TIMEOUT_S, follow_redirects=True) as c:
             r = await c.get(url, headers={"User-Agent": "investor-outreach/verifier"})

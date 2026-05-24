@@ -1665,6 +1665,27 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch29_fetch_result_final_url():
+    """Inventory #325: FetchResult carries final_url alongside the
+    requested url, so callers persisting provenance can record the
+    canonical URL after redirects."""
+    from core.http_client import FetchResult
+
+    r = FetchResult(url="http://x", status=200, text="ok",
+                    final_url="https://x.com/")
+    assert r.url == "http://x"
+    assert r.final_url == "https://x.com/"
+
+    # Backward compat: final_url defaults to "" if not supplied (old
+    # callers that constructed FetchResult without it don't break).
+    r2 = FetchResult(url="http://y", status=200, text="ok")
+    assert r2.final_url == ""
+
+    # source_snapshots schema has the column.
+    from core.db import source_snapshots
+    assert "final_url" in {c.name for c in source_snapshots.columns}
+
+
 def test_batch28_stage5_offline_mode():
     """Inventory #354: Stage 5 --offline skips live fetch and verifies
     only against captured snapshots."""
