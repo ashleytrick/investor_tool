@@ -82,8 +82,14 @@ class RunLogger:
         """Bracket one per-record processing block. Increments .processed
         on entry. Caller decides the outcome via .succeed(), .skip(reason),
         or .fail(record_id, type, msg). If neither is called and no
-        exception was raised inside the block, the attempt is implicitly
-        treated as succeeded -- this matches the most common loop shape.
+        exception escaped the block, the attempt is implicitly treated as
+        succeeded -- this matches the most common loop shape.
+
+        If an UNCAUGHT exception escapes the block, the attempt is counted
+        as a fail and a run_errors row is written. Callers that want to
+        attach a record_id should catch the exception themselves and call
+        run.fail(record_id, type, msg) -- the implicit-fail path uses
+        record_id="?" because there's no per-record context available.
 
         Usage:
             for partner in partners:
@@ -95,7 +101,6 @@ class RunLogger:
                 with run.attempt():
                     try:
                         do_work(partner)
-                        run.succeed()
                     except KnownError as e:
                         run.fail(partner.id, type(e).__name__, str(e))
         """
@@ -103,9 +108,25 @@ class RunLogger:
         self._attempt_resolved = False
         try:
             yield self
+        except BaseException as exc:
+            # Finding 3: previously the finally-only path counted an
+            # uncaught exception as a SUCCESS because _attempt_resolved
+            # was still False. That silently turned crashes into greens.
+            # Mark as fail and re-raise so the loop's outer except (if
+            # any) still sees the exception.
+            if not self._attempt_resolved:
+                self.failed += 1
+                self._attempt_resolved = True
+                # Best-effort audit. record_id is unknown at this layer.
+                try:
+                    self.log_error("?", type(exc).__name__, str(exc))
+                except Exception:  # noqa: BLE001
+                    # Logging itself failed -- don't mask the original.
+                    pass
+            raise
         finally:
             if not self._attempt_resolved:
-                # Implicit success when the block exited cleanly.
+                # Clean exit (no exception, no explicit outcome).
                 self.succeeded += 1
             self._attempt_resolved = False
 

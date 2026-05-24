@@ -1724,6 +1724,23 @@ def test_refactor_batch_c_runlogger_accounting():
             assert ctx.run.is_clean() is True
         assert ctx.exit_code == 0
 
+        # Uncaught exception inside attempt() must count as fail, not
+        # succeed (regression test for the implicit-success bug where
+        # the finally-only path treated unresolved attempts as wins).
+        with stage_run(args, stage="test_accounting_uncaught",
+                       require_llm=False) as ctx:
+            for i in range(3):
+                try:
+                    with ctx.run.attempt():
+                        if i == 1:
+                            raise RuntimeError("boom")
+                except RuntimeError:
+                    pass
+            assert ctx.run.processed == 3
+            assert ctx.run.succeeded == 2
+            assert ctx.run.failed == 1
+        assert ctx.exit_code == 2
+
 
 def test_refactor_batch_a_stage_runner_basic():
     """Refactor Batch A: stage_run() context manager. Smoke-test the
