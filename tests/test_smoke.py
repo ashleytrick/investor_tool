@@ -1665,6 +1665,110 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch26_do_not_contact_and_new_clis():
+    """Inventory #441, #684, #687, #692-#695: do_not_contact flag, warm-
+    path contact edit without flag flip, and list_partners_for_action."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Pick a currently-recommended partner.
+        c = sqlite3.connect(db)
+        pid = c.execute(
+            "select partner_id from partner_score_summaries "
+            "where recommended_to_send=1 limit 1"
+        ).fetchone()[0]
+        c.close()
+
+        # #441/#684: set do_not_contact, re-run Stage 6, expect demotion.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_do_not_contact.py"),
+             "--workspace", ws, "--partner-id", pid,
+             "--reason", "conflict of interest"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        rec, summary = c.execute(
+            "select recommended_to_send, kill_signal_summary "
+            "from partner_score_summaries where partner_id=?", (pid,),
+        ).fetchone()
+        c.close()
+        assert rec == 0, "do_not_contact partner must not be recommended"
+        assert "do_not_contact" in (summary or ""), (
+            f"kill_signal_summary should mention do_not_contact; "
+            f"got {summary!r}"
+        )
+
+        # Clear the flag, re-run, expect recommendation restored (if it
+        # was the only blocker -- the fixture partners are otherwise
+        # qualified so this should work).
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_do_not_contact.py"),
+             "--workspace", ws, "--partner-id", pid, "--clear"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        rec_again = c.execute(
+            "select recommended_to_send from partner_score_summaries "
+            "where partner_id=?", (pid,),
+        ).fetchone()[0]
+        c.close()
+        assert rec_again == 1
+
+        # #687: set_warm_path_contact updates contact text without
+        # flipping warm_path_available.
+        # First, set warm-path via manual_override to get the flag on.
+        subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "manual_override.py"),
+             "--workspace", ws, "--partner-id", pid, "--warm-path",
+             "--reason", "warm intro",
+             "--warm-path-contact", "ashley@example.com"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        # Now update only the contact text.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_warm_path_contact.py"),
+             "--workspace", ws, "--partner-id", pid,
+             "--contact", "Jane via Series B board (chair)"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        c = sqlite3.connect(db)
+        flag, contact = c.execute(
+            "select warm_path_available, warm_path_contact "
+            "from partners where partner_id=?", (pid,),
+        ).fetchone()
+        c.close()
+        assert flag == 1, "warm_path_available should still be TRUE"
+        assert contact == "Jane via Series B board (chair)"
+
+        # #692: list_partners_for_action --high-priority-no-email.
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "list_partners_for_action.py"),
+             "--workspace", ws, "--high-priority-no-email", "--json"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        rows = json.loads(res.stdout)
+        # Fixture partners don't have email set; expect several rows.
+        assert isinstance(rows, list) and rows
+
+
 def test_batch24_sector_matching_false_positives():
     """Inventory #419/#420/#422: word-boundary matching avoids substring
     false positives ("ai" in "stairwell", "art" in "smart") and sector

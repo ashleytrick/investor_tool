@@ -105,6 +105,12 @@ partners = Table(
     # No CASCADE on partners.fund_id: removing a fund shouldn't silently
     # nuke its partner rows. Just declare the relationship.
     Column("fund_id", Text, ForeignKey("funds.fund_id")),
+    # Batch 26 (#441, #684): per-partner do-not-contact flag. Stage 6
+    # treats this as a major_kill and Stage 7 routes to outreach_status=
+    # do_not_contact. Distinct from warm_path_available because warm-path
+    # is "use the warm channel"; do_not_contact is "use no channel".
+    Column("do_not_contact", Boolean, default=False),
+    Column("do_not_contact_reason", Text),
     Column("name", Text, nullable=False),
     Column("title", Text),
     Column("linkedin_url", Text),

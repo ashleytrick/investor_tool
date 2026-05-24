@@ -625,6 +625,10 @@ def main() -> int:
                 # non-empty extracted kill_signals string as a kill.
                 fund_kill_signals_str = (fund.kill_signals or "").strip()
                 fund_has_kill = bool(fund_kill_signals_str)
+                # Batch 26 (#441/#684): per-partner do_not_contact flag.
+                # getattr() guards against older partners rows that pre-
+                # date the column.
+                do_not_contact = bool(getattr(p, "do_not_contact", False))
                 major_kill = (
                     rf.disqualifier_present
                     or (p.employment_status == "left_fund")
@@ -633,6 +637,7 @@ def main() -> int:
                         and rf.components.get("active_fund", 0) == 0
                     )
                     or fund_has_kill
+                    or do_not_contact
                 )
                 kill_summary_parts: list[str] = []
                 if rf.triggered_disqualifiers:
@@ -640,6 +645,11 @@ def main() -> int:
                 if fund_has_kill:
                     kill_summary_parts.append(
                         f"fund kill_signals: {fund_kill_signals_str}"
+                    )
+                if do_not_contact:
+                    kill_summary_parts.append(
+                        f"do_not_contact: "
+                        f"{(getattr(p, 'do_not_contact_reason', None) or '-')}"
                     )
                 kill_summary = "; ".join(kill_summary_parts) if major_kill else ""
 
