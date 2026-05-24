@@ -60,6 +60,17 @@ def main() -> int:
              "has `mode: fixture` -- prevents accidental Gmail drafts of "
              "fictional partners.",
     )
+    # Mirror Stage 8's --require-attio: when an operator depends on
+    # Gmail drafting as part of production delivery, missing Gmail
+    # config should be a HARD failure, not a quiet skip. ws.mode ==
+    # "prod" also implies require-gmail so a prod cron can't quietly
+    # skip the draft step without the operator noticing.
+    parser.add_argument(
+        "--require-gmail", action="store_true",
+        help="Refuse to skip when Gmail isn't linked for the workspace. "
+             "Use in production cron entries that depend on draft "
+             "creation; missing creds become a fail instead of a skip.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -78,6 +89,7 @@ def main() -> int:
     # the "Gmail not linked, skipping" outcome lands in `runs` with
     # records_skipped=1 instead of writing no run row at all. status.py
     # + the operator can then see when this stage was last attempted.
+    require_gmail = args.require_gmail or ws.mode == "prod"
     try:
         gmail = GmailClient.from_workspace(ws)
     except GmailNotConfigured:
@@ -87,10 +99,17 @@ def main() -> int:
                 f"uv run scripts/connect_gmail.py "
                 f"--workspace {args.workspace or ws.path}"
             )
-            print(f"[gmail_drafts] {msg}")
-            run.note(msg)
-            run.skipped = 1
-        return 0
+            if require_gmail:
+                # Prod-mode (or explicit --require-gmail): missing creds
+                # is a fail, not a skip, so cron / wrappers notice.
+                print(f"[gmail_drafts] REFUSED: {msg}")
+                run.note(f"REFUSED: {msg}")
+                run.failed = 1
+            else:
+                print(f"[gmail_drafts] {msg}")
+                run.note(msg)
+                run.skipped = 1
+        return 2 if require_gmail else 0
 
     with RunLogger(engine, ws.name, STAGE) as run:
         with engine.begin() as conn:
