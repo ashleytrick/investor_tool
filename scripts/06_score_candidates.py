@@ -507,313 +507,311 @@ def main() -> int:
 
         recommended_count = 0
         for p in partner_rows:
-            run.processed += 1
-            if partner_id_filter and p.partner_id not in partner_id_filter:
-                run.skipped += 1
-                continue
+            with run.attempt():
+                if partner_id_filter and p.partner_id not in partner_id_filter:
+                    run.skip()
+                    continue
 
-            # Manual override gate: routine runs never overwrite a partner whose
-            # user-set flags are True. --force-rescore --reason bypasses this and
-            # logs every changed field to force_refresh_log.
-            with engine.begin() as conn:
-                existing = conn.execute(
-                    select(partner_score_summaries).where(
-                        partner_score_summaries.c.partner_id == p.partner_id
-                    )
-                ).first()
-            existing_score_override = bool(
-                existing and existing.manual_score_override
-            )
-            existing_rec_override = bool(
-                existing and existing.manual_recommended_override
-            )
-            if (
-                (existing_score_override or existing_rec_override)
-                and not args.force_rescore
-            ):
-                run.skipped += 1
-                print(
-                    f"[stage 6] {p.partner_id}: manual override set "
-                    f"(score={existing_score_override}, "
-                    f"recommended={existing_rec_override}); "
-                    "skipping. Use --force-rescore --reason \"...\" to overwrite."
+                # Manual override gate: routine runs never overwrite a partner whose
+                # user-set flags are True. --force-rescore --reason bypasses this and
+                # logs every changed field to force_refresh_log.
+                with engine.begin() as conn:
+                    existing = conn.execute(
+                        select(partner_score_summaries).where(
+                            partner_score_summaries.c.partner_id == p.partner_id
+                        )
+                    ).first()
+                existing_score_override = bool(
+                    existing and existing.manual_score_override
                 )
-                continue
+                existing_rec_override = bool(
+                    existing and existing.manual_recommended_override
+                )
+                if (
+                    (existing_score_override or existing_rec_override)
+                    and not args.force_rescore
+                ):
+                    run.skip()
+                    print(
+                        f"[stage 6] {p.partner_id}: manual override set "
+                        f"(score={existing_score_override}, "
+                        f"recommended={existing_rec_override}); "
+                        "skipping. Use --force-rescore --reason \"...\" to overwrite."
+                    )
+                    continue
 
-            try:
-                p_signals = verified_signals_by_partner.get(p.partner_id, [])
-                if not p_signals:
-                    # Stale-state invalidation (Findings 1 + 3): if a partner
-                    # has no qualifying signals, remove their stale summary
-                    # + scores so downstream stages don't carry yesterday's
-                    # decision forward. Preserve rows that the operator has
-                    # explicitly pinned with a manual override.
-                    if existing and not (
+                try:
+                    p_signals = verified_signals_by_partner.get(p.partner_id, [])
+                    if not p_signals:
+                        # Stale-state invalidation (Findings 1 + 3): if a partner
+                        # has no qualifying signals, remove their stale summary
+                        # + scores so downstream stages don't carry yesterday's
+                        # decision forward. Preserve rows that the operator has
+                        # explicitly pinned with a manual override.
+                        if existing and not (
+                            existing_score_override or existing_rec_override
+                        ):
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    partner_score_summaries.delete().where(
+                                        partner_score_summaries.c.partner_id
+                                        == p.partner_id
+                                    )
+                                )
+                                conn.execute(
+                                    scores.delete().where(
+                                        scores.c.partner_id == p.partner_id
+                                    )
+                                )
+                            run.note(
+                                f"invalidated stale summary for {p.partner_id} "
+                                f"(no current verified quality>=2 signals)"
+                            )
+                        run.skip()
+                        continue
+                    fund = fund_rows.get(p.fund_id)
+                    if fund is None:
+                        run.skip()
+                        run.log_error(p.partner_id, "no_fund", "fund row missing")
+                        continue
+
+                    fund_deals = deals_by_fund.get(p.fund_id, [])
+                    # Bound on BOTH sides: future-dated deals (bad parsing) must
+                    # not count as recent fund activity.
+                    fund_deals_18mo = [
+                        d for d in fund_deals
+                        if d.get("announcement_date")
+                        and cutoff_18mo <= d["announcement_date"] <= today
+                    ]
+                    fund_has_led_recently = len(fund_deals_18mo) > 0
+
+                    # Build context dicts the helpers expect.
+                    fund_dict = {
+                        "stated_stage_focus": fund.stated_stage_focus,
+                        "check_size_range": fund.check_size_range,
+                        "is_active": bool(fund.is_active),
+                    }
+                    partner_dict = {"title": p.title}
+
+                    # Stage 2: deterministic round_fit.
+                    rf = compute_round_fit(
+                        fund_dict, partner_dict, fund_deals_18mo,
+                        fund_has_led_recently, ws.company,
+                    )
+
+                    # Stage 3: deterministic lead_likelihood.
+                    ll = compute_lead_likelihood(
+                        partner_dict, partner_deals.get(p.partner_id, []), today,
+                    )
+
+                    # Stage 1: composite (LLM or stub).
+                    cs = score_candidate(
+                        llm,
+                        partner_row=p,
+                        fund_row=fund,
+                        verified_signals=p_signals,
+                        axes_cfg=ws.axes,
+                        company_cfg=ws.company,
+                        round_fit_score=rf.round_fit_score,
+                        lead_likelihood_score=ll.lead_likelihood_score,
+                    )
+                    composite, axis_max, variance, spiky, score_conf = composite_and_spikiness(
+                        cs, ws.axes
+                    )
+
+                    # cold_reachability_score: combines Stage-4 LLM partial (weight
+                    # 0.6 -> max contribution 6.0) with deterministic components:
+                    # post count in last 12mo (up to 2.0) and recency of last post
+                    # (up to 2.0). Max 10.0. Brief Step 4 also lists a contact-info
+                    # component derived from fund-site scraping; that lands when
+                    # Stage 2 enrichment persists contact-info presence.
+                    most_recent = max((s["date"] for s in p_signals if s.get("date")),
+                                      default=None)
+                    # Past-only counting: future-dated signals don't pad the
+                    # 12-month post count or the recency bonus.
+                    from core.dates import days_since, within_days
+                    post_count_12mo = sum(
+                        1 for s in p_signals
+                        if within_days(s.get("date"), 365, today)
+                    )
+                    if post_count_12mo >= 3:
+                        posts_pts = 2.0
+                    elif post_count_12mo >= 1:
+                        posts_pts = 1.0
+                    else:
+                        posts_pts = 0.0
+                    _mr = days_since(most_recent, today)
+                    if _mr is None:
+                        recency_pts = 0.0
+                    elif _mr <= 90:
+                        recency_pts = 2.0
+                    elif _mr <= 180:
+                        recency_pts = 1.0
+                    else:
+                        recency_pts = 0.0
+                    partial = p.cold_reachability_partial_score
+                    cold_reachability = (
+                        max(0.0, min(10.0, float(partial) * 0.6 + posts_pts + recency_pts))
+                        if partial is not None else None
+                    )
+
+                    # Major kill signal aggregation. components.get() rather than
+                    # bracket access so a future shape change in compute_round_fit
+                    # doesn't KeyError here.
+                    # fund.kill_signals (Stage 2 LLM extraction) was previously
+                    # stored but never consulted by Stage 6 -- a fund whose
+                    # extracted thesis said "pre-seed only" would NOT trigger
+                    # major_kill unless round_fit also caught it. Treat any
+                    # non-empty extracted kill_signals string as a kill.
+                    fund_kill_signals_str = (fund.kill_signals or "").strip()
+                    fund_has_kill = bool(fund_kill_signals_str)
+                    # Batch 26 (#441/#684): per-partner do_not_contact flag.
+                    # getattr() guards against older partners rows that pre-
+                    # date the column.
+                    do_not_contact = bool(getattr(p, "do_not_contact", False))
+                    major_kill = (
+                        rf.disqualifier_present
+                        or (p.employment_status == "left_fund")
+                        or (
+                            not fund.is_active
+                            and rf.components.get("active_fund", 0) == 0
+                        )
+                        or fund_has_kill
+                        or do_not_contact
+                    )
+                    kill_summary_parts: list[str] = []
+                    if rf.triggered_disqualifiers:
+                        kill_summary_parts.extend(rf.triggered_disqualifiers)
+                    if fund_has_kill:
+                        kill_summary_parts.append(
+                            f"fund kill_signals: {fund_kill_signals_str}"
+                        )
+                    if do_not_contact:
+                        kill_summary_parts.append(
+                            f"do_not_contact: "
+                            f"{(getattr(p, 'do_not_contact_reason', None) or '-')}"
+                        )
+                    kill_summary = "; ".join(kill_summary_parts) if major_kill else ""
+
+                    recency_bonus = signal_recency_bonus(most_recent, today)
+                    # Previously: `cold_reachability or 5.0` -- unknown reachability
+                    # silently inflated send_now_priority by ~2.5 points (0.5 weight
+                    # * 5.0), pushing partners with NO reachability data ABOVE
+                    # partners scored low. Treat unknown as 0 so the absence of
+                    # evidence doesn't masquerade as a mid-tier score.
+                    send_now = compute_send_now_priority(
+                        round_fit_score=rf.round_fit_score,
+                        lead_likelihood_score=ll.lead_likelihood_score,
+                        composite_fit_score=composite,
+                        cold_reachability_score=cold_reachability or 0.0,
+                        spiky_belief_score=spiky,
+                        recency_bonus=recency_bonus,
+                        major_kill=major_kill,
+                    )
+
+                    distinct_source_types = len({s["source_type"] for s in p_signals
+                                                 if s.get("source_type")})
+                    deal_count = len(partner_deals.get(p.partner_id, []))
+                    recommended, rec_reason = evaluate_recommended(
+                        composite=composite,
+                        round_fit_score=rf.round_fit_score,
+                        disqualifier_present=rf.disqualifier_present,
+                        lead_likelihood_score=ll.lead_likelihood_score,
+                        distinct_source_types=distinct_source_types,
+                        q2_plus_signal_count=len(p_signals),
+                        deal_attribution_count=deal_count,
+                        most_recent_signal_date=most_recent,
+                        employment_status=p.employment_status,
+                        major_kill=major_kill,
+                        cold_reachability_score=cold_reachability,
+                        warm_path_available=p.warm_path_available,
+                        latest_outcome=latest_outcome_by_partner.get(p.partner_id),
+                        latest_outcome_window_days=recent_outreach_window_days,
+                        today=today,
+                    )
+
+                    if recommended:
+                        recommended_count += 1
+
+                    # ---- build values dict; preserve overridden fields/flags ----
+                    new_values = {
+                        "partner_id": p.partner_id,
+                        "composite_fit_score": composite,
+                        "axis_max_score": axis_max,
+                        "axis_score_variance": variance,
+                        "spiky_belief_score": spiky,
+                        "score_confidence": score_conf,
+                        "verified_signal_count": all_verified_count_by_partner.get(
+                            p.partner_id, len(p_signals)
+                        ),
+                        "quality_2_plus_signal_count": len(p_signals),
+                        "distinct_source_type_count": distinct_source_types,
+                        "most_recent_signal_date": most_recent,
+                        "major_kill_signal_present": major_kill,
+                        "kill_signal_summary": kill_summary,
+                        "cold_reachability_score": cold_reachability,
+                        "round_fit_score": rf.round_fit_score,
+                        "round_fit_reasoning": rf.round_fit_reasoning,
+                        "lead_likelihood_score": ll.lead_likelihood_score,
+                        "lead_likelihood_signals": ll.lead_likelihood_signals,
+                        "send_now_priority": send_now,
+                        "employment_status": p.employment_status,
+                        "recommended_to_send": recommended,
+                        "recommendation_reasoning": rec_reason,
+                        "scored_at": _now(),
+                    }
+                    # Manual override flags + reason are preserved from existing
+                    # row (never silently reset by routine OR forced runs).
+                    new_values["manual_score_override"] = existing_score_override
+                    new_values["manual_recommended_override"] = existing_rec_override
+                    new_values["manual_override_reason"] = (
+                        existing.manual_override_reason if existing else None
+                    )
+                    # If --force-rescore reached an overridden record, log every
+                    # changed field to force_refresh_log before the upsert.
+                    if args.force_rescore and existing and (
                         existing_score_override or existing_rec_override
                     ):
                         with engine.begin() as conn:
-                            conn.execute(
-                                partner_score_summaries.delete().where(
-                                    partner_score_summaries.c.partner_id
-                                    == p.partner_id
-                                )
-                            )
-                            conn.execute(
-                                scores.delete().where(
-                                    scores.c.partner_id == p.partner_id
-                                )
-                            )
-                        run.note(
-                            f"invalidated stale summary for {p.partner_id} "
-                            f"(no current verified quality>=2 signals)"
-                        )
-                    run.skipped += 1
-                    continue
-                fund = fund_rows.get(p.fund_id)
-                if fund is None:
-                    run.skipped += 1
-                    run.log_error(p.partner_id, "no_fund", "fund row missing")
-                    continue
-
-                fund_deals = deals_by_fund.get(p.fund_id, [])
-                # Bound on BOTH sides: future-dated deals (bad parsing) must
-                # not count as recent fund activity.
-                fund_deals_18mo = [
-                    d for d in fund_deals
-                    if d.get("announcement_date")
-                    and cutoff_18mo <= d["announcement_date"] <= today
-                ]
-                fund_has_led_recently = len(fund_deals_18mo) > 0
-
-                # Build context dicts the helpers expect.
-                fund_dict = {
-                    "stated_stage_focus": fund.stated_stage_focus,
-                    "check_size_range": fund.check_size_range,
-                    "is_active": bool(fund.is_active),
-                }
-                partner_dict = {"title": p.title}
-
-                # Stage 2: deterministic round_fit.
-                rf = compute_round_fit(
-                    fund_dict, partner_dict, fund_deals_18mo,
-                    fund_has_led_recently, ws.company,
-                )
-
-                # Stage 3: deterministic lead_likelihood.
-                ll = compute_lead_likelihood(
-                    partner_dict, partner_deals.get(p.partner_id, []), today,
-                )
-
-                # Stage 1: composite (LLM or stub).
-                cs = score_candidate(
-                    llm,
-                    partner_row=p,
-                    fund_row=fund,
-                    verified_signals=p_signals,
-                    axes_cfg=ws.axes,
-                    company_cfg=ws.company,
-                    round_fit_score=rf.round_fit_score,
-                    lead_likelihood_score=ll.lead_likelihood_score,
-                )
-                composite, axis_max, variance, spiky, score_conf = composite_and_spikiness(
-                    cs, ws.axes
-                )
-
-                # cold_reachability_score: combines Stage-4 LLM partial (weight
-                # 0.6 -> max contribution 6.0) with deterministic components:
-                # post count in last 12mo (up to 2.0) and recency of last post
-                # (up to 2.0). Max 10.0. Brief Step 4 also lists a contact-info
-                # component derived from fund-site scraping; that lands when
-                # Stage 2 enrichment persists contact-info presence.
-                most_recent = max((s["date"] for s in p_signals if s.get("date")),
-                                  default=None)
-                # Past-only counting: future-dated signals don't pad the
-                # 12-month post count or the recency bonus.
-                from core.dates import days_since, within_days
-                post_count_12mo = sum(
-                    1 for s in p_signals
-                    if within_days(s.get("date"), 365, today)
-                )
-                if post_count_12mo >= 3:
-                    posts_pts = 2.0
-                elif post_count_12mo >= 1:
-                    posts_pts = 1.0
-                else:
-                    posts_pts = 0.0
-                _mr = days_since(most_recent, today)
-                if _mr is None:
-                    recency_pts = 0.0
-                elif _mr <= 90:
-                    recency_pts = 2.0
-                elif _mr <= 180:
-                    recency_pts = 1.0
-                else:
-                    recency_pts = 0.0
-                partial = p.cold_reachability_partial_score
-                cold_reachability = (
-                    max(0.0, min(10.0, float(partial) * 0.6 + posts_pts + recency_pts))
-                    if partial is not None else None
-                )
-
-                # Major kill signal aggregation. components.get() rather than
-                # bracket access so a future shape change in compute_round_fit
-                # doesn't KeyError here.
-                # fund.kill_signals (Stage 2 LLM extraction) was previously
-                # stored but never consulted by Stage 6 -- a fund whose
-                # extracted thesis said "pre-seed only" would NOT trigger
-                # major_kill unless round_fit also caught it. Treat any
-                # non-empty extracted kill_signals string as a kill.
-                fund_kill_signals_str = (fund.kill_signals or "").strip()
-                fund_has_kill = bool(fund_kill_signals_str)
-                # Batch 26 (#441/#684): per-partner do_not_contact flag.
-                # getattr() guards against older partners rows that pre-
-                # date the column.
-                do_not_contact = bool(getattr(p, "do_not_contact", False))
-                major_kill = (
-                    rf.disqualifier_present
-                    or (p.employment_status == "left_fund")
-                    or (
-                        not fund.is_active
-                        and rf.components.get("active_fund", 0) == 0
-                    )
-                    or fund_has_kill
-                    or do_not_contact
-                )
-                kill_summary_parts: list[str] = []
-                if rf.triggered_disqualifiers:
-                    kill_summary_parts.extend(rf.triggered_disqualifiers)
-                if fund_has_kill:
-                    kill_summary_parts.append(
-                        f"fund kill_signals: {fund_kill_signals_str}"
-                    )
-                if do_not_contact:
-                    kill_summary_parts.append(
-                        f"do_not_contact: "
-                        f"{(getattr(p, 'do_not_contact_reason', None) or '-')}"
-                    )
-                kill_summary = "; ".join(kill_summary_parts) if major_kill else ""
-
-                recency_bonus = signal_recency_bonus(most_recent, today)
-                # Previously: `cold_reachability or 5.0` -- unknown reachability
-                # silently inflated send_now_priority by ~2.5 points (0.5 weight
-                # * 5.0), pushing partners with NO reachability data ABOVE
-                # partners scored low. Treat unknown as 0 so the absence of
-                # evidence doesn't masquerade as a mid-tier score.
-                send_now = compute_send_now_priority(
-                    round_fit_score=rf.round_fit_score,
-                    lead_likelihood_score=ll.lead_likelihood_score,
-                    composite_fit_score=composite,
-                    cold_reachability_score=cold_reachability or 0.0,
-                    spiky_belief_score=spiky,
-                    recency_bonus=recency_bonus,
-                    major_kill=major_kill,
-                )
-
-                distinct_source_types = len({s["source_type"] for s in p_signals
-                                             if s.get("source_type")})
-                deal_count = len(partner_deals.get(p.partner_id, []))
-                recommended, rec_reason = evaluate_recommended(
-                    composite=composite,
-                    round_fit_score=rf.round_fit_score,
-                    disqualifier_present=rf.disqualifier_present,
-                    lead_likelihood_score=ll.lead_likelihood_score,
-                    distinct_source_types=distinct_source_types,
-                    q2_plus_signal_count=len(p_signals),
-                    deal_attribution_count=deal_count,
-                    most_recent_signal_date=most_recent,
-                    employment_status=p.employment_status,
-                    major_kill=major_kill,
-                    cold_reachability_score=cold_reachability,
-                    warm_path_available=p.warm_path_available,
-                    latest_outcome=latest_outcome_by_partner.get(p.partner_id),
-                    latest_outcome_window_days=recent_outreach_window_days,
-                    today=today,
-                )
-
-                if recommended:
-                    recommended_count += 1
-
-                # ---- build values dict; preserve overridden fields/flags ----
-                new_values = {
-                    "partner_id": p.partner_id,
-                    "composite_fit_score": composite,
-                    "axis_max_score": axis_max,
-                    "axis_score_variance": variance,
-                    "spiky_belief_score": spiky,
-                    "score_confidence": score_conf,
-                    "verified_signal_count": all_verified_count_by_partner.get(
-                        p.partner_id, len(p_signals)
-                    ),
-                    "quality_2_plus_signal_count": len(p_signals),
-                    "distinct_source_type_count": distinct_source_types,
-                    "most_recent_signal_date": most_recent,
-                    "major_kill_signal_present": major_kill,
-                    "kill_signal_summary": kill_summary,
-                    "cold_reachability_score": cold_reachability,
-                    "round_fit_score": rf.round_fit_score,
-                    "round_fit_reasoning": rf.round_fit_reasoning,
-                    "lead_likelihood_score": ll.lead_likelihood_score,
-                    "lead_likelihood_signals": ll.lead_likelihood_signals,
-                    "send_now_priority": send_now,
-                    "employment_status": p.employment_status,
-                    "recommended_to_send": recommended,
-                    "recommendation_reasoning": rec_reason,
-                    "scored_at": _now(),
-                }
-                # Manual override flags + reason are preserved from existing
-                # row (never silently reset by routine OR forced runs).
-                new_values["manual_score_override"] = existing_score_override
-                new_values["manual_recommended_override"] = existing_rec_override
-                new_values["manual_override_reason"] = (
-                    existing.manual_override_reason if existing else None
-                )
-                # If --force-rescore reached an overridden record, log every
-                # changed field to force_refresh_log before the upsert.
-                if args.force_rescore and existing and (
-                    existing_score_override or existing_rec_override
-                ):
+                            for field, new_v in new_values.items():
+                                if field == "scored_at":
+                                    continue
+                                old_v = getattr(existing, field, None)
+                                if old_v != new_v:
+                                    conn.execute(force_refresh_log.insert().values(
+                                        partner_id=p.partner_id,
+                                        field_name=field,
+                                        old_value=str(old_v),
+                                        new_value=str(new_v),
+                                        reason=args.reason,
+                                        refreshed_at=_now(),
+                                    ))
                     with engine.begin() as conn:
-                        for field, new_v in new_values.items():
-                            if field == "scored_at":
+                        upsert(conn, partner_score_summaries, ["partner_id"], new_values)
+                        # Replace per-axis scores for this partner.
+                        conn.execute(delete(scores).where(scores.c.partner_id == p.partner_id))
+                        for ax_id, ax_data in cs.axis_scores.items():
+                            if ax_data.score is None:
                                 continue
-                            old_v = getattr(existing, field, None)
-                            if old_v != new_v:
-                                conn.execute(force_refresh_log.insert().values(
-                                    partner_id=p.partner_id,
-                                    field_name=field,
-                                    old_value=str(old_v),
-                                    new_value=str(new_v),
-                                    reason=args.reason,
-                                    refreshed_at=_now(),
-                                ))
-                with engine.begin() as conn:
-                    upsert(conn, partner_score_summaries, ["partner_id"], new_values)
-                    # Replace per-axis scores for this partner.
-                    conn.execute(delete(scores).where(scores.c.partner_id == p.partner_id))
-                    for ax_id, ax_data in cs.axis_scores.items():
-                        if ax_data.score is None:
-                            continue
-                        conn.execute(scores.insert().values(
-                            partner_id=p.partner_id,
-                            axis_id=ax_id,
-                            score=ax_data.score,
-                            supporting_signal_ids=json.dumps(ax_data.supporting_signal_ids),
-                            confidence=ax_data.confidence,
-                            scored_at=_now(),
-                        ))
+                            conn.execute(scores.insert().values(
+                                partner_id=p.partner_id,
+                                axis_id=ax_id,
+                                score=ax_data.score,
+                                supporting_signal_ids=json.dumps(ax_data.supporting_signal_ids),
+                                confidence=ax_data.confidence,
+                                scored_at=_now(),
+                            ))
 
-                run.succeeded += 1
-                print(
-                    f"[stage 6] {p.name}: composite={composite} "
-                    f"round_fit={rf.round_fit_score:.1f} "
-                    f"lead={ll.lead_likelihood_score:.1f} "
-                    f"reach={cold_reachability} "
-                    f"send_now={send_now:.2f} "
-                    f"recommended={recommended}"
-                )
-            except Exception as exc:  # noqa: BLE001 - logged, continue
-                run.failed += 1
-                run.log_error(p.partner_id, type(exc).__name__, str(exc))
+                    print(
+                        f"[stage 6] {p.name}: composite={composite} "
+                        f"round_fit={rf.round_fit_score:.1f} "
+                        f"lead={ll.lead_likelihood_score:.1f} "
+                        f"reach={cold_reachability} "
+                        f"send_now={send_now:.2f} "
+                        f"recommended={recommended}"
+                    )
+                except Exception as exc:  # noqa: BLE001 - logged, continue
+                    run.fail(p.partner_id, type(exc).__name__, str(exc))
 
         # Batch 28 (#358/#359/#360): when --partner-id was used, the
         # legacy summary line said "N partners recommended_to_send" using
