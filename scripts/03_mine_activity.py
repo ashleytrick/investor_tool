@@ -27,7 +27,9 @@ from sqlalchemy import delete, select
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
 from core.validate_config import preflight_or_exit
-from core.db import deal_attributions, funds, get_engine, partners
+from core.db import (
+    ambiguous_matches, deal_attributions, funds, get_engine, partners,
+)
 from core.http_client import HttpClient
 from core.ids import normalize_name, partner_id_for
 from core.llm.client import MODEL_BATCH, LLMClient
@@ -108,18 +110,55 @@ def _now() -> datetime:
 
 def match_fund(name: str | None, funds_by_name: dict[str, str]) -> str | None:
     """Resolve a fund name to a known fund_id. Exact normalized match, then fuzzy."""
+    fid, _candidates = match_fund_with_candidates(name, funds_by_name)
+    return fid
+
+
+# Batch 33 (#341/#342/#737/#738): ambiguous-match-aware fund lookup.
+# Returns (chosen_fund_id, candidates_list) where candidates is a list of
+# {id, name, score} for the top 3 fuzzy matches sorted by score desc.
+# Used by Stage 3 to detect "best match was 0.86 but second-best was
+# 0.85 -- this is ambiguous" and log to the ambiguous_matches table.
+FUND_NAME_AMBIGUITY_DELTA = 0.05  # within 5% of best => ambiguous
+FUND_NAME_AMBIGUITY_FLOOR = 0.70  # ignore candidates below 0.70
+
+
+def match_fund_with_candidates(
+    name: str | None, funds_by_name: dict[str, str],
+) -> tuple[str | None, list[dict]]:
     if not name:
-        return None
+        return None, []
     key = normalize_name(name)
     if key in funds_by_name:
-        return funds_by_name[key]
-    # Fuzzy fallback against known fund names.
-    best_id, best_score = None, 0.0
+        return funds_by_name[key], [{
+            "id": funds_by_name[key], "name": key, "score": 1.0,
+        }]
+    scored: list[tuple[str, str, float]] = []
     for known_name, fid in funds_by_name.items():
         score = token_set_similarity(key, known_name)
-        if score > best_score:
-            best_id, best_score = fid, score
-    return best_id if best_score >= FUND_NAME_FUZZY_THRESHOLD else None
+        if score >= FUND_NAME_AMBIGUITY_FLOOR:
+            scored.append((fid, known_name, score))
+    scored.sort(key=lambda x: -x[2])
+    candidates = [
+        {"id": fid, "name": nm, "score": round(score, 4)}
+        for fid, nm, score in scored[:3]
+    ]
+    if not scored:
+        return None, []
+    best_id, _best_name, best_score = scored[0]
+    if best_score < FUND_NAME_FUZZY_THRESHOLD:
+        return None, candidates
+    return best_id, candidates
+
+
+def _detect_ambiguity(candidates: list[dict]) -> bool:
+    """True when the top two candidates are within FUND_NAME_AMBIGUITY_DELTA
+    of each other (and both above the floor)."""
+    if len(candidates) < 2:
+        return False
+    top = candidates[0]["score"]
+    second = candidates[1]["score"]
+    return (top - second) < FUND_NAME_AMBIGUITY_DELTA
 
 
 def resolve_partner_id(
@@ -325,7 +364,41 @@ def main() -> int:
                     model=MODEL_BATCH,
                     stub_response=ann.get("_attribution"),
                 )
-                lead_fund_id = match_fund(deal.lead_investor, funds_by_name)
+                lead_fund_id, lead_candidates = match_fund_with_candidates(
+                    deal.lead_investor, funds_by_name,
+                )
+                # Batch 33 (#341/#342): when fuzzy match was ambiguous
+                # (top two candidates within FUND_NAME_AMBIGUITY_DELTA),
+                # record an ambiguous_matches row so the operator can
+                # review + resolve. The auto-picked id still wins for
+                # this run; resolve_ambiguous_match.py corrects it.
+                if (
+                    deal.lead_investor
+                    and _detect_ambiguity(lead_candidates)
+                    and not (
+                        lead_candidates
+                        and lead_candidates[0]["score"] == 1.0
+                    )
+                ):
+                    with engine.begin() as conn:
+                        conn.execute(ambiguous_matches.insert().values(
+                            entity_type="fund",
+                            raw_name=deal.lead_investor,
+                            source_url=source_url,
+                            candidates=json.dumps(lead_candidates),
+                            chosen_id=lead_fund_id,
+                            chosen_score=(
+                                lead_candidates[0]["score"]
+                                if lead_candidates else None
+                            ),
+                            captured_at=_now(),
+                        ))
+                    run.note(
+                        f"ambiguous fund match for {deal.lead_investor!r}: "
+                        f"chose {lead_fund_id!r} from candidates "
+                        f"{lead_candidates}; review via "
+                        f"scripts/list_ambiguous_matches.py"
+                    )
                 # Batch 32 (#742): when --allow-provisional is set AND the
                 # named lead investor doesn't resolve, create a
                 # provisional fund. We synthesize a fund_id from the

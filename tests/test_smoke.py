@@ -1673,6 +1673,105 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch33_ambiguous_match_queue():
+    """Inventory #341/#342/#737/#738: when Stage 3's fuzzy match has two
+    candidates within 5%, an ambiguous_matches row is recorded;
+    resolve_ambiguous_match.py corrects both the row + the
+    deal_attributions that picked the wrong fund."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+
+        # Add a second fund whose normalized name is close to an existing
+        # one to force fuzzy ambiguity.
+        from core.ids import fund_id_for
+        c = sqlite3.connect(db)
+        decoy_fund_id = fund_id_for("northbeam-east.example")
+        c.execute(
+            "insert into funds (fund_id, name, domain, is_active, "
+            "is_provisional, last_updated) values (?, ?, ?, 1, 0, "
+            "datetime('now'))",
+            (decoy_fund_id, "Northbeam East Capital",
+             "northbeam-east.example"),
+        )
+        c.commit()
+        c.close()
+
+        _run("03_mine_activity.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        # The fixture mentions "Northbeam Capital" multiple times. With
+        # "Northbeam East Capital" now in funds, fuzzy scoring should
+        # produce at least one ambiguous_matches row.
+        n_amb = c.execute(
+            "select count(*) from ambiguous_matches where entity_type='fund'"
+        ).fetchone()[0]
+        c.close()
+        assert n_amb >= 1, (
+            f"expected ambiguous_matches row after fuzzy collision; got {n_amb}"
+        )
+
+        # list_ambiguous_matches --json exposes them.
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "list_ambiguous_matches.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        rows = json.loads(res.stdout)
+        assert rows and len(rows[0]["candidates"]) >= 2
+
+        # Resolve one ambiguous match.
+        match_id = rows[0]["match_id"]
+        # Pick the "real" Northbeam id (not the decoy) explicitly.
+        c = sqlite3.connect(db)
+        real_id = c.execute(
+            "select fund_id from funds where domain='northbeam.example'"
+        ).fetchone()[0]
+        c.close()
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "resolve_ambiguous_match.py"),
+             "--workspace", ws, "--match-id", str(match_id),
+             "--resolved-id", real_id, "--note", "real Northbeam, not East",
+             "--resolved-by", "smoke-test"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        resolved = c.execute(
+            "select resolved_id, resolved_by, resolution_note "
+            "from ambiguous_matches where match_id=?", (match_id,),
+        ).fetchone()
+        c.close()
+        assert resolved[0] == real_id
+        assert resolved[1] == "smoke-test"
+        assert "real Northbeam" in resolved[2]
+
+        # Resolving to a non-existent id refuses.
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "resolve_ambiguous_match.py"),
+             "--workspace", ws, "--match-id", str(match_id),
+             "--resolved-id", "nonexistent.example",
+             "--note", "should fail"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2
+
+
 def test_batch32_stage3_provisional_and_raw_names():
     """Inventory #741/#742/#744/#745: Stage 3 records raw names for
     unmatched leads/partners, --allow-provisional creates provisional

@@ -375,6 +375,30 @@ batch_qa_reports = Table(
     Index("ix_batch_qa_reports_batch_id", "batch_id"),
 )
 
+# Batch 33 (#341/#342/#737/#738): record fuzzy matches that were
+# ambiguous (multiple candidates close to the best). Lets the operator
+# spot wrong attributions ("Foundry North" matched "Foundry NorthEast"
+# at 0.86 -- but Foundry NorthWest scored 0.85") via
+# scripts/list_ambiguous_matches.py and resolve them via
+# scripts/resolve_ambiguous_match.py.
+ambiguous_matches = Table(
+    "ambiguous_matches", metadata,
+    Column("match_id", Integer, primary_key=True, autoincrement=True),
+    Column("entity_type", Text),          # 'fund' or 'partner'
+    Column("raw_name", Text),
+    Column("source_url", Text),
+    Column("candidates", Text),           # JSON list of {id, name, score}
+    Column("chosen_id", Text),            # the auto-picked id (may be NULL)
+    Column("chosen_score", Float),
+    Column("resolved_id", Text),          # operator-supplied final id
+    Column("resolved_at", DateTime),
+    Column("resolved_by", Text),
+    Column("resolution_note", Text),
+    Column("captured_at", DateTime),
+    Index("ix_ambiguous_matches_entity_type", "entity_type"),
+    Index("ix_ambiguous_matches_resolved", "resolved_id"),
+)
+
 attio_sync_log = Table(
     "attio_sync_log", metadata,
     Column("sync_id", Integer, primary_key=True, autoincrement=True),
