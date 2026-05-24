@@ -138,6 +138,86 @@ def resolve_partner_id(
     return pid if pid in known_partner_ids else None
 
 
+# Batch 32 (#742): provisional fund creation. Synthesize a fund_id from
+# the normalized name; flag is_provisional=TRUE so Stage 2 (or the
+# operator) can promote it once enriched.
+def _create_provisional_fund(engine, name: str) -> str | None:
+    from core.ids import fund_id_for
+    norm = normalize_name(name).strip()
+    if not norm:
+        return None
+    # Use the normalized name as the synthetic domain so the existing
+    # fund_id_for() hash is stable; the row's `domain` column carries
+    # `<slug>.provisional` so the operator can distinguish stubs.
+    pseudo_domain = norm.replace(" ", "-") + ".provisional"
+    fund_id = fund_id_for(pseudo_domain)
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(funds.c.fund_id).where(funds.c.fund_id == fund_id)
+        ).first()
+        if not existing:
+            conn.execute(funds.insert().values(
+                fund_id=fund_id,
+                name=name,
+                domain=pseudo_domain,
+                is_active=True,
+                is_provisional=True,
+                last_updated=_now(),
+            ))
+    return fund_id
+
+
+# Batch 32 (#741): provisional partner creation. Requires a resolvable
+# fund (provisional or real); a partner without ANY fund is too
+# ambiguous to record without operator review.
+def _create_provisional_partner(
+    engine, name: str, fund_id: str, fund_id_to_domain: dict[str, str],
+) -> str | None:
+    norm = (name or "").strip()
+    if not norm:
+        return None
+    domain = fund_id_to_domain.get(fund_id)
+    if not domain:
+        return None
+    pid = partner_id_for(domain, norm)
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(partners.c.partner_id).where(partners.c.partner_id == pid)
+        ).first()
+        if not existing:
+            conn.execute(partners.insert().values(
+                partner_id=pid,
+                fund_id=fund_id,
+                name=norm,
+                employment_status="uncertain",
+                is_provisional=True,
+                last_updated=_now(),
+            ))
+    return pid
+
+
+def _resolve_lead_confidence(
+    raw_name: str | None, lead_fund_id: str | None,
+    funds_by_name: dict[str, str],
+) -> float | None:
+    """1.0 for exact normalized match, fuzzy score for fuzzy, None when
+    unresolved."""
+    if not raw_name or not lead_fund_id:
+        return None
+    key = normalize_name(raw_name)
+    if funds_by_name.get(key) == lead_fund_id:
+        return 1.0
+    # Fuzzy: find the score that produced the match.
+    best = 0.0
+    for known_name, fid in funds_by_name.items():
+        if fid != lead_fund_id:
+            continue
+        score = token_set_similarity(key, known_name)
+        if score > best:
+            best = score
+    return best if best > 0 else None
+
+
 def recompute_fund_activity(engine) -> None:
     """Idempotent: set last_known_activity_date + is_active from deal_attributions."""
     from core.dates import within_days
@@ -167,6 +247,17 @@ def main() -> int:
     add_workspace_arg(parser)
     parser.add_argument("--fixtures", action="store_true",
                         help="Read announcements from data/fixtures/announcements.json")
+    # Batch 32 (#741/#742): when the LLM names a fund/partner the local
+    # DB doesn't know about, create a `is_provisional=TRUE` row so the
+    # deal can still be attributed. The operator (or a later Stage 2 run)
+    # confirms the row by clearing the provisional flag.
+    parser.add_argument(
+        "--allow-provisional", action="store_true",
+        help="Create provisional funds/partners for LLM-named entities "
+             "not yet in the DB (Batch 32 #741/#742). Provisional rows "
+             "are flagged is_provisional=TRUE so Stage 6 / Stage 8 can "
+             "distinguish them from confirmed records.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -235,7 +326,46 @@ def main() -> int:
                     stub_response=ann.get("_attribution"),
                 )
                 lead_fund_id = match_fund(deal.lead_investor, funds_by_name)
+                # Batch 32 (#742): when --allow-provisional is set AND the
+                # named lead investor doesn't resolve, create a
+                # provisional fund. We synthesize a fund_id from the
+                # normalized name (no real domain yet) so downstream
+                # joins work. Stage 2 enrichment can later fill in
+                # domain + clear is_provisional.
+                if (
+                    lead_fund_id is None
+                    and args.allow_provisional
+                    and deal.lead_investor
+                ):
+                    lead_fund_id = _create_provisional_fund(
+                        engine, deal.lead_investor,
+                    )
+                    if lead_fund_id:
+                        funds_by_name[normalize_name(deal.lead_investor)] = (
+                            lead_fund_id
+                        )
+                        fund_id_to_domain[lead_fund_id] = (
+                            f"{lead_fund_id}.provisional"
+                        )
+                        run.note(
+                            f"provisional fund created for "
+                            f"{deal.lead_investor!r} (id={lead_fund_id})"
+                        )
                 sector_tags_json = json.dumps(deal.sector_tags or [])
+                # Batch 32: raw names preserved on every row for backfill
+                # / audit even when matching dropped the attribution.
+                raw_attributed = json.dumps([
+                    {"name": ap.name, "fund": ap.fund}
+                    for ap in deal.attributed_partners
+                ])
+                # Match confidence: 1.0 when the lead investor resolved
+                # via exact normalized match, fuzzy score when via the
+                # fuzzy fallback, None when unresolved. Stage 6 round_fit
+                # can filter low-confidence deals.
+                match_conf = _resolve_lead_confidence(
+                    deal.lead_investor, lead_fund_id, funds_by_name,
+                )
+
                 rows: list[dict] = []
                 # Batch 27 (#345): when the LLM named partners that we
                 # can't resolve to existing partners rows (Stage 2 hasn't
@@ -243,11 +373,33 @@ def main() -> int:
                 # operator sees "we lost partner attribution for X at
                 # fund Y" instead of silently dropping it.
                 dropped_partners: list[str] = []
+                provisional_partners_created: list[str] = []
                 for ap in deal.attributed_partners:
                     ap_fund_id = match_fund(ap.fund, funds_by_name)
                     pid = resolve_partner_id(
                         ap.name, ap_fund_id, fund_id_to_domain, known_partner_ids
                     )
+                    # Batch 32 (#741): provisional partner creation. Only
+                    # works when we have a resolvable fund (provisional
+                    # fund counts) -- a partner without ANY fund is
+                    # ambiguous.
+                    if (
+                        pid is None
+                        and args.allow_provisional
+                        and ap_fund_id is not None
+                        and ap.name
+                    ):
+                        pid = _create_provisional_partner(
+                            engine, ap.name, ap_fund_id,
+                            fund_id_to_domain,
+                        )
+                        if pid:
+                            known_partner_ids.add(pid)
+                            provisional_partners_created.append(pid)
+                            run.note(
+                                f"provisional partner created: "
+                                f"{ap.name!r}@{ap.fund!r} -> {pid}"
+                            )
                     if pid:
                         rows.append({
                             "company": deal.company,
@@ -259,6 +411,10 @@ def main() -> int:
                             "source_url": source_url,
                             "sector_tags": sector_tags_json,
                             "captured_at": _now(),
+                            "raw_lead_investor": deal.lead_investor,
+                            "raw_attributed_partners": raw_attributed,
+                            "match_confidence": match_conf,
+                            "snapshot_id": None,
                         })
                     else:
                         dropped_partners.append(
@@ -269,7 +425,9 @@ def main() -> int:
                         f"unresolved partner(s) for {source_url}: "
                         + ", ".join(dropped_partners)
                         + " (Stage 2 hasn't discovered these partners; "
-                        "re-run after enrichment to backfill attribution)"
+                        "re-run after enrichment, OR pass --allow-"
+                        "provisional to create stub rows; raw names "
+                        "preserved in deal_attributions for backfill)"
                     )
                 if not rows and lead_fund_id:
                     rows.append({
@@ -282,7 +440,40 @@ def main() -> int:
                         "source_url": source_url,
                         "sector_tags": sector_tags_json,
                         "captured_at": _now(),
+                        "raw_lead_investor": deal.lead_investor,
+                        "raw_attributed_partners": raw_attributed,
+                        "match_confidence": match_conf,
+                        "snapshot_id": None,
                     })
+                # Batch 32: even when there is NO fund match at all, we
+                # still record a "skeleton" deal_attributions row with
+                # raw names + a NULL lead_fund_id so the unmatched
+                # attribution is auditable and backfillable. The row
+                # carries no partner attribution (Stage 6 ignores
+                # lead_fund_id=NULL rows) but the audit trail captures
+                # the LLM's intent.
+                if not rows and not lead_fund_id and deal.lead_investor:
+                    rows.append({
+                        "company": deal.company,
+                        "round_type": deal.round_type,
+                        "round_size_usd": deal.round_size_usd,
+                        "announcement_date": deal.announcement_date,
+                        "lead_fund_id": None,
+                        "attributed_partner_id": None,
+                        "source_url": source_url,
+                        "sector_tags": sector_tags_json,
+                        "captured_at": _now(),
+                        "raw_lead_investor": deal.lead_investor,
+                        "raw_attributed_partners": raw_attributed,
+                        "match_confidence": None,
+                        "snapshot_id": None,
+                    })
+                    run.note(
+                        f"unmatched lead investor for {source_url}: "
+                        f"{deal.lead_investor!r} (recorded as skeleton "
+                        f"row for backfill; pass --allow-provisional to "
+                        f"create the fund stub)"
+                    )
                 # Delete prior attributions for THIS source_url FIRST. If a
                 # reprocess yields no known-fund/partner rows, the prior
                 # (possibly wrong) attribution must NOT linger -- otherwise

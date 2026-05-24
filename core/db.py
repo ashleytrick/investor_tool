@@ -89,6 +89,13 @@ funds = Table(
     Column("kill_signals", Text),
     Column("source_urls", Text),
     Column("last_updated", DateTime),
+    # Batch 32 (#742): TRUE when Stage 3 created the row from an
+    # announcement before Stage 2 enriched the fund. Distinguishes
+    # "fund we discovered via deal flow but haven't researched yet"
+    # from "fund we've enriched + scored". Stage 6 round_fit can
+    # de-emphasize provisional funds; the operator can promote one
+    # via scripts/promote_provisional.py once enriched.
+    Column("is_provisional", Boolean, default=False),
     # Batch 18 (#675): UNIQUE on attio_record_id. SQLite UNIQUE indexes
     # tolerate multiple NULLs, so this only constrains rows that have
     # actually been synced. Catches the duplicate-create-after-timeout
@@ -111,6 +118,13 @@ partners = Table(
     # is "use the warm channel"; do_not_contact is "use no channel".
     Column("do_not_contact", Boolean, default=False),
     Column("do_not_contact_reason", Text),
+    # Batch 32 (#741): TRUE when Stage 3 created the row from an
+    # announcement that named the partner, BEFORE Stage 2 enrichment
+    # confirms them on the team page. Stage 6 should treat
+    # employment_status='uncertain' partners more cautiously; the
+    # provisional flag is a stronger signal that the row needs Stage 2
+    # follow-up.
+    Column("is_provisional", Boolean, default=False),
     Column("name", Text, nullable=False),
     Column("title", Text),
     Column("linkedin_url", Text),
@@ -203,6 +217,17 @@ deal_attributions = Table(
     # Surfaced by Stage 6 round_fit for recent_relevant_deals scoring.
     Column("sector_tags", Text),
     Column("captured_at", DateTime),
+    # Batch 32 (#744/#745/#746/#747/#749): raw names + confidence +
+    # snapshot link preserved so a future re-run can backfill when a
+    # previously-unresolved name now matches a known partner/fund, AND
+    # the operator can audit why a particular attribution was made.
+    Column("raw_lead_investor", Text),
+    Column("raw_attributed_partners", Text),  # JSON list of names+funds
+    # Batch 32: optional LLM-supplied confidence (0.0 - 1.0) or fuzzy-
+    # match score for the lead fund. Useful for filtering low-confidence
+    # attributions out of Stage 6 round_fit later.
+    Column("match_confidence", Float),
+    Column("snapshot_id", Integer, ForeignKey("source_snapshots.snapshot_id")),
     Index("ix_deal_attributions_lead_fund_id", "lead_fund_id"),
     Index("ix_deal_attributions_attributed_partner_id", "attributed_partner_id"),
 )

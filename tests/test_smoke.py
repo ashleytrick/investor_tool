@@ -83,7 +83,11 @@ def test_full_pipeline_end_to_end():
         assert counts["partners"] == 8
         assert counts["signals"] == 11
         assert counts["source_snapshots"] >= 26  # 15 fund pages + 11 signal sources
-        assert counts["deal_attributions"] == 12
+        # Batch 32: 12 matched-lead-fund rows + skeleton rows for any
+        # announcement whose lead investor couldn't resolve. The
+        # fixture announcements include leads not in funds_seed.csv,
+        # so total >= 12; matched count is still exactly 12.
+        assert counts["deal_attributions"] >= 12
         assert counts["partner_score_summaries"] == 7  # 8 partners minus Alan (no signals)
         assert counts["email_drafts"] == 10  # 5 partners x 2 variants
         assert counts["followup_drafts"] == 5
@@ -92,10 +96,14 @@ def test_full_pipeline_end_to_end():
 
         # --- Stage 3 sector_tags persisted (batch 2 fix) ---
         c = sqlite3.connect(db)
-        tagged = c.execute(
-            "select count(*) from deal_attributions where sector_tags is not null"
+        matched_tagged = c.execute(
+            "select count(*) from deal_attributions where sector_tags is "
+            "not null and lead_fund_id is not null"
         ).fetchone()[0]
-        assert tagged == 12, f"expected all 12 deal_attributions tagged, got {tagged}"
+        assert matched_tagged == 12, (
+            f"expected 12 matched-fund deal_attributions tagged, got "
+            f"{matched_tagged}"
+        )
         sample_tags = json.loads(
             c.execute(
                 "select sector_tags from deal_attributions where company='LedgerKit'"
@@ -1663,6 +1671,103 @@ def test_batch16_check_size_parser_edge_cases():
     }
     rf = compute_round_fit(fund, partner, [], False, company)
     assert 0.0 <= rf.round_fit_score <= 10.0
+
+
+def test_batch32_stage3_provisional_and_raw_names():
+    """Inventory #741/#742/#744/#745: Stage 3 records raw names for
+    unmatched leads/partners, --allow-provisional creates provisional
+    funds + partners, list_unmatched_attributions surfaces them."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        # Run Stages 1 + 2 (so partners table is populated for the
+        # match path), then Stage 3 WITHOUT --allow-provisional. The
+        # fixture announcements name funds + partners that aren't in
+        # funds_seed.csv; raw names should be persisted but no provisional
+        # rows created.
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        baseline_funds = c.execute("select count(*) from funds").fetchone()[0]
+        baseline_partners = c.execute(
+            "select count(*) from partners"
+        ).fetchone()[0]
+        c.close()
+
+        _run("03_mine_activity.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        # Every row should have raw_lead_investor recorded (even matched ones).
+        n_with_raw = c.execute(
+            "select count(*) from deal_attributions "
+            "where raw_lead_investor is not null"
+        ).fetchone()[0]
+        assert n_with_raw > 0, (
+            "raw_lead_investor must be recorded on every Stage 3 row"
+        )
+        # Skeleton rows for unmatched leads exist (lead_fund_id NULL with
+        # a raw name on file).
+        n_skeleton = c.execute(
+            "select count(*) from deal_attributions "
+            "where lead_fund_id is null and raw_lead_investor is not null"
+        ).fetchone()[0]
+        assert n_skeleton > 0, (
+            "expected skeleton rows for unmatched leads in fixture"
+        )
+        # No provisional funds/partners created without the flag.
+        n_prov_funds = c.execute(
+            "select count(*) from funds where is_provisional=1"
+        ).fetchone()[0]
+        n_prov_partners = c.execute(
+            "select count(*) from partners where is_provisional=1"
+        ).fetchone()[0]
+        assert n_prov_funds == 0
+        assert n_prov_partners == 0
+        c.close()
+
+        # Now re-run WITH --allow-provisional. Provisional funds (and
+        # partners with named funds) should appear.
+        _run("03_mine_activity.py", "--workspace", ws, "--fixtures",
+             "--allow-provisional", cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        n_prov_funds = c.execute(
+            "select count(*) from funds where is_provisional=1"
+        ).fetchone()[0]
+        # Some skeleton rows should now have lead_fund_id populated.
+        n_resolved_via_prov = c.execute(
+            "select count(*) from deal_attributions d "
+            "join funds f on f.fund_id = d.lead_fund_id "
+            "where f.is_provisional=1"
+        ).fetchone()[0]
+        c.close()
+        assert n_prov_funds > 0, (
+            f"--allow-provisional should create provisional fund rows; "
+            f"got {n_prov_funds}"
+        )
+        assert n_resolved_via_prov > 0
+
+        # list_unmatched_attributions --json works.
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "list_unmatched_attributions.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        payload = json.loads(res.stdout)
+        assert "unmatched_funds" in payload
+        assert "unmatched_partners" in payload
 
 
 def test_batch31_compare_and_restore_batches():
