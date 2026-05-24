@@ -247,10 +247,13 @@ def main() -> int:
     with stage_run(args, stage=STAGE, require_attio=_require_attio,
                    require_llm=False) as ctx:
         ws, engine, run = ctx.ws, ctx.engine, ctx.run
+        # WorkspacePolicy centralizes mode-driven defaults (Refactor item 10).
+        from core.workspace_policy import WorkspacePolicy
+        policy = WorkspacePolicy.from_workspace_and_args(ws, args)
         # Batch 30 (#529/#531): mode-aware refusal. A workspace explicitly
         # marked `mode: fixture` should never sync to real Attio without
         # the operator stating the intent.
-        if ws.mode == "fixture" and not args.allow_fixture_mode:
+        if policy.refuses_fixture_data():
             msg = (
                 "REFUSED: workspace mode=fixture; sync to Attio would "
                 "propagate fictional data. Pass --allow-fixture-mode if "
@@ -267,16 +270,8 @@ def main() -> int:
         # path into a hard failure. ws.mode == "prod" also implies
         # require-attio so a prod workspace can't quietly skip its CRM
         # sync without the operator noticing.
-        require = args.require_attio or ws.mode == "prod"
-        # Prod-mode default: only sync ready_to_send + qa_status='pass'
-        # partners so a workspace that's wired into a real Attio CRM
-        # never silently pushes non-recommended partners as if they
-        # were on the outreach list. Operator can opt out with
-        # --include-not-ready (Finding from review).
-        require_ready_to_send = (
-            args.require_ready_to_send
-            or (ws.mode == "prod" and not args.include_not_ready)
-        )
+        require = policy.require_attio
+        require_ready_to_send = policy.require_ready_to_send
         if not attio_cfg:
             msg = f"no attio.yaml in workspace {ws.name!r}"
             if require:
@@ -341,7 +336,7 @@ def main() -> int:
                 prod_fails = production_gate_for_attio_sync(
                     fund_domain=f.domain, partner_email=None,
                 )
-                if prod_fails and not args.allow_example_domains:
+                if prod_fails and not policy.allow_example_domains:
                     run.skip()
                     msg = (
                         f"refused fund {f.fund_id}: "
