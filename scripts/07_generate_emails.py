@@ -114,6 +114,43 @@ import re as _re
 _NONWORD_RE = _re.compile(r"\W+")
 
 
+def _company_primary_domain(company_cfg: dict) -> str | None:
+    """Best-effort: extract the company's primary domain from the
+    scheduling link (post-redirect host) or fall back to the founder
+    email's domain. Returns lowercase host, no port. Used by Stage 7's
+    founder-email-alignment check (Batch 37 #35)."""
+    co = (company_cfg or {}).get("company") or {}
+    link = (co.get("meeting_ask") or {}).get("preferred_scheduling_link") or ""
+    if "://" in link:
+        rest = link.split("://", 1)[1]
+        for sep in ("/", "?", "#", ":"):
+            if sep in rest:
+                rest = rest.split(sep, 1)[0]
+        rest = rest.strip().lower()
+        # Strip well-known scheduling-service hosts so we don't compare
+        # against cal.com / calendly.com / savvycal.com etc.
+        scheduling_hosts = (
+            "cal.com", "calendly.com", "savvycal.com", "hubspot.com",
+            "google.com", "x.ai", "tldv.io",
+        )
+        # Batch 37: also treat any host on an RFC 2606 reserved TLD as
+        # a scheduling-service-like host (the fixture uses cal.example).
+        if rest and (
+            rest in scheduling_hosts
+            or any(
+                rest.endswith(suffix)
+                for suffix in (".example", ".test", ".invalid", ".localhost")
+            )
+        ):
+            return None
+        if rest:
+            return rest
+    fe = (co.get("founder_email") or "").strip().lower()
+    if "@" in fe:
+        return fe.split("@", 1)[1] or None
+    return None
+
+
 def _word_boundary_hit(haystack: str, needle: str) -> bool:
     """True if `needle` appears in `haystack` bounded by non-word chars
     (or start/end of string). Case-insensitive on the caller side; both
@@ -1231,9 +1268,37 @@ def main() -> int:
         # X's old drafts must not be wiped without replacement -- otherwise
         # a flaky LLM run silently erases the operator's prior usable
         # batch for those partners.
+        # Batch 37 (#38): additionally PRESERVE prior drafts when this
+        # run's RECOMMENDED draft for the same partner has per-draft
+        # hard-gate failures. Otherwise a bad regeneration would
+        # silently replace a good prior draft. The partner's downgrade
+        # to outreach_status=draft already lands in the CSV reasoning;
+        # this just refuses to nuke the historical email_drafts row.
+        partner_ids_with_failed_rec: set[str] = set()
+        for ctx, output, _ in partner_outputs:
+            rec_strategy = output.recommended_variant_strategy
+            if not rec_strategy:
+                continue
+            for v in output.variants:
+                if v.strategy != rec_strategy:
+                    continue
+                hf = check_hard_gates(
+                    {"subject": v.subject, "body": v.body}, banned,
+                )
+                if hf:
+                    partner_ids_with_failed_rec.add(ctx["partner_id"])
+                break
         partner_ids_in_batch = [
             ctx["partner_id"] for ctx, _output, _ in partner_outputs
+            if ctx["partner_id"] not in partner_ids_with_failed_rec
         ]
+        if partner_ids_with_failed_rec:
+            run.note(
+                f"PRESERVED prior drafts for "
+                f"{len(partner_ids_with_failed_rec)} partner(s) whose new "
+                f"recommended draft failed per-draft hard gates: "
+                f"{sorted(partner_ids_with_failed_rec)} (Batch 37 #38)"
+            )
         with engine.begin() as conn:
             for pid in partner_ids_in_batch:
                 conn.execute(delete(email_drafts).where(email_drafts.c.partner_id == pid))
@@ -1406,6 +1471,66 @@ def main() -> int:
                 allow_example_domains=args.allow_example_domains,
             )
             qa_fails.extend(prod_fails)
+            # Batch 37 (#44): warn when an email body contains a URL that
+            # looks like a scheduling link (cal.com, calendly.com,
+            # savvycal.com, etc.) BUT doesn't match the workspace's
+            # configured preferred_scheduling_link. Hallucinated scheduling
+            # links route prospects to the wrong calendar.
+            configured_link = (
+                (ws.company.get("company") or {})
+                .get("meeting_ask", {})
+                .get("preferred_scheduling_link")
+                or ""
+            ).strip().lower()
+            body_lower = (rec.get("body") or "").lower()
+            scheduling_hosts = (
+                "cal.com/", "calendly.com/", "savvycal.com/",
+                "meetings.hubspot.com/", "cal.example/",
+            )
+            for host in scheduling_hosts:
+                if host in body_lower and (
+                    not configured_link or host not in configured_link
+                ):
+                    qa_fails.append(
+                        f"body contains scheduling link host {host!r} but "
+                        f"workspace configured "
+                        f"{(configured_link or '<none>')!r} -- LLM may have "
+                        f"hallucinated a scheduling URL"
+                    )
+                    break
+            # Batch 37 (#42): defense in depth. Stage 6 already blocks
+            # recommendation when cold_reachability_score is None, but
+            # if a recommendation somehow lands here with no reachability
+            # score (e.g. a force-rescore that ignored the gate), refuse
+            # to mark it ready_to_send.
+            if (
+                ctx.get("recommended_to_send")
+                and ctx.get("cold_reachability_score") is None
+            ):
+                qa_fails.append(
+                    "cold_reachability_score is unknown; Stage 7 refuses "
+                    "to mark ready_to_send without it"
+                )
+            # Batch 37 (#35): founder email domain should match the
+            # company's primary domain when one is configured. Mismatch
+            # is a soft warning (downgrade to draft) so the operator
+            # catches "sending from gmail.com instead of company.io".
+            founder_email = (
+                ws.company.get("company") or {}
+            ).get("founder_email") or ""
+            primary_domain = _company_primary_domain(ws.company)
+            if (
+                founder_email
+                and primary_domain
+                and "@" in founder_email
+            ):
+                fe_domain = founder_email.split("@", 1)[1].lower().strip()
+                if fe_domain != primary_domain:
+                    qa_fails.append(
+                        f"founder email domain {fe_domain!r} does not "
+                        f"match company primary domain {primary_domain!r}; "
+                        f"verify the sender is intentional"
+                    )
 
             base["recommendation_reasoning"] = ctx["recommendation_reasoning"]
             if ctx.get("warm_path_available"):
