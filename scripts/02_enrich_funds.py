@@ -287,90 +287,70 @@ def main() -> int:
                     snaps = store_snapshots(engine, pages)
                     enrichment = enrich(llm, fund, pages)
 
-                    # Track which partners are still on the team page this run so
-                    # we can demote anyone previously seen but now missing.
+                    # Reconciliation owned by core/fund_enrichment.py
+                    # (Refactor item 7 / 11): preserve-on-empty fund row
+                    # builder, deterministic partner_id slug, and the
+                    # vanished-partner demotion proposal.
+                    from core.fund_enrichment import (
+                        build_fund_update_values,
+                        compute_vanished_partners,
+                        partner_upsert_values,
+                    )
+                    now = _now()
+                    update_values = build_fund_update_values(enrichment, now)
+                    # Track which partners are still on the team page this
+                    # run so we can demote anyone previously seen but now
+                    # missing.
                     discovered_pids: set[str] = set()
 
                     with engine.begin() as conn:
-                        # Batch 11 (#412/#413): only update fields where the new
-                        # enrichment actually has a value. Previously a sparse
-                        # re-run (LLM missed a field this time, site changed) would
-                        # blank out richer prior enrichment with None, so the
-                        # operator lost the better extraction. Preserve-on-empty
-                        # means re-runs strictly improve the fund row.
-                        update_values = {
-                            "last_updated": _now(),
-                            "source_urls": "; ".join(
-                                str(u) for u in enrichment.source_urls_used
-                            ),
-                        }
-                        if enrichment.thesis_summary:
-                            update_values["stated_thesis"] = enrichment.thesis_summary
-                        if enrichment.stated_stage_focus:
-                            update_values["stated_stage_focus"] = (
-                                enrichment.stated_stage_focus
-                            )
-                        if enrichment.check_size_range:
-                            update_values["check_size_range"] = (
-                                enrichment.check_size_range
-                            )
-                        if enrichment.explicit_kill_signals:
-                            update_values["kill_signals"] = "; ".join(
-                                enrichment.explicit_kill_signals
-                            )
                         conn.execute(
                             funds.update()
                             .where(funds.c.fund_id == fund["fund_id"])
                             .values(**update_values)
                         )
                         for p in enrichment.current_partners:
-                            pid = partner_id_for(fund["domain"], p.name)
-                            discovered_pids.add(pid)
-                            # Team page is a single-source recent observation;
-                            # likely_current per the brief's ladder. LinkedIn
-                            # cross-check (-> verified_current) and a departure
-                            # feed (-> left_fund) are future enhancements.
-                            upsert(conn, partners, ["partner_id"], {
-                                "partner_id": pid,
-                                "fund_id": fund["fund_id"],
-                                "name": p.name,
-                                "title": p.title,
-                                "bio": p.bio_snippet,
-                                "employment_status": "likely_current",
-                                "last_updated": _now(),
-                            })
+                            row = partner_upsert_values(
+                                fund_id=fund["fund_id"],
+                                fund_domain=fund["domain"],
+                                partner=p,
+                                now=now,
+                            )
+                            discovered_pids.add(row["partner_id"])
+                            upsert(conn, partners, ["partner_id"], row)
 
-                        # Demote previously-seen partners no longer on the team
-                        # page. Without this, a partner who left a fund stays
-                        # `likely_current` forever and continues to satisfy
-                        # Stage 6 criterion 6.
-                        if discovered_pids:
-                            prior_for_fund = [
-                                r.partner_id for r in conn.execute(
-                                    select(partners.c.partner_id).where(
-                                        partners.c.fund_id == fund["fund_id"]
-                                    )
+                        # Demote previously-seen partners no longer on the
+                        # team page. Without this, a partner who left a
+                        # fund stays `likely_current` forever and continues
+                        # to satisfy Stage 6 criterion 6. An empty
+                        # discovered set is treated as an LLM miss (not a
+                        # mass departure) and skips the demotion -- see
+                        # compute_vanished_partners docstring.
+                        prior_for_fund = [
+                            r.partner_id for r in conn.execute(
+                                select(partners.c.partner_id).where(
+                                    partners.c.fund_id == fund["fund_id"]
                                 )
-                            ]
-                            vanished = [
-                                pid for pid in prior_for_fund
-                                if pid not in discovered_pids
-                            ]
-                            if vanished:
-                                conn.execute(
-                                    partners.update().where(
-                                        partners.c.partner_id.in_(vanished)
-                                    ).values(
-                                        employment_status="uncertain",
-                                        last_updated=_now(),
-                                    )
+                            )
+                        ]
+                        vanished = compute_vanished_partners(
+                            prior_for_fund, discovered_pids,
+                        )
+                        if vanished:
+                            conn.execute(
+                                partners.update().where(
+                                    partners.c.partner_id.in_(vanished)
+                                ).values(
+                                    employment_status="uncertain",
+                                    last_updated=now,
                                 )
-                                print(
-                                    f"[stage 2] {fund['name']}: demoted "
-                                    f"{len(vanished)} partner(s) to "
-                                    f"employment_status=uncertain (no longer on "
-                                    f"team page)"
-                                )
+                            )
+                            print(
+                                f"[stage 2] {fund['name']}: demoted "
+                                f"{len(vanished)} partner(s) to "
+                                f"employment_status=uncertain (no longer on "
+                                f"team page)"
+                            )
                     print(
                         f"[stage 2] {fund['name']}: {len(pages)} pages "
                         f"({snaps} new snapshots), "
