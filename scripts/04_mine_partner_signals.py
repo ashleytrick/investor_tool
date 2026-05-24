@@ -144,39 +144,55 @@ def _fetch_live_partner_content(
     client = HttpClient()
     out: dict[str, dict] = {}
     by_partner: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    with csv_path.open(encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh)
-        # Batch 36 (#10): header validation. Reject upfront if a column
-        # is missing -- otherwise we'd silently treat every row as
-        # missing partner_id.
-        missing = CSV_REQUIRED_HEADERS - set(reader.fieldnames or [])
-        if missing:
-            msg = (
-                f"partner_content_urls.csv missing required column(s): "
-                f"{sorted(missing)} (have: {reader.fieldnames})"
-            )
-            run.log_error(str(csv_path), "csv_schema", msg)
+
+    # core/csv_ingest (Refactor item 4) replaces the bespoke header +
+    # row validation. unknown_partner errors are reported via row_errors;
+    # the strict_unknown_partners knob still decides whether they bump
+    # run.failed for cron non-zero exit. Rows with empty partner_id /
+    # source_url were previously silently skipped via `continue`; the
+    # require_field validators now flag those as missing_field row
+    # errors that get logged (matches the brief's "no silent failures"
+    # rule but doesn't change the per-row outcome -- the row is still
+    # excluded from `by_partner`).
+    from core.csv_ingest import (
+        CsvIngestSchema, ingest_csv, in_set, require_field,
+    )
+
+    schema = CsvIngestSchema(
+        required_headers=CSV_REQUIRED_HEADERS,
+        row_validators=(
+            require_field("partner_id"),
+            require_field("source_url"),
+            in_set("partner_id", known_partner_ids,
+                   error_type="unknown_partner_in_csv"),
+        ),
+    )
+    result = ingest_csv(csv_path, schema)
+    if result.missing_headers:
+        msg = (
+            f"partner_content_urls.csv missing required column(s): "
+            f"{result.missing_headers} (have: {result.headers})"
+        )
+        run.log_error(str(csv_path), "csv_schema", msg)
+        run.failed += 1
+        raise ValueError(msg)
+    for err in result.row_errors:
+        # Empty-field errors are noise (the prior code skipped them
+        # silently); only unknown_partner is operator-actionable. Log
+        # both for the audit trail but only bump run.failed for the
+        # unknown_partner class so existing strict/permissive semantics
+        # hold.
+        run.log_error(
+            err.record_id, err.error_type,
+            f"row {err.row_num}: {err.message}",
+        )
+        if err.error_type == "unknown_partner_in_csv" and strict_unknown_partners:
             run.failed += 1
-            raise ValueError(msg)
-        for row in reader:
-            pid = (row.get("partner_id") or "").strip()
-            url = (row.get("source_url") or "").strip()
-            stype = (row.get("source_type") or "blog").strip()
-            if not pid or not url:
-                continue
-            # Batch 36 (#11): unknown partner_id is a CSV error, not a
-            # silent skip. Log + count as failure; the operator gets a
-            # non-zero exit unless they pass --allow-unknown-partner-ids.
-            if pid not in known_partner_ids:
-                run.log_error(
-                    pid, "unknown_partner_in_csv",
-                    f"row references partner_id not in partners table; "
-                    f"source_url={url}",
-                )
-                if strict_unknown_partners:
-                    run.failed += 1
-                continue
-            by_partner[pid].append((stype, url))
+    for row in result.rows:
+        pid = row["partner_id"]
+        url = row["source_url"]
+        stype = row.get("source_type") or "blog"
+        by_partner[pid].append((stype, url))
 
     for pid, items in by_partner.items():
         sources: list[dict] = []
