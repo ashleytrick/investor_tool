@@ -28,7 +28,8 @@ from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
 from core.validate_config import preflight_or_exit
 from core.db import (
-    ambiguous_matches, deal_attributions, funds, get_engine, partners,
+    ambiguous_matches, deal_attribution_overrides, deal_attributions,
+    funds, get_engine, partners,
 )
 from core.http_client import HttpClient
 from core.ids import normalize_name, partner_id_for
@@ -315,6 +316,19 @@ def main() -> int:
     fund_id_to_domain = {r.fund_id: r.domain for r in fund_rows}
     known_partner_ids = {r.partner_id for r in partner_rows}
 
+    # Batch 34: load operator overrides keyed on source_url. The Stage 3
+    # per-announcement loop consults this BEFORE asking the LLM so
+    # operator decisions survive re-runs.
+    overrides_by_url: dict[str, dict] = {}
+    with engine.begin() as conn:
+        for r in conn.execute(select(deal_attribution_overrides)):
+            overrides_by_url[r.source_url] = {
+                "action": r.action,
+                "lead_fund_id": r.lead_fund_id,
+                "attributed_partner_id": r.attributed_partner_id,
+                "reason": r.reason,
+            }
+
     feeds = ws.sources.get("funding_announcement_feeds") or []
     prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
     with RunLogger(engine, ws.name, STAGE) as run:
@@ -356,6 +370,57 @@ def main() -> int:
         for ann in announcements:
             run.processed += 1
             source_url = ann["source_url"]
+            # Batch 34 (#760): operator override takes precedence over LLM.
+            override = overrides_by_url.get(source_url)
+            if override and override["action"] == "reject":
+                # Wipe any prior attribution rows for this URL (skeleton-
+                # only persistence). Don't ask the LLM.
+                with engine.begin() as conn:
+                    conn.execute(
+                        deal_attributions.delete().where(
+                            deal_attributions.c.source_url == source_url,
+                        )
+                    )
+                run.skipped += 1
+                run.note(
+                    f"override REJECT applied to {source_url}: "
+                    f"{override['reason']!r}"
+                )
+                continue
+            if override and override["action"] == "set":
+                # Skip the LLM entirely; persist a single row built from
+                # the operator's chosen fund/partner. (We can't reconstruct
+                # the company / round_type without the LLM, so we preserve
+                # whatever was already in deal_attributions OR fall through
+                # to LLM if no prior row exists.)
+                with engine.begin() as conn:
+                    existing = conn.execute(
+                        select(deal_attributions).where(
+                            deal_attributions.c.source_url == source_url,
+                        )
+                    ).first()
+                if existing:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            deal_attributions.update()
+                            .where(deal_attributions.c.source_url == source_url)
+                            .values(
+                                lead_fund_id=override["lead_fund_id"]
+                                              or existing.lead_fund_id,
+                                attributed_partner_id=(
+                                    override["attributed_partner_id"]
+                                    or existing.attributed_partner_id
+                                ),
+                            )
+                        )
+                    run.succeeded += 1
+                    run.note(
+                        f"override SET applied to {source_url}: "
+                        f"{override['reason']!r}"
+                    )
+                    continue
+                # No prior row -- fall through to the LLM path; we'll
+                # apply the override after the LLM result lands.
             try:
                 prompt = prompt_template.replace("{ANNOUNCEMENT_TEXT}", ann["text"])
                 deal: DealAttribution = llm.complete_json(

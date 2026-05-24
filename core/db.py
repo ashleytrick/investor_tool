@@ -375,6 +375,35 @@ batch_qa_reports = Table(
     Index("ix_batch_qa_reports_batch_id", "batch_id"),
 )
 
+# Batch 34 (#757/#758/#759/#760): operator-supplied corrections /
+# rejections for individual Stage 3 attributions. Keyed by source_url
+# (one announcement => one override). Persisted across Stage 3 re-runs
+# so the LLM can't silently reintroduce a wrong attribution the operator
+# previously rejected.
+#
+# action='reject' -> Stage 3 leaves a SKELETON row only (raw names but
+#                    NULL lead_fund_id + NULL partner attribution)
+# action='set'    -> Stage 3 uses the supplied lead_fund_id /
+#                    attributed_partner_id verbatim, ignoring the LLM
+# action='note'   -> annotation only; Stage 3 still resolves via the
+#                    LLM but the note is surfaced for audit
+deal_attribution_overrides = Table(
+    "deal_attribution_overrides", metadata,
+    Column("override_id", Integer, primary_key=True, autoincrement=True),
+    Column("source_url", Text, nullable=False),
+    Column("action", Text, nullable=False),  # 'reject' | 'set' | 'note'
+    Column("lead_fund_id", Text),
+    Column("attributed_partner_id", Text),
+    Column("reason", Text),
+    Column("created_by", Text),
+    Column("created_at", DateTime),
+    Index(
+        "ux_deal_attribution_overrides_source_url",
+        "source_url", unique=True,
+    ),
+)
+
+
 # Batch 33 (#341/#342/#737/#738): record fuzzy matches that were
 # ambiguous (multiple candidates close to the best). Lets the operator
 # spot wrong attributions ("Foundry North" matched "Foundry NorthEast"

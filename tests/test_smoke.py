@@ -1673,6 +1673,171 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch34_attribution_overrides_and_backfill():
+    """Inventory #346/#757/#758/#759/#760: operator overrides preserved
+    across Stage 3 re-runs (reject, set), and backfill resolves
+    previously-unmatched raw names against the updated DB."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+        _run("03_mine_activity.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Pick an attribution with a real lead_fund_id to override.
+        c = sqlite3.connect(db)
+        row = c.execute(
+            "select source_url, lead_fund_id from deal_attributions "
+            "where lead_fund_id is not null limit 1"
+        ).fetchone()
+        assert row is not None
+        target_url, original_fund = row
+        c.close()
+
+        # #758: --action set forces a different fund_id (use a real one).
+        c = sqlite3.connect(db)
+        other_fund = c.execute(
+            "select fund_id from funds where fund_id != ? limit 1",
+            (original_fund,),
+        ).fetchone()[0]
+        c.close()
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "correct_deal_attribution.py"),
+             "--workspace", ws, "--source-url", target_url,
+             "--action", "set", "--fund-id", other_fund,
+             "--reason", "operator override"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        applied = c.execute(
+            "select lead_fund_id from deal_attributions where source_url = ?",
+            (target_url,),
+        ).fetchone()[0]
+        c.close()
+        assert applied == other_fund, (
+            f"override should have updated fund; got {applied}"
+        )
+
+        # #760: re-run Stage 3 -- the override survives.
+        _run("03_mine_activity.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+        c = sqlite3.connect(db)
+        after_rerun = c.execute(
+            "select lead_fund_id from deal_attributions where source_url = ?",
+            (target_url,),
+        ).fetchone()[0]
+        c.close()
+        assert after_rerun == other_fund, (
+            f"override should survive Stage 3 re-run; got {after_rerun}"
+        )
+
+        # #757: --action reject wipes attribution but leaves skeleton.
+        # Pick a DIFFERENT source_url.
+        c = sqlite3.connect(db)
+        reject_url = c.execute(
+            "select source_url from deal_attributions where source_url != ? "
+            "and lead_fund_id is not null limit 1",
+            (target_url,),
+        ).fetchone()
+        c.close()
+        assert reject_url is not None
+        reject_url = reject_url[0]
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "correct_deal_attribution.py"),
+             "--workspace", ws, "--source-url", reject_url,
+             "--action", "reject", "--reason", "not actually a funding event"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        c = sqlite3.connect(db)
+        rej_after = c.execute(
+            "select lead_fund_id, attributed_partner_id, raw_lead_investor "
+            "from deal_attributions where source_url = ?",
+            (reject_url,),
+        ).fetchone()
+        c.close()
+        assert rej_after[0] is None
+        assert rej_after[1] is None
+        # raw_lead_investor preserved (skeleton).
+        assert rej_after[2] is not None
+
+        # #759: refuse to set with a non-existent fund/partner id.
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "correct_deal_attribution.py"),
+             "--workspace", ws, "--source-url", target_url,
+             "--action", "set", "--fund-id", "nonexistent.example",
+             "--reason", "should fail"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2
+
+        # --list shows the active overrides.
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "correct_deal_attribution.py"),
+             "--workspace", ws, "--list"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        assert target_url in res.stdout
+        assert reject_url in res.stdout
+
+        # #346 backfill: inject an unresolved partner-attribution row whose
+        # raw name resolves to an existing partner (simulating Stage 2
+        # having JUST discovered them).
+        c = sqlite3.connect(db)
+        # Pick a known partner + their fund.
+        pid, fname = c.execute(
+            "select p.partner_id, f.name from partners p "
+            "join funds f on f.fund_id = p.fund_id limit 1"
+        ).fetchone()
+        # Get the partner's display name to feed into raw_attributed_partners.
+        partner_name = c.execute(
+            "select name from partners where partner_id = ?", (pid,)
+        ).fetchone()[0]
+        c.execute(
+            "insert into deal_attributions (source_url, raw_lead_investor, "
+            "raw_attributed_partners, captured_at) values "
+            "(?, NULL, ?, datetime('now'))",
+            (
+                "https://example.invalid/test-backfill",
+                json.dumps([{"name": partner_name, "fund": fname}]),
+            ),
+        )
+        c.commit()
+        c.close()
+
+        res = subprocess.run(
+            [sys.executable,
+             str(REPO_ROOT / "scripts" / "backfill_attributions.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+        c = sqlite3.connect(db)
+        backfilled = c.execute(
+            "select attributed_partner_id, lead_fund_id from deal_attributions "
+            "where source_url = 'https://example.invalid/test-backfill'"
+        ).fetchone()
+        c.close()
+        assert backfilled[0] == pid, (
+            f"backfill should resolve partner_id; got {backfilled[0]}"
+        )
+
+
 def test_batch33_ambiguous_match_queue():
     """Inventory #341/#342/#737/#738: when Stage 3's fuzzy match has two
     candidates within 5%, an ambiguous_matches row is recorded;
