@@ -26,12 +26,42 @@ class AttioNotConfigured(RuntimeError):
     """Raised when an AttioClient is asked for, but the workspace lacks config."""
 
 
+# Batch 18 (#653/#654/#655): refuse to send Attio's bearer token to any
+# host outside this allowlist. A typo in attio.yaml's `api_base`, or a
+# malicious config injection, would otherwise leak the key. Operators
+# who legitimately self-host an Attio-compatible service can pass
+# allow_any_base_url=True at construction.
+ALLOWED_API_BASE_HOSTS = {
+    "api.attio.com",
+}
+
+
 @dataclass
 class AttioClient:
     api_key: str
     base_url: str = "https://api.attio.com/v2"
     timeout_s: float = 30.0
+    allow_any_base_url: bool = False
     _client: Optional[httpx.Client] = None
+
+    def __post_init__(self) -> None:
+        # Validate the base URL's host against the allowlist. Operators
+        # self-hosting an Attio-compatible service can opt out by passing
+        # allow_any_base_url=True (with full awareness that their bearer
+        # token will be sent to that host).
+        from urllib.parse import urlparse
+        host = (urlparse(self.base_url).hostname or "").lower()
+        if not host:
+            raise AttioNotConfigured(
+                f"Attio api_base {self.base_url!r} has no parseable host"
+            )
+        if not self.allow_any_base_url and host not in ALLOWED_API_BASE_HOSTS:
+            raise AttioNotConfigured(
+                f"Attio api_base host {host!r} not in allowlist "
+                f"{sorted(ALLOWED_API_BASE_HOSTS)}. Set "
+                f"allow_any_base_url=True to override (the bearer token "
+                f"will be sent to {host!r})."
+            )
 
     @classmethod
     def from_workspace(cls, ws) -> "AttioClient":
@@ -44,7 +74,13 @@ class AttioClient:
             )
         attio_cfg = cfg.get("attio") or cfg  # accept either shape
         base = attio_cfg.get("api_base", "https://api.attio.com/v2")
-        return cls(api_key=api_key, base_url=base)
+        # Operators can opt out of the allowlist by setting
+        # api_base_allow_any_host: true in attio.yaml.
+        allow_any = bool(attio_cfg.get("api_base_allow_any_host", False))
+        return cls(
+            api_key=api_key, base_url=base,
+            allow_any_base_url=allow_any,
+        )
 
     # --- low-level transport ---
 

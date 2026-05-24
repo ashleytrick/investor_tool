@@ -89,6 +89,13 @@ funds = Table(
     Column("kill_signals", Text),
     Column("source_urls", Text),
     Column("last_updated", DateTime),
+    # Batch 18 (#675): UNIQUE on attio_record_id. SQLite UNIQUE indexes
+    # tolerate multiple NULLs, so this only constrains rows that have
+    # actually been synced. Catches the duplicate-create-after-timeout
+    # case at the DB layer.
+    Index(
+        "ux_funds_attio_record_id", "attio_record_id", unique=True,
+    ),
 )
 
 partners = Table(
@@ -118,6 +125,11 @@ partners = Table(
     Column("cold_reachability_partial_evidence", Text),
     Column("last_updated", DateTime),
     Index("ix_partners_fund_id", "fund_id"),
+    # Batch 18 (#674): UNIQUE on attio_record_id. Same NULL semantics as
+    # funds -- only constrains rows that have actually been synced.
+    Index(
+        "ux_partners_attio_record_id", "attio_record_id", unique=True,
+    ),
 )
 
 source_snapshots = Table(

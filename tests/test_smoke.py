@@ -1665,6 +1665,37 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch18_attio_api_base_allowlist():
+    """Inventory #653/#654/#655: AttioClient refuses to send the bearer
+    token to any host outside ALLOWED_API_BASE_HOSTS unless explicitly
+    opted out."""
+    from core.attio_client import (
+        ALLOWED_API_BASE_HOSTS, AttioClient, AttioNotConfigured,
+    )
+
+    # Default (api.attio.com): permitted.
+    AttioClient(api_key="fake", base_url="https://api.attio.com/v2")
+
+    # Other host: refused unless opt-in.
+    import pytest
+    with pytest.raises(AttioNotConfigured) as exc_info:
+        AttioClient(api_key="fake", base_url="https://evil.example/v2")
+    assert "allowlist" in str(exc_info.value)
+
+    # Opt-out flag: permitted.
+    AttioClient(
+        api_key="fake", base_url="https://self-hosted.attio.example/v2",
+        allow_any_base_url=True,
+    )
+
+    # Empty / unparseable base: refused.
+    with pytest.raises(AttioNotConfigured):
+        AttioClient(api_key="fake", base_url="")
+
+    # Allowlist baseline contract.
+    assert "api.attio.com" in ALLOWED_API_BASE_HOSTS
+
+
 def test_batch17_stage7_refuses_stale_stage6():
     """Inventory #363/#364/#970: Stage 7 must refuse when Stage 6 is older
     than its upstreams (Stage 5 / Stage 3), OR when Stage 6 hasn't
