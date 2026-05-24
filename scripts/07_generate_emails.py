@@ -889,116 +889,28 @@ def main() -> int:
                 "warm_path_available": "" if pctx["warm_path_available"] is None else bool(pctx["warm_path_available"]),
             }
             # ---- outreach_status routing (Findings 1 + 3) ----
-            # Compute per-draft hard-gate status. The draft was already
-            # validated against the schema; recheck the body-level gates here
-            # so we have the failure reasons available for the CSV.
-            qa_fails: list[str] = check_hard_gates(
-                {"subject": rec.get("subject"), "body": rec.get("body")}, banned
-            )
-            if rec.get("template_smell") == "high":
-                qa_fails.append("template_smell=high")
-            if pid in sim_failed_partners:
-                qa_fails.append("body similarity > 0.82 with another draft")
-            # Batch 9: production guards. A workspace scaffolded from a
-            # fixture can have `.example` scheduling links, `{PLACEHOLDER}`
-            # founder emails, or missing meeting_ask config. Downgrade
-            # ready_to_send -> draft and surface the reasons so the
-            # operator sees what to fix.
-            prod_fails = production_gate_for_ready_to_send(
-                subject=rec.get("subject"),
-                body=rec.get("body"),
-                scheduling_link=(
-                    (ws.company.get("company") or {})
-                    .get("meeting_ask", {})
-                    .get("preferred_scheduling_link")
-                ),
-                founder_email=(ws.company.get("company") or {}).get(
-                    "founder_email"
-                ),
-                partner_email=None,  # partner email is optional at CSV stage
+            # Routing decision owned by core/email/draft_routing.py
+            # (Refactor item 14). See that module for the full set of
+            # per-draft QA checks + the warm-path / downgrade /
+            # ready_to_send decision order.
+            from core.email.draft_routing import decide_draft_routing
+            decision = decide_draft_routing(
+                rec_subject=rec.get("subject"),
+                rec_body=rec.get("body"),
+                rec_template_smell=rec.get("template_smell"),
+                in_sim_failure_pair=pid in sim_failed_partners,
+                pctx_recommendation_reasoning=pctx["recommendation_reasoning"],
+                pctx_recommended_to_send=bool(pctx["recommended_to_send"]),
+                pctx_warm_path_available=pctx.get("warm_path_available"),
+                pctx_cold_reachability_score=pctx.get("cold_reachability_score"),
+                banned=banned,
+                company_cfg=ws.company,
                 allow_example_domains=policy.allow_example_domains,
             )
-            qa_fails.extend(prod_fails)
-            # Batch 37 (#44): warn when an email body contains a URL that
-            # looks like a scheduling link (cal.com, calendly.com,
-            # savvycal.com, etc.) BUT doesn't match the workspace's
-            # configured preferred_scheduling_link. Hallucinated scheduling
-            # links route prospects to the wrong calendar.
-            configured_link = (
-                (ws.company.get("company") or {})
-                .get("meeting_ask", {})
-                .get("preferred_scheduling_link")
-                or ""
-            ).strip().lower()
-            body_lower = (rec.get("body") or "").lower()
-            scheduling_hosts = (
-                "cal.com/", "calendly.com/", "savvycal.com/",
-                "meetings.hubspot.com/", "cal.example/",
-            )
-            for host in scheduling_hosts:
-                if host in body_lower and (
-                    not configured_link or host not in configured_link
-                ):
-                    qa_fails.append(
-                        f"body contains scheduling link host {host!r} but "
-                        f"workspace configured "
-                        f"{(configured_link or '<none>')!r} -- LLM may have "
-                        f"hallucinated a scheduling URL"
-                    )
-                    break
-            # Batch 37 (#42): defense in depth. Stage 6 already blocks
-            # recommendation when cold_reachability_score is None, but
-            # if a recommendation somehow lands here with no reachability
-            # score (e.g. a force-rescore that ignored the gate), refuse
-            # to mark it ready_to_send.
-            if (
-                pctx.get("recommended_to_send")
-                and pctx.get("cold_reachability_score") is None
-            ):
-                qa_fails.append(
-                    "cold_reachability_score is unknown; Stage 7 refuses "
-                    "to mark ready_to_send without it"
-                )
-            # Batch 37 (#35): founder email domain should match the
-            # company's primary domain when one is configured. Mismatch
-            # is a soft warning (downgrade to draft) so the operator
-            # catches "sending from gmail.com instead of company.io".
-            founder_email = (
-                ws.company.get("company") or {}
-            ).get("founder_email") or ""
-            primary_domain = _company_primary_domain(ws.company)
-            if (
-                founder_email
-                and primary_domain
-                and "@" in founder_email
-            ):
-                fe_domain = founder_email.split("@", 1)[1].lower().strip()
-                if fe_domain != primary_domain:
-                    qa_fails.append(
-                        f"founder email domain {fe_domain!r} does not "
-                        f"match company primary domain {primary_domain!r}; "
-                        f"verify the sender is intentional"
-                    )
-
-            base["recommendation_reasoning"] = pctx["recommendation_reasoning"]
-            if pctx.get("warm_path_available"):
-                # Warm path takes precedence -- don't email cold.
-                base["outreach_status"] = "warm_path_needed"
-                base["recommendation_reasoning"] = (
-                    f"warm_path_available=TRUE; cold draft suppressed. "
-                    f"{pctx['recommendation_reasoning'] or ''}"
-                ).strip()
-            elif pctx["recommended_to_send"] and qa_fails:
-                base["outreach_status"] = "draft"
-                base["recommendation_reasoning"] = (
-                    f"DOWNGRADED by Stage 7 QA: {'; '.join(qa_fails)}. "
-                    f"(Stage 6 said: {pctx['recommendation_reasoning'] or '-'})"
-                )
+            base["outreach_status"] = decision.outreach_status
+            base["recommendation_reasoning"] = decision.reasoning
+            if decision.downgraded:
                 downgraded_count += 1
-            elif pctx["recommended_to_send"]:
-                base["outreach_status"] = "ready_to_send"
-            else:
-                base["outreach_status"] = "draft"
             csv_rows.append(base)
 
         out_path = write_review_queue(ws.exports_dir, csv_rows)
