@@ -158,23 +158,15 @@ from core.email.stub_bank import (  # noqa: E402,F401
 
 # ------- live LLM prompt assembly (built but exercised only when key present) -------
 
-def _read_example_files(examples_dir) -> str:
-    """Concatenate every prompts/examples/*.md into one block for the live
-    prompt. The base prompt previously said 'load the corresponding example
-    file as a style anchor', but the LLM has no filesystem access -- it was
-    being told to use anchors that were never sent. Each file is wrapped in
-    a header so the model can see which strategy it belongs to."""
-    from pathlib import Path
-    examples_dir = Path(examples_dir)
-    if not examples_dir.exists():
-        return "(no example files available)"
-    chunks: list[str] = []
-    for path in sorted(examples_dir.glob("*.md")):
-        body = path.read_text(encoding="utf-8").strip()
-        if not body:
-            continue
-        chunks.append(f"--- {path.stem} ---\n{body}")
-    return "\n\n".join(chunks) if chunks else "(no example files available)"
+# Live-prompt assembly moved to core/email/prompt.py (Refactor item 14).
+# Re-exported here so any external importer of the symbols keeps working.
+from core.email.prompt import (  # noqa: E402,F401
+    _meeting_slot,
+    _read_example_files,
+    meeting_slot,
+    read_example_files,
+)
+from core.email.prompt import build_live_prompt as _build_live_prompt_impl
 
 
 def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
@@ -182,84 +174,26 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
                       lead_likelihood_score, axes_summary, fund_kill_signals,
                       signals_for_partner, deals_for_partner,
                       examples_dir) -> str:
-    c = company_cfg["company"]
-    rc = company_cfg["raise_context"]
-    rh = rc.get("round_hook") or {}
-    return (
-        PROMPT_PATH.read_text(encoding="utf-8")
-        .replace("{COMPANY_NAME}", c["name"])
-        .replace("{FOUNDER_NAME}", c["founder_name"])
-        .replace("{ROUND}", rc.get("round", ""))
-        .replace("{RAISE_AMOUNT}", rc.get("amount", ""))
-        .replace("{RAISE_STATUS}", rc.get("status", ""))
-        .replace("{RAISE_TIMING}", rc.get("timing", ""))
-        .replace("{WHY_THIS_ROUND_IS_FUNDABLE_NOW}", rc.get("why_this_round_is_fundable_now", ""))
-        .replace("{WHAT_CHANGES_AFTER_THIS_ROUND}", rc.get("what_changes_after_this_round", ""))
-        .replace("{ROUND_HOOK_REASON}", rh.get("strongest_reason_to_meet_now", ""))
-        .replace("{ROUND_HOOK_CONSEQUENCE}", rh.get("investor_consequence_of_waiting", ""))
-        .replace("{ROUND_HOOK_MOMENTUM_PROOF}", rh.get("round_momentum_proof", ""))
-        .replace("{COMPANY_DESCRIPTION}", c.get("description", ""))
-        .replace("{STRONGEST_RAISE_PROOF}", rc.get("strongest_raise_proof", ""))
-        .replace("{HEADLINE_METRIC}", c.get("current_traction", {}).get("headline_metric", ""))
-        .replace("{SECONDARY_METRICS}", ", ".join(c.get("current_traction", {}).get("secondary_metrics", [])))
-        .replace("{CUSTOMER_EVIDENCE}", "")
-        .replace("{TECHNICAL_VALIDATION}", "")
-        .replace("{NON_DILUTIVE_OR_STRATEGIC}", rc.get("notable_existing_investors_or_non_dilutive", ""))
-        .replace("{FOUNDER_MARKET_FIT}", "")
-        .replace("{PARTNER_NAME}", partner_name or "")
-        .replace("{FUND_NAME}", fund_name or "")
-        .replace("{PARTNER_BIO}", partner_bio or "")
-        # Finding 5: stop sending blank scoring context to the live LLM.
-        .replace("{COMPOSITE_SCORE}",
-                 "" if composite_score is None else f"{composite_score:.2f}")
-        .replace("{ROUND_FIT_SCORE}",
-                 "" if round_fit_score is None else f"{round_fit_score:.1f}")
-        .replace("{LEAD_LIKELIHOOD_SCORE}",
-                 "" if lead_likelihood_score is None else f"{lead_likelihood_score:.1f}")
-        .replace("{TOP_AXES_NAMES_AND_SCORES}", axes_summary or "")
-        .replace("{TOP_SIGNALS}", json.dumps([
-            {"quote": s["quote"], "url": s["source_url"], "date": str(s.get("date"))}
-            for s in signals_for_partner[:3]
-        ]))
-        # Stage 2 does not yet persist per-fund portfolio_companies; left
-        # blank with a comment so the operator knows it's a known gap.
-        .replace("{ADJACENT_PORTFOLIO_COMPANIES}", "")
-        .replace("{RECENT_PARTNER_LED_DEALS}", json.dumps([
-            {"company": d["company"], "round": d.get("round_type")}
-            for d in deals_for_partner
-        ]))
-        # COMM_STYLE would need linguistic analysis we don't yet do.
-        .replace("{COMM_STYLE}", "")
-        .replace("{KILL_SIGNALS}", fund_kill_signals or "")
-        .replace("{FOUNDER_VOICE_STYLE}", (company_cfg.get("founder_voice") or {}).get("style", ""))
-        .replace("{FOUNDER_BANNED_PHRASES}", ", ".join(
-            (company_cfg.get("founder_voice") or {}).get("banned_phrases", [])
-        ))
-        # Inject the actual file contents AND keep the legacy {EXAMPLES_DIR}
-        # token for backward-compatibility with any custom prompts that still
-        # reference the directory path.
-        .replace("{EXAMPLES_BLOCK}", _read_example_files(examples_dir))
-        .replace("{EXAMPLES_DIR}", str(examples_dir))
-        .replace("{MEETING_DURATION}", str(c.get("meeting_ask", {}).get("duration_minutes", 30)))
-        .replace("{MEETING_FORMAT}", c.get("meeting_ask", {}).get("format", "video call"))
-        .replace("{SCHEDULING_LINK}", c.get("meeting_ask", {}).get("preferred_scheduling_link", ""))
-        # Finding 6: {TIME_1}/{TIME_2} were never substituted; a live LLM
-        # could emit literal placeholders. Pull from
-        # company.meeting_ask.preferred_time_slots if set; else fill with a
-        # neutral string. check_hard_gates ALSO rejects any leftover
-        # `{...}` placeholder in the body as a belt-and-suspenders guard.
-        .replace("{TIME_1}", _meeting_slot(c, 0))
-        .replace("{TIME_2}", _meeting_slot(c, 1))
+    """Thin wrapper: reads the prompt template from PROMPT_PATH and
+    forwards everything else to core.email.prompt.build_live_prompt
+    so that function stays pure (no side-effecting file reads) and is
+    unit-testable from any fixture template string."""
+    return _build_live_prompt_impl(
+        prompt_template=PROMPT_PATH.read_text(encoding="utf-8"),
+        company_cfg=company_cfg,
+        partner_name=partner_name,
+        fund_name=fund_name,
+        partner_bio=partner_bio,
+        composite_score=composite_score,
+        round_fit_score=round_fit_score,
+        round_fit_reasoning=round_fit_reasoning,
+        lead_likelihood_score=lead_likelihood_score,
+        axes_summary=axes_summary,
+        fund_kill_signals=fund_kill_signals,
+        signals_for_partner=signals_for_partner,
+        deals_for_partner=deals_for_partner,
+        examples_dir=examples_dir,
     )
-
-
-def _meeting_slot(company_block: dict, idx: int) -> str:
-    slots = (company_block.get("meeting_ask") or {}).get("preferred_time_slots") or []
-    if idx < len(slots) and slots[idx]:
-        return str(slots[idx])
-    # Sentinel that won't slip past the placeholder hard gate if the LLM
-    # decides to use the slots-only CTA when slots aren't configured.
-    return "(no time slot configured)"
 
 
 # ------- batch QA -------
