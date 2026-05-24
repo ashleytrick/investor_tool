@@ -76,8 +76,12 @@ def main() -> int:
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
     print_banner(ws, stage=STAGE)
+    # WorkspacePolicy centralizes the prod-mode-implies-strict /
+    # fixture-mode-refuses-real-writes derivations (Refactor item 10).
+    from core.workspace_policy import WorkspacePolicy
+    policy = WorkspacePolicy.from_workspace_and_args(ws, args)
     # Batch 30 (#529): mode-aware refusal.
-    if ws.mode == "fixture" and not args.allow_fixture_mode:
+    if policy.refuses_fixture_data():
         print(
             f"[gmail_drafts] REFUSED: workspace mode=fixture; would draft "
             f"fictional partners. Pass --allow-fixture-mode to override."
@@ -89,7 +93,7 @@ def main() -> int:
     # the "Gmail not linked, skipping" outcome lands in `runs` with
     # records_skipped=1 instead of writing no run row at all. status.py
     # + the operator can then see when this stage was last attempted.
-    require_gmail = args.require_gmail or ws.mode == "prod"
+    require_gmail = policy.require_gmail
     try:
         gmail = GmailClient.from_workspace(ws)
     except GmailNotConfigured:
@@ -185,7 +189,7 @@ def main() -> int:
                     body=rec.body,
                 )
                 # Filter out .example checks if the operator opted in.
-                if args.allow_example_domains:
+                if policy.allow_example_domains:
                     prod_fails = [
                         f for f in prod_fails
                         if "example/reserved domain" not in f
