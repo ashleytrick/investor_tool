@@ -80,6 +80,16 @@ def _looks_like_placeholder(value: Any) -> bool:
     return False
 
 
+# Batch 21 (#718): very-loose email shape -- the goal is to catch
+# "foo@bar" or "not-an-email", not to enforce RFC 5322. Real validation
+# happens at send time via Gmail.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _looks_like_email(value: Any) -> bool:
+    return isinstance(value, str) and bool(_EMAIL_RE.match(value.strip()))
+
+
 def _scan_placeholders(obj: Any, path: str, issues: list[str]) -> None:
     """Recurse through dict/list and flag any leftover {PLACEHOLDER} strings."""
     if isinstance(obj, dict):
@@ -104,6 +114,14 @@ def _check_company(company_cfg: dict, issues: list[str]) -> None:
                      "description", "stage"):
         if not co.get(required):
             issues.append(f"company.yaml: company.{required} missing or empty")
+
+    # Batch 21 (#718): founder_email must look like an email.
+    fe = (co.get("founder_email") or "").strip()
+    if fe and not _looks_like_email(fe):
+        issues.append(
+            f"company.yaml: company.founder_email {fe!r} doesn't look like "
+            f"a valid email address"
+        )
 
     cs = co.get("target_check_size_usd") or {}
     if not isinstance(cs, dict):
@@ -155,6 +173,28 @@ def _check_meeting_ask(company_cfg: dict, issues: list[str]) -> None:
             f"company.yaml: meeting_ask.preferred_scheduling_link is still "
             f"a placeholder ({link!r})"
         )
+    # Batch 21 (#717): scheduling link must be HTTPS so the operator
+    # doesn't ship a `http://` link into outreach (browsers warn / block).
+    if link and not _looks_like_placeholder(link):
+        if not (link.startswith("https://") or link.startswith("http://")):
+            issues.append(
+                f"company.yaml: meeting_ask.preferred_scheduling_link "
+                f"{link!r} should start with https:// or http://"
+            )
+        elif link.startswith("http://"):
+            issues.append(
+                f"company.yaml: meeting_ask.preferred_scheduling_link "
+                f"{link!r} uses http://; use https:// for outreach"
+            )
+    # Batch 21 (#716): duration_minutes within a reasonable range. The
+    # brief defaults to 30; reject 0/negative or absurd (> 240) values.
+    dm = ma.get("duration_minutes")
+    if dm is not None:
+        if not isinstance(dm, int) or dm <= 0 or dm > 240:
+            issues.append(
+                f"company.yaml: meeting_ask.duration_minutes {dm!r} should "
+                f"be a positive integer <= 240"
+            )
 
 
 def _check_axes(axes_cfg: dict, issues: list[str]) -> None:
@@ -169,6 +209,11 @@ def _check_axes(axes_cfg: dict, issues: list[str]) -> None:
         )
     expected_ids = {f"axis_{i}" for i in range(1, 5)}
     seen_ids: set[str] = set()
+    # Batch 21 (#727): detect axes that are duplicate copies of each other
+    # (same name OR same description -- exact-match heuristic). Operators
+    # who collapse two axes during editing sometimes leave both rows.
+    seen_names: dict[str, int] = {}
+    seen_descs: dict[str, int] = {}
     for i, ax in enumerate(axes):
         if not isinstance(ax, dict):
             issues.append(f"axes.yaml: axes[{i}] must be a mapping")
@@ -181,15 +226,48 @@ def _check_axes(axes_cfg: dict, issues: list[str]) -> None:
         for required in ("id", "name", "description"):
             if not ax.get(required):
                 issues.append(f"axes.yaml: axes[{i}].{required} missing or empty")
+        # Batch 21 (#723/#724): weights must be POSITIVE and in [0.1, 5.0].
+        # Negative weights would invert the axis contribution; weights >5
+        # would dominate every composite over a normalized axis.
         w = ax.get("weight")
-        if w is not None and not isinstance(w, (int, float)):
-            issues.append(
-                f"axes.yaml: axes[{i}].weight must be numeric (got {w!r})"
-            )
+        if w is not None:
+            if not isinstance(w, (int, float)):
+                issues.append(
+                    f"axes.yaml: axes[{i}].weight must be numeric (got {w!r})"
+                )
+            elif w <= 0:
+                issues.append(
+                    f"axes.yaml: axes[{i}].weight ({w}) must be positive"
+                )
+            elif w > 5.0:
+                issues.append(
+                    f"axes.yaml: axes[{i}].weight ({w}) > 5.0 will dominate "
+                    f"composite scoring; cap at 5.0 or rebalance"
+                )
         if not ax.get("positive_signals"):
             issues.append(
                 f"axes.yaml: axes[{i}].positive_signals must list >=1 keyword"
             )
+        nm = (ax.get("name") or "").strip().lower()
+        ds = (ax.get("description") or "").strip().lower()
+        if nm:
+            if nm in seen_names:
+                issues.append(
+                    f"axes.yaml: axes[{i}] has the same name as "
+                    f"axes[{seen_names[nm]}] -- two axes describing the "
+                    f"same belief; collapse or differentiate"
+                )
+            else:
+                seen_names[nm] = i
+        if ds:
+            if ds in seen_descs:
+                issues.append(
+                    f"axes.yaml: axes[{i}] has the same description as "
+                    f"axes[{seen_descs[ds]}] -- two axes describing the "
+                    f"same belief; collapse or differentiate"
+                )
+            else:
+                seen_descs[ds] = i
     if len(axes) == 4 and seen_ids and seen_ids != expected_ids:
         issues.append(
             f"axes.yaml: axis IDs must be exactly {sorted(expected_ids)} "

@@ -1665,6 +1665,113 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch21_config_validators():
+    """Inventory #716/#717/#718/#723/#724/#727: preflight catches the
+    common config drift problems that would otherwise silently corrupt
+    a real run."""
+    from core.validate_config import (
+        _check_axes, _check_company, _check_meeting_ask, _looks_like_email,
+    )
+
+    # #718: founder_email shape
+    assert _looks_like_email("dana@tendril.example") is True
+    assert _looks_like_email("dana@tendril") is False
+    assert _looks_like_email("not-an-email") is False
+    assert _looks_like_email("") is False
+    assert _looks_like_email(None) is False
+
+    co_base = {
+        "company": {
+            "name": "Tendril", "founder_name": "Dana",
+            "founder_email": "dana@tendril.com", "one_liner": "x",
+            "description": "y", "stage": "SEED",
+            "target_check_size_usd": {"min": 100_000, "max": 1_000_000},
+            "target_sectors": ["fintech"],
+        },
+    }
+    issues: list[str] = []
+    _check_company(co_base, issues)
+    assert not [i for i in issues if "founder_email" in i]
+
+    issues = []
+    bad = {**co_base, "company": {**co_base["company"],
+                                  "founder_email": "not-an-email"}}
+    _check_company(bad, issues)
+    assert any("founder_email" in i for i in issues)
+
+    # #716/#717: meeting_ask
+    issues = []
+    _check_meeting_ask({"company": {"meeting_ask": {
+        "duration_minutes": 30,
+        "preferred_scheduling_link": "https://cal.example/dana",
+    }}}, issues)
+    assert not issues  # placeholder = no, https = yes, dur = 30
+
+    issues = []
+    _check_meeting_ask({"company": {"meeting_ask": {
+        "duration_minutes": 30,
+        "preferred_scheduling_link": "http://cal.example/dana",
+    }}}, issues)
+    assert any("http://" in i for i in issues)
+
+    issues = []
+    _check_meeting_ask({"company": {"meeting_ask": {
+        "duration_minutes": 999,
+        "preferred_scheduling_link": "https://cal.example/dana",
+    }}}, issues)
+    assert any("duration_minutes" in i for i in issues)
+
+    issues = []
+    _check_meeting_ask({"company": {"meeting_ask": {
+        "duration_minutes": 30,
+        "preferred_scheduling_link": "not-a-url",
+    }}}, issues)
+    assert any("https://" in i for i in issues)
+
+    # #723/#724: axis weight positive + bounded
+    axes_ok = {"axes": [
+        {"id": f"axis_{i}", "name": f"n{i}", "description": f"d{i}",
+         "positive_signals": ["x"], "weight": 1.0}
+        for i in range(1, 5)
+    ]}
+    issues = []
+    _check_axes(axes_ok, issues)
+    assert not issues
+
+    bad_axes = {"axes": [
+        {"id": "axis_1", "name": "n1", "description": "d1",
+         "positive_signals": ["x"], "weight": -1.0},
+        {"id": "axis_2", "name": "n2", "description": "d2",
+         "positive_signals": ["x"], "weight": 10.0},
+        {"id": "axis_3", "name": "n3", "description": "d3",
+         "positive_signals": ["x"], "weight": 1.0},
+        {"id": "axis_4", "name": "n4", "description": "d4",
+         "positive_signals": ["x"], "weight": 1.0},
+    ]}
+    issues = []
+    _check_axes(bad_axes, issues)
+    msgs = " ".join(issues)
+    assert "must be positive" in msgs
+    assert "> 5.0" in msgs
+
+    # #727: duplicate axes by name/description
+    dup_axes = {"axes": [
+        {"id": "axis_1", "name": "same", "description": "d1",
+         "positive_signals": ["x"], "weight": 1.0},
+        {"id": "axis_2", "name": "same", "description": "d2",
+         "positive_signals": ["x"], "weight": 1.0},
+        {"id": "axis_3", "name": "n3", "description": "same",
+         "positive_signals": ["x"], "weight": 1.0},
+        {"id": "axis_4", "name": "n4", "description": "same",
+         "positive_signals": ["x"], "weight": 1.0},
+    ]}
+    issues = []
+    _check_axes(dup_axes, issues)
+    msgs = " ".join(issues)
+    assert "same name" in msgs
+    assert "same description" in msgs
+
+
 def test_batch20_env_precedence():
     """Inventory #815/#816: env resolution is (process env if non-empty)
     > workspace .env > root .env. An empty process env value must NOT
