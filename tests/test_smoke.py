@@ -1557,6 +1557,216 @@ def test_batch15_manual_override_polish():
         assert warm is None
 
 
+def test_batch16_live_prompt_has_no_unfilled_placeholders():
+    """Inventory #828/#457: build_live_prompt should leave no `{TOKEN}` -style
+    placeholders after substitution. Catches drift between the prompt
+    file and build_live_prompt's .replace() chain."""
+    import importlib.util
+    import re
+    spec = importlib.util.spec_from_file_location(
+        "s7", REPO_ROOT / "scripts" / "07_generate_emails.py"
+    )
+    s7 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s7)
+
+    company = {
+        "company": {
+            "name": "Tendril",
+            "founder_name": "Dana Okafor",
+            "founder_email": "dana@tendril.example",
+            "description": "Compliance reporting as an API.",
+            "one_liner": "Compliance reporting as an API.",
+            "current_traction": {"headline_metric": "$180K ARR",
+                                  "secondary_metrics": ["NRR 128%"]},
+            "target_sectors": ["fintech"],
+            "meeting_ask": {
+                "duration_minutes": 30, "format": "video call",
+                "preferred_scheduling_link": "https://cal.example/dana",
+                "preferred_time_slots": ["Tue 10am PT", "Wed 2pm PT"],
+            },
+        },
+        "raise_context": {
+            "round": "Seed", "amount": "$3M", "status": "in market",
+            "timing": "first close in 8 weeks",
+            "why_this_round_is_fundable_now": "x",
+            "what_changes_after_this_round": "y",
+            "strongest_raise_proof": "z",
+            "notable_existing_investors_or_non_dilutive": "w",
+            "round_hook": {
+                "strongest_reason_to_meet_now": "a",
+                "investor_consequence_of_waiting": "b",
+                "round_momentum_proof": "c",
+            },
+        },
+        "founder_voice": {
+            "style": "direct", "banned_phrases": ["would love"],
+        },
+    }
+    prompt = s7.build_live_prompt(
+        company_cfg=company,
+        partner_name="Priya Anand",
+        fund_name="Northbeam",
+        partner_bio="Investor focused on regulated fintech.",
+        composite_score=8.0,
+        round_fit_score=10.0,
+        round_fit_reasoning="stage match, check overlap",
+        lead_likelihood_score=6.0,
+        axes_summary="axis_1 (8.0), axis_2 (6.0)",
+        fund_kill_signals=None,
+        signals_for_partner=[
+            {"quote": "regulation as moat",
+             "source_url": "https://example.com/p",
+             "date": "2026-02-01"},
+        ],
+        deals_for_partner=[
+            {"company": "LedgerKit", "round_type": "Seed"},
+        ],
+        examples_dir=REPO_ROOT / "clients" / "test_workspace" / "prompts" / "examples",
+    )
+    leftover = sorted(set(re.findall(r"\{[A-Z][A-Z0-9_]*\}", prompt)))
+    assert not leftover, f"unfilled placeholders in live prompt: {leftover}"
+    # Sanity: examples block actually injected, not just the path.
+    assert "--- signal_led ---" in prompt, (
+        "expected `--- signal_led ---` from the examples block; the prompt "
+        "may still be using {EXAMPLES_DIR} without {EXAMPLES_BLOCK}"
+    )
+
+
+def test_batch16_check_size_parser_edge_cases():
+    """Inventory #919/#920/#921/#922/#923: round_fit's check-size parsing
+    must handle commas, malformed ranges, and missing config without
+    crashing."""
+    from core.round_fit import (
+        parse_check_size, ranges_overlap, compute_round_fit,
+    )
+
+    # Commas in the numeric part.
+    assert parse_check_size("$1,000,000-$2,000,000") == (1_000_000, 2_000_000)
+    # K / M suffixes.
+    assert parse_check_size("$500K-$2M") == (500_000, 2_000_000)
+    # Malformed: returns None, doesn't crash.
+    assert parse_check_size("around $500K to a few million") is None
+    assert parse_check_size("") is None
+    assert parse_check_size(None) is None
+    # Overlap helper
+    assert ranges_overlap((100, 500), (400, 1000)) is True
+    assert ranges_overlap((100, 500), (600, 1000)) is False
+
+    # min > max raise context: compute_round_fit shouldn't crash.
+    fund = {"stated_stage_focus": "seed", "check_size_range": "$1M-$3M",
+            "is_active": True}
+    partner = {"title": "Partner"}
+    company = {
+        "company": {"target_check_size_usd": {"min": 500_000, "max": 1_500_000},
+                    "target_sectors": ["fintech"]},
+        "raise_context": {"round": "Seed"},
+        "round_fit": {"disqualifiers": []},
+    }
+    rf = compute_round_fit(fund, partner, [], False, company)
+    assert 0.0 <= rf.round_fit_score <= 10.0
+
+
+def test_batch16_doctor_invariant_for_orphan_summary_via_drift():
+    """Inventory #907 + #503: doctor surfaces an orphan summary when the
+    partners row is deleted out from under it (simulating an older DB
+    without FK enforcement). FK enforcement makes this hard to trigger
+    in fresh DBs -- we have to temporarily disable FKs to inject the
+    drift, then re-enable for the doctor read."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+
+        c = sqlite3.connect(db)
+        # FKs are OFF for direct sqlite3 connections by default. Inject the
+        # orphan -- specifically, sever partner_id without touching the
+        # cascading children so the summary survives the delete.
+        c.execute("PRAGMA foreign_keys = OFF")
+        c.execute(
+            "update partner_score_summaries set partner_id = ? "
+            "where partner_id = (select partner_id from partner_score_summaries limit 1)",
+            ("orphan-fake-partner-id",),
+        )
+        c.commit()
+        c.close()
+
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "doctor.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        payload = json.loads(res.stdout)
+        assert any(
+            "partner_score_summaries" in e and "orphan" in e
+            for e in payload["errors"]
+        ), f"expected orphan summary finding; got {payload['errors']}"
+
+
+def test_batch16_fund_kill_signals_block_recommendation():
+    """Inventory #834/#927: a fund whose Stage 2 enrichment extracted
+    explicit kill_signals must trigger major_kill and prevent
+    recommended_to_send for that fund's partners."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+        ):
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+        # Force a kill_signals string onto an active fund whose partners
+        # would otherwise be recommended.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update funds set kill_signals = ? "
+            "where fund_id = 'northbeam.example'",
+            ("explicitly does not lead seed rounds in fintech",),
+        )
+        c.commit()
+        c.close()
+
+        _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        rows = c.execute(
+            "select p.partner_id, s.major_kill_signal_present, "
+            "s.recommended_to_send, s.kill_signal_summary "
+            "from partners p join partner_score_summaries s "
+            "on s.partner_id = p.partner_id "
+            "where p.fund_id = 'northbeam.example'"
+        ).fetchall()
+        c.close()
+        assert rows, "expected Northbeam partners with summaries"
+        for pid, major_kill, recommended, kill_summary in rows:
+            assert major_kill == 1, (
+                f"partner {pid}: fund.kill_signals should trip major_kill"
+            )
+            assert "fund kill_signals" in (kill_summary or ""), (
+                f"kill_signal_summary should mention the fund kill; "
+                f"got {kill_summary!r}"
+            )
+            assert recommended == 0, (
+                f"partner {pid}: should not be recommended when fund has kill"
+            )
+
+
 def test_batch15_apply_records_approver():
     """Batch 15: apply_axis_suggestion records approved_by + approval_reason
     on the row, and --list doesn't pollute run.processed."""
