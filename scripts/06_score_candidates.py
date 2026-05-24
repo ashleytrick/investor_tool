@@ -399,40 +399,24 @@ def main() -> int:
                         cs, ws.axes
                     )
 
-                    # cold_reachability_score: combines Stage-4 LLM partial (weight
-                    # 0.6 -> max contribution 6.0) with deterministic components:
-                    # post count in last 12mo (up to 2.0) and recency of last post
-                    # (up to 2.0). Max 10.0. Brief Step 4 also lists a contact-info
-                    # component derived from fund-site scraping; that lands when
-                    # Stage 2 enrichment persists contact-info presence.
-                    most_recent = max((s["date"] for s in p_signals if s.get("date")),
-                                      default=None)
-                    # Past-only counting: future-dated signals don't pad the
-                    # 12-month post count or the recency bonus.
-                    from core.dates import days_since, within_days
-                    post_count_12mo = sum(
-                        1 for s in p_signals
-                        if within_days(s.get("date"), 365, today)
+                    # cold_reachability_score: combines Stage-4 LLM partial
+                    # with deterministic post count + recency bands.
+                    # core/scoring/reachability.py owns the formula (Refactor
+                    # 7/13). Brief Step 4 also lists a contact-info component
+                    # derived from fund-site scraping; that lands when Stage 2
+                    # enrichment persists contact-info presence.
+                    from core.scoring.reachability import (
+                        compute_cold_reachability,
                     )
-                    if post_count_12mo >= 3:
-                        posts_pts = 2.0
-                    elif post_count_12mo >= 1:
-                        posts_pts = 1.0
-                    else:
-                        posts_pts = 0.0
-                    _mr = days_since(most_recent, today)
-                    if _mr is None:
-                        recency_pts = 0.0
-                    elif _mr <= 90:
-                        recency_pts = 2.0
-                    elif _mr <= 180:
-                        recency_pts = 1.0
-                    else:
-                        recency_pts = 0.0
-                    partial = p.cold_reachability_partial_score
-                    cold_reachability = (
-                        max(0.0, min(10.0, float(partial) * 0.6 + posts_pts + recency_pts))
-                        if partial is not None else None
+                    # also need most_recent for signal_recency_bonus below
+                    most_recent = max(
+                        (s["date"] for s in p_signals if s.get("date")),
+                        default=None,
+                    )
+                    cold_reachability = compute_cold_reachability(
+                        partial_score=p.cold_reachability_partial_score,
+                        partner_signals=p_signals,
+                        today=today,
                     )
 
                     # Major kill signal aggregation. components.get() rather than
