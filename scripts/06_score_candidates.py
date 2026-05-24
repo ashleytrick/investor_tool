@@ -70,51 +70,13 @@ def _now() -> datetime:
 
 
 # ------- composite scoring (LLM + stub) -------
-
-def _stub_axis_scores(verified_signals: list[dict], axes_cfg: dict) -> dict:
-    """Deterministic per-axis stub used when the LLM client is offline.
-
-    Signal direction matters: a 'negative' quote on an axis is evidence the
-    partner DOES NOT hold that belief, so it should LOWER the axis score, not
-    raise it. The previous version counted all signals as positive evidence,
-    so an anti-fit quote tagged to the regulated-market axis would bump the
-    score for that axis by 0.5-1.0.
-    """
-    by_axis: dict[str, dict] = {}
-    for ax in axes_cfg.get("axes", []):
-        ax_id = ax["id"]
-        relevant = [s for s in verified_signals if ax_id in s["axes"]]
-        if not relevant:
-            by_axis[ax_id] = {
-                "score": None,
-                "supporting_signal_ids": [],
-                "confidence": "low",
-                "reasoning": "no verified quality>=2 signals on this axis",
-            }
-            continue
-        pos = [s for s in relevant if (s.get("direction") or "").lower() == "positive"]
-        neg = [s for s in relevant if (s.get("direction") or "").lower() == "negative"]
-        q3 = sum(1 for s in pos if s["quality"] == 3)
-        q2 = sum(1 for s in pos if s["quality"] == 2)
-        q3_neg = sum(1 for s in neg if s["quality"] == 3)
-        q2_neg = sum(1 for s in neg if s["quality"] == 2)
-        # Start at 6 (neutral). Positive signals raise it; negative signals
-        # subtract proportionally. Clamp to [0, 10] so a partner with
-        # several anti-fit quotes lands at 0, not below.
-        score = 6.0 + min(3, q3) + (0.5 if q2 else 0.0)
-        score -= min(3, q3_neg) + (0.5 if q2_neg else 0.0)
-        score = max(0.0, min(10.0, score))
-        confidence = "high" if len(relevant) >= 2 else ("medium" if (q3 or q3_neg) else "low")
-        by_axis[ax_id] = {
-            "score": float(score),
-            "supporting_signal_ids": [s["id"] for s in relevant],
-            "confidence": confidence,
-            "reasoning": (
-                f"stub: pos={q3}xQ3+{q2}xQ2, neg={q3_neg}xQ3+{q2_neg}xQ2 "
-                f"tagged on this axis"
-            ),
-        }
-    return by_axis
+# composite_and_spikiness + stub_axis_scores moved to
+# core/scoring/composite.py (Refactor item 7/13). Local _stub_axis_scores
+# alias keeps the existing call-site name unchanged.
+from core.scoring.composite import (  # noqa: E402
+    composite_and_spikiness,
+    stub_axis_scores as _stub_axis_scores,
+)
 
 
 def score_candidate(
@@ -165,38 +127,6 @@ def score_candidate(
         model=MODEL_BATCH,
         stub_response=stub_response,
     )
-
-
-def composite_and_spikiness(
-    candidate_score: CandidateScore, axes_cfg: dict
-) -> tuple[float | None, float | None, float, float, str]:
-    """Returns (composite_or_None, axis_max_or_None, variance, spiky, confidence)."""
-    weights_by_id = {ax["id"]: float(ax.get("weight", 1.0)) for ax in axes_cfg["axes"]}
-    scored = [
-        (ax_id, ax_data)
-        for ax_id, ax_data in candidate_score.axis_scores.items()
-        if ax_data.score is not None
-    ]
-    if not scored:
-        return None, None, 0.0, 0.0, "low"
-
-    total_w = sum(weights_by_id.get(ax_id, 1.0) for ax_id, _ in scored)
-    weighted = sum(
-        ax_data.score * weights_by_id.get(ax_id, 1.0) for ax_id, ax_data in scored
-    )
-    composite = weighted / total_w
-    score_values = [ax_data.score for _, ax_data in scored]
-    axis_max = max(score_values)
-    if len(score_values) > 1:
-        mean = sum(score_values) / len(score_values)
-        variance = sum((s - mean) ** 2 for s in score_values) / len(score_values)
-    else:
-        variance = 0.0
-    spiky = max(0.0, min(2.0, variance * 0.5))
-
-    n = len(scored)
-    confidence = "high" if n >= 4 else ("medium" if n >= 2 else "low")
-    return composite, axis_max, variance, spiky, confidence
 
 
 # ------- send_now_priority -------
