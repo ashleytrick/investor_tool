@@ -293,10 +293,14 @@ followup_drafts = Table(
         "partner_id", Text,
         ForeignKey("partners.partner_id", ondelete="CASCADE"),
     ),
+    # Batch 23 (#473): join to email_drafts.batch_id so a followup row
+    # can be traced back to the Stage 7 batch it was generated for.
+    Column("batch_id", Text),
     Column("body", Text),
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
     Index("ix_followup_drafts_partner_id", "partner_id"),
+    Index("ix_followup_drafts_batch_id", "batch_id"),
 )
 
 deck_request_responses = Table(
@@ -306,10 +310,13 @@ deck_request_responses = Table(
         "partner_id", Text,
         ForeignKey("partners.partner_id", ondelete="CASCADE"),
     ),
+    # Batch 23 (#474): same batch_id link as followup_drafts.
+    Column("batch_id", Text),
     Column("body", Text),
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
     Index("ix_deck_request_responses_partner_id", "partner_id"),
+    Index("ix_deck_request_responses_batch_id", "batch_id"),
 )
 
 batch_qa_reports = Table(
@@ -317,6 +324,12 @@ batch_qa_reports = Table(
     Column("report_id", Integer, primary_key=True, autoincrement=True),
     Column("batch_id", Text),
     Column("batch_size", Integer),
+    # Batch 23 (#367/#467): batch_size historically stored the number of
+    # draft ROWS (partners x variants). Add an explicit per-partner count
+    # so the operator can reconcile "I expected 25 partners; the QA
+    # report shows 50 drafts" without having to know the variants-per-
+    # partner ratio.
+    Column("batch_partner_count", Integer),
     Column("strategy_distribution", Text),
     Column("similarity_failures", Integer),
     Column("template_smell_high_count", Integer),

@@ -1665,6 +1665,75 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch23_stage7_metadata():
+    """Inventory #467, #471-#474: followup_drafts/deck_request_responses
+    carry batch_id, written_to_csv_at is set AFTER CSV success not at
+    insert, and batch_qa_reports.batch_partner_count is populated."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+
+        c = sqlite3.connect(db)
+        # #473/#474: followup + deck have batch_id linking back to email_drafts
+        n_followup_with_batch = c.execute(
+            "select count(*) from followup_drafts where batch_id is not null"
+        ).fetchone()[0]
+        n_followup = c.execute(
+            "select count(*) from followup_drafts"
+        ).fetchone()[0]
+        assert n_followup_with_batch == n_followup > 0, (
+            f"every followup row should carry batch_id; "
+            f"{n_followup_with_batch}/{n_followup}"
+        )
+        n_deck_with_batch = c.execute(
+            "select count(*) from deck_request_responses where batch_id is not null"
+        ).fetchone()[0]
+        n_deck = c.execute(
+            "select count(*) from deck_request_responses"
+        ).fetchone()[0]
+        assert n_deck_with_batch == n_deck > 0
+
+        # The batch_ids should match between email_drafts and followup_drafts
+        # for any given partner.
+        mismatches = c.execute(
+            "select e.partner_id, e.batch_id, f.batch_id "
+            "from email_drafts e join followup_drafts f "
+            "on e.partner_id = f.partner_id "
+            "where e.is_recommended = 1 and e.batch_id != f.batch_id"
+        ).fetchall()
+        assert not mismatches, f"batch_id mismatches: {mismatches}"
+
+        # #467: batch_qa_reports.batch_partner_count populated.
+        size, partners_count = c.execute(
+            "select batch_size, batch_partner_count from batch_qa_reports "
+            "order by report_id desc limit 1"
+        ).fetchone()
+        assert size > 0
+        assert partners_count > 0
+        assert partners_count <= size, (
+            f"batch_partner_count ({partners_count}) should be <= batch_size "
+            f"({size})"
+        )
+
+        # #471/#472: written_to_csv_at is set on recommended email_drafts
+        # rows AFTER the CSV write.
+        n_written = c.execute(
+            "select count(*) from email_drafts "
+            "where is_recommended=1 and written_to_csv_at is not null"
+        ).fetchone()[0]
+        assert n_written > 0, "recommended drafts should have written_to_csv_at"
+        c.close()
+
+
 def test_batch22_email_schema_extends_to_alternate_and_deck():
     """Inventory #373/#374/#607/#608/#612: forbidden-phrase, em-dash, and
     exclamation-mark checks now fire at the SCHEMA layer for variant

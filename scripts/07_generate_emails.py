@@ -1226,6 +1226,10 @@ def main() -> int:
                         {"subject": v.subject, "body": v.body}, banned
                     )
                     qa_status = "pass" if not hard_fails and smell_info.get("template_smell") != "high" else "fail"
+                    # Batch 23 (#471/#472): leave written_to_csv_at NULL
+                    # here. It's set AFTER write_review_queue() returns
+                    # successfully, so a CSV failure no longer claims the
+                    # rows landed in the CSV.
                     conn.execute(email_drafts.insert().values(
                         partner_id=pid,
                         batch_id=batch_id,
@@ -1241,19 +1245,26 @@ def main() -> int:
                         regeneration_count=0,
                         is_recommended=is_rec,
                         generated_at=_now(),
-                        written_to_csv_at=_now() if is_rec else None,
+                        written_to_csv_at=None,
                     ))
+                # Batch 23 (#473/#474): tag followup + deck with batch_id
+                # so they can be reconciled to email_drafts.batch_id later.
                 conn.execute(followup_drafts.insert().values(
-                    partner_id=pid, body=output.followup_draft,
+                    partner_id=pid, batch_id=batch_id,
+                    body=output.followup_draft,
                     generated_at=_now(),
                 ))
                 conn.execute(deck_request_responses.insert().values(
-                    partner_id=pid, body=output.deck_request_response,
+                    partner_id=pid, batch_id=batch_id,
+                    body=output.deck_request_response,
                     generated_at=_now(),
                 ))
             conn.execute(batch_qa_reports.insert().values(
                 batch_id=batch_id,
                 batch_size=len(all_drafts),
+                # Batch 23 (#367/#467): partner count alongside the draft
+                # count so the operator can reconcile both.
+                batch_partner_count=len({d["partner_id"] for d in all_drafts}),
                 strategy_distribution=json.dumps(qa["strategy_distribution"]),
                 similarity_failures=qa["similarity_failure_count"],
                 template_smell_high_count=qa["template_smell_high_count"],
@@ -1390,6 +1401,28 @@ def main() -> int:
             csv_rows.append(base)
 
         out_path = write_review_queue(ws.exports_dir, csv_rows)
+
+        # Batch 23 (#471/#472): stamp written_to_csv_at on the recommended
+        # email_drafts rows AFTER the CSV write returned successfully.
+        # If write_review_queue() had raised, none of these rows would
+        # claim they were written.
+        rec_partner_ids = [
+            r["partner_id"] for r in csv_rows
+            if r.get("outreach_status") == "ready_to_send"
+            or r.get("outreach_status") == "draft"
+        ]
+        if rec_partner_ids:
+            now = _now()
+            with engine.begin() as conn:
+                conn.execute(
+                    email_drafts.update()
+                    .where(
+                        email_drafts.c.batch_id == batch_id,
+                        email_drafts.c.is_recommended.is_(True),
+                        email_drafts.c.partner_id.in_(rec_partner_ids),
+                    )
+                    .values(written_to_csv_at=now)
+                )
 
         ready = sum(1 for r in csv_rows if r["outreach_status"] == "ready_to_send")
         warm_routed = sum(
