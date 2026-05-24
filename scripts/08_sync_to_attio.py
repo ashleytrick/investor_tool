@@ -33,21 +33,18 @@ from sqlalchemy import func, select
 
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
 from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
+from core.stage_runner import stage_run
 from core.production_guards import production_gate_for_attio_sync
-from core.validate_config import preflight_or_exit
 from core.db import (
     attio_sync_log,
     deck_request_responses,
     email_drafts,
     followup_drafts,
     funds,
-    get_engine,
     partner_score_summaries,
     partners,
     runs,
 )
-from core.runs import RunLogger
 
 STAGE = "08_sync_to_attio"
 
@@ -233,27 +230,30 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(
-        ws, stage=STAGE, require_attio=bool(ws.attio),
-    )
-    print_banner(ws, stage=STAGE)
-    # Batch 30 (#529/#531): mode-aware refusal. A workspace explicitly
-    # marked `mode: fixture` should never sync to real Attio without
-    # the operator stating the intent.
-    if ws.mode == "fixture" and not args.allow_fixture_mode:
-        msg = (
-            f"REFUSED: workspace mode=fixture; sync to Attio would "
-            f"propagate fictional data. Pass --allow-fixture-mode if "
-            f"you really intend to test against Attio."
-        )
-        print(f"[stage 8] {msg}")
-        return 2
-    engine = get_engine(ws.db_url)
-    cfg = ws.attio or {}
-    attio_cfg = cfg.get("attio") or cfg
+    # Refactor sweep: stage_run() boilerplate collapse. require_attio is
+    # dynamic (only enforce when workspace declares attio.yaml); peek the
+    # workspace once before stage_run() so preflight knows.
+    from core.config_loader import load_workspace as _peek_ws
+    _require_attio = bool(_peek_ws(args.workspace).attio)
+    with stage_run(args, stage=STAGE, require_attio=_require_attio,
+                   require_llm=False) as ctx:
+        ws, engine, run = ctx.ws, ctx.engine, ctx.run
+        # Batch 30 (#529/#531): mode-aware refusal. A workspace explicitly
+        # marked `mode: fixture` should never sync to real Attio without
+        # the operator stating the intent.
+        if ws.mode == "fixture" and not args.allow_fixture_mode:
+            msg = (
+                "REFUSED: workspace mode=fixture; sync to Attio would "
+                "propagate fictional data. Pass --allow-fixture-mode if "
+                "you really intend to test against Attio."
+            )
+            print(f"[stage 8] {msg}")
+            run.note(msg)
+            run.failed = max(run.failed, 1)
+            return ctx.exit_code
+        cfg = ws.attio or {}
+        attio_cfg = cfg.get("attio") or cfg
 
-    with RunLogger(engine, ws.name, STAGE) as run:
         # Batch 38 (#46): --require-attio turns the skip-on-missing-config
         # path into a hard failure. ws.mode == "prod" also implies
         # require-attio so a prod workspace can't quietly skip its CRM
@@ -745,7 +745,7 @@ def main() -> int:
         if run.failed:
             return 2
 
-    return 0
+    return ctx.exit_code
 
 
 def _lookup_fund_attio_id(engine, fund_id: str) -> str | None:

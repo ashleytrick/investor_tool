@@ -42,9 +42,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import delete, select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
+from core.config_loader import add_workspace_arg
+from core.stage_runner import stage_run
 from core.csv_export import write_review_queue
 from core.db import (
     batch_qa_reports,
@@ -53,14 +52,12 @@ from core.db import (
     email_drafts,
     followup_drafts,
     funds,
-    get_engine,
     partner_score_summaries,
     partners,
     signals,
 )
-from core.llm.client import MODEL_EMAIL, LLMClient
+from core.llm.client import MODEL_EMAIL
 from core.production_guards import production_gate_for_ready_to_send
-from core.runs import RunLogger
 from core.similarity import first_sentence, ratio_similarity, token_set_similarity
 from schemas.email_generation import EmailOutput
 
@@ -904,89 +901,86 @@ def main() -> int:
             "--skip-freshness-check require --reason \"...\""
         )
 
-    ws = load_workspace(args.workspace)
-    # Examples anchor the LIVE LLM prompt. Stub mode doesn't call the LLM,
-    # so we only require examples when ANTHROPIC_API_KEY is set.
-    preflight_or_exit(
-        ws, stage=STAGE,
-        require_examples=bool(ws.env("ANTHROPIC_API_KEY")),
-    )
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
-    batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    banned = (ws.company.get("founder_voice") or {}).get("banned_phrases", []) or []
-    target_sectors = {
-        s.lower()
-        for s in (ws.company.get("company") or {}).get("target_sectors", []) or []
-    }
-    market_shift_axes = market_shift_axis_ids(ws.axes)
+    # Refactor sweep: stage_run() boilerplate collapse. Examples anchor
+    # the LIVE prompt; stub mode skips the LLM so we only require
+    # example files when ANTHROPIC_API_KEY is resolvable. Workspace .env
+    # may carry the key, so peek the workspace before stage_run() decides
+    # which preflight checks to run.
+    from core.config_loader import load_workspace as _peek_ws
+    _require_examples = bool(_peek_ws(args.workspace).env("ANTHROPIC_API_KEY"))
+    with stage_run(args, stage=STAGE, require_examples=_require_examples) as ctx:
+        ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
+        batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        banned = (ws.company.get("founder_voice") or {}).get("banned_phrases", []) or []
+        target_sectors = {
+            s.lower()
+            for s in (ws.company.get("company") or {}).get("target_sectors", []) or []
+        }
+        market_shift_axes = market_shift_axis_ids(ws.axes)
 
-    # ---- pull top-N partners + their context ----
-    with engine.begin() as conn:
-        rows = list(conn.execute(
-            select(
-                partner_score_summaries,
-                partners.c.name.label("partner_name"),
-                partners.c.title,
-                partners.c.linkedin_url,
-                partners.c.warm_path_available,
-                partners.c.bio,
-                funds.c.name.label("fund_name"),
-                funds.c.domain.label("fund_domain"),
-                funds.c.stated_thesis,
-                # Finding 5: surface fund-level kill signals into the live
-                # prompt so the LLM can avoid triggering them.
-                funds.c.kill_signals.label("fund_kill_signals"),
-            )
-            .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
-            .join(funds, funds.c.fund_id == partners.c.fund_id)
-            .order_by(partner_score_summaries.c.send_now_priority.desc())
-            .limit(args.top)
-        ))
-        # Per-partner per-axis scores -- consumed by the live prompt's
-        # TOP_AXES_NAMES_AND_SCORES placeholder so the LLM strategy picker
-        # has the deterministic axis ranking in hand.
-        from core.db import scores as _scores
-        axis_scores_by_partner: dict[str, list[tuple[str, float | None]]] = {}
-        for s in conn.execute(select(_scores)):
-            axis_scores_by_partner.setdefault(s.partner_id, []).append(
-                (s.axis_id, s.score)
-            )
-        # Per-partner: verified quality>=2 signals.
-        signals_by_partner: dict[str, list[dict]] = {}
-        for s in conn.execute(
-            select(signals).where(
-                signals.c.verified.is_(True),
-                signals.c.signal_quality_score >= 2,
-            )
-        ):
-            signals_by_partner.setdefault(s.partner_id, []).append({
-                "id": int(s.signal_id),
-                "quote": s.quoted_text,
-                "source_url": s.source_url,
-                "source_type": s.source_type,
-                "axes": json.loads(s.axis_relevance or "[]"),
-                "direction": s.signal_direction,
-                "quality": int(s.signal_quality_score),
-                "date": s.quote_date,
-            })
-        # Partner-attributed deals.
-        deals_by_partner: dict[str, list[dict]] = {}
-        for d in conn.execute(select(deal_attributions)):
-            if d.attributed_partner_id:
-                deals_by_partner.setdefault(d.attributed_partner_id, []).append({
-                    "company": d.company,
-                    "round_type": d.round_type,
-                    "round_size_usd": d.round_size_usd,
-                    "announcement_date": d.announcement_date,
-                    "lead_fund_id": d.lead_fund_id,
+        # ---- pull top-N partners + their context ----
+        with engine.begin() as conn:
+            rows = list(conn.execute(
+                select(
+                    partner_score_summaries,
+                    partners.c.name.label("partner_name"),
+                    partners.c.title,
+                    partners.c.linkedin_url,
+                    partners.c.warm_path_available,
+                    partners.c.bio,
+                    funds.c.name.label("fund_name"),
+                    funds.c.domain.label("fund_domain"),
+                    funds.c.stated_thesis,
+                    # Finding 5: surface fund-level kill signals into the live
+                    # prompt so the LLM can avoid triggering them.
+                    funds.c.kill_signals.label("fund_kill_signals"),
+                )
+                .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
+                .join(funds, funds.c.fund_id == partners.c.fund_id)
+                .order_by(partner_score_summaries.c.send_now_priority.desc())
+                .limit(args.top)
+            ))
+            # Per-partner per-axis scores -- consumed by the live prompt's
+            # TOP_AXES_NAMES_AND_SCORES placeholder so the LLM strategy picker
+            # has the deterministic axis ranking in hand.
+            from core.db import scores as _scores
+            axis_scores_by_partner: dict[str, list[tuple[str, float | None]]] = {}
+            for s in conn.execute(select(_scores)):
+                axis_scores_by_partner.setdefault(s.partner_id, []).append(
+                    (s.axis_id, s.score)
+                )
+            # Per-partner: verified quality>=2 signals.
+            signals_by_partner: dict[str, list[dict]] = {}
+            for s in conn.execute(
+                select(signals).where(
+                    signals.c.verified.is_(True),
+                    signals.c.signal_quality_score >= 2,
+                )
+            ):
+                signals_by_partner.setdefault(s.partner_id, []).append({
+                    "id": int(s.signal_id),
+                    "quote": s.quoted_text,
+                    "source_url": s.source_url,
+                    "source_type": s.source_type,
+                    "axes": json.loads(s.axis_relevance or "[]"),
+                    "direction": s.signal_direction,
+                    "quality": int(s.signal_quality_score),
+                    "date": s.quote_date,
                 })
+            # Partner-attributed deals.
+            deals_by_partner: dict[str, list[dict]] = {}
+            for d in conn.execute(select(deal_attributions)):
+                if d.attributed_partner_id:
+                    deals_by_partner.setdefault(d.attributed_partner_id, []).append({
+                        "company": d.company,
+                        "round_type": d.round_type,
+                        "round_size_usd": d.round_size_usd,
+                        "announcement_date": d.announcement_date,
+                        "lead_fund_id": d.lead_fund_id,
+                    })
 
-    rec_in_batch = [r for r in rows if r.recommended_to_send]
+        rec_in_batch = [r for r in rows if r.recommended_to_send]
 
-    with RunLogger(engine, ws.name, STAGE) as run:
-        run.attach_llm_usage(llm.usage)
         # Both safety refusals (Gate 5.5 calibration + Rule 16 ceiling) now
         # live inside the RunLogger context so the refusal lands in `runs`
         # with run.failed=1 and an audit note. The previous early-returns
@@ -1274,7 +1268,7 @@ def main() -> int:
         # to outreach_status=draft already lands in the CSV reasoning;
         # this just refuses to nuke the historical email_drafts row.
         partner_ids_with_failed_rec: set[str] = set()
-        for ctx, output, _ in partner_outputs:
+        for pctx, output, _ in partner_outputs:
             rec_strategy = output.recommended_variant_strategy
             if not rec_strategy:
                 continue
@@ -1285,11 +1279,11 @@ def main() -> int:
                     {"subject": v.subject, "body": v.body}, banned,
                 )
                 if hf:
-                    partner_ids_with_failed_rec.add(ctx["partner_id"])
+                    partner_ids_with_failed_rec.add(pctx["partner_id"])
                 break
         partner_ids_in_batch = [
-            ctx["partner_id"] for ctx, _output, _ in partner_outputs
-            if ctx["partner_id"] not in partner_ids_with_failed_rec
+            pctx["partner_id"] for pctx, _output, _ in partner_outputs
+            if pctx["partner_id"] not in partner_ids_with_failed_rec
         ]
         if partner_ids_with_failed_rec:
             run.note(
@@ -1309,8 +1303,8 @@ def main() -> int:
             qa_by_key = {
                 (d["partner_id"], d["strategy"]): d for d in all_drafts
             }
-            for ctx, output, _ in partner_outputs:
-                pid = ctx["partner_id"]
+            for pctx, output, _ in partner_outputs:
+                pid = pctx["partner_id"]
                 for v in output.variants:
                     is_rec = (v.strategy == output.recommended_variant_strategy)
                     smell_info = qa_by_key.get((pid, v.strategy), {})
@@ -1386,8 +1380,8 @@ def main() -> int:
         # Build CSV rows.
         csv_rows: list[dict] = []
         downgraded_count = 0
-        for ctx, output, _ in partner_outputs:
-            pid = ctx["partner_id"]
+        for pctx, output, _ in partner_outputs:
+            pid = pctx["partner_id"]
             rec = rec_by_partner.get(pid)
             alt = alt_by_partner.get(pid)
             if not rec:
@@ -1401,22 +1395,22 @@ def main() -> int:
             )
             base = {
                 "partner_id": pid,
-                "partner_name": ctx["partner_name"],
-                "partner_title": ctx["title"],
-                "fund_name": ctx["fund_name"],
-                "fund_domain": ctx["fund_domain"],
-                "linkedin_url": ctx["linkedin_url"],
-                "send_now_priority": round(ctx["send_now_priority"] or 0, 2),
-                "composite_fit_score": round(ctx["composite_fit_score"] or 0, 2),
-                "round_fit_score": ctx["round_fit_score"],
-                "round_fit_reasoning": ctx["round_fit_reasoning"],
-                "lead_likelihood_score": ctx["lead_likelihood_score"],
-                "lead_likelihood_signals": ctx["lead_likelihood_signals"],
-                "cold_reachability_score": ctx["cold_reachability_score"],
-                "spiky_belief_score": round(ctx["spiky_belief_score"] or 0, 3),
+                "partner_name": pctx["partner_name"],
+                "partner_title": pctx["title"],
+                "fund_name": pctx["fund_name"],
+                "fund_domain": pctx["fund_domain"],
+                "linkedin_url": pctx["linkedin_url"],
+                "send_now_priority": round(pctx["send_now_priority"] or 0, 2),
+                "composite_fit_score": round(pctx["composite_fit_score"] or 0, 2),
+                "round_fit_score": pctx["round_fit_score"],
+                "round_fit_reasoning": pctx["round_fit_reasoning"],
+                "lead_likelihood_score": pctx["lead_likelihood_score"],
+                "lead_likelihood_signals": pctx["lead_likelihood_signals"],
+                "cold_reachability_score": pctx["cold_reachability_score"],
+                "spiky_belief_score": round(pctx["spiky_belief_score"] or 0, 3),
                 "top_signals": top_signals_str,
-                "recommended_to_send": ctx["recommended_to_send"],
-                "recommendation_reasoning": ctx["recommendation_reasoning"],
+                "recommended_to_send": pctx["recommended_to_send"],
+                "recommendation_reasoning": pctx["recommendation_reasoning"],
                 "email_strategy_used": rec["strategy"],
                 "email_subject_line": rec["subject"],
                 "outreach_email_draft": rec["body"],
@@ -1437,7 +1431,7 @@ def main() -> int:
                 "followup_email_draft": output.followup_draft,
                 "deck_request_response": output.deck_request_response,
                 "template_smell": rec.get("template_smell", "unscored"),
-                "warm_path_available": "" if ctx["warm_path_available"] is None else bool(ctx["warm_path_available"]),
+                "warm_path_available": "" if pctx["warm_path_available"] is None else bool(pctx["warm_path_available"]),
             }
             # ---- outreach_status routing (Findings 1 + 3) ----
             # Compute per-draft hard-gate status. The draft was already
@@ -1503,8 +1497,8 @@ def main() -> int:
             # score (e.g. a force-rescore that ignored the gate), refuse
             # to mark it ready_to_send.
             if (
-                ctx.get("recommended_to_send")
-                and ctx.get("cold_reachability_score") is None
+                pctx.get("recommended_to_send")
+                and pctx.get("cold_reachability_score") is None
             ):
                 qa_fails.append(
                     "cold_reachability_score is unknown; Stage 7 refuses "
@@ -1531,22 +1525,22 @@ def main() -> int:
                         f"verify the sender is intentional"
                     )
 
-            base["recommendation_reasoning"] = ctx["recommendation_reasoning"]
-            if ctx.get("warm_path_available"):
+            base["recommendation_reasoning"] = pctx["recommendation_reasoning"]
+            if pctx.get("warm_path_available"):
                 # Warm path takes precedence -- don't email cold.
                 base["outreach_status"] = "warm_path_needed"
                 base["recommendation_reasoning"] = (
                     f"warm_path_available=TRUE; cold draft suppressed. "
-                    f"{ctx['recommendation_reasoning'] or ''}"
+                    f"{pctx['recommendation_reasoning'] or ''}"
                 ).strip()
-            elif ctx["recommended_to_send"] and qa_fails:
+            elif pctx["recommended_to_send"] and qa_fails:
                 base["outreach_status"] = "draft"
                 base["recommendation_reasoning"] = (
                     f"DOWNGRADED by Stage 7 QA: {'; '.join(qa_fails)}. "
-                    f"(Stage 6 said: {ctx['recommendation_reasoning'] or '-'})"
+                    f"(Stage 6 said: {pctx['recommendation_reasoning'] or '-'})"
                 )
                 downgraded_count += 1
-            elif ctx["recommended_to_send"]:
+            elif pctx["recommended_to_send"]:
                 base["outreach_status"] = "ready_to_send"
             else:
                 base["outreach_status"] = "draft"
@@ -1607,7 +1601,7 @@ def main() -> int:
             print(f"[stage 7] HARD FAIL: {hf}")
         print(f"[stage 7] llm stub mode: {llm.stub}")
 
-    return 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

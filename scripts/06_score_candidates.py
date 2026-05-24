@@ -28,14 +28,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import delete, func, select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
+from core.config_loader import add_workspace_arg
+from core.stage_runner import stage_run
 from core.db import (
     deal_attributions,
     force_refresh_log,
     funds,
-    get_engine,
     outcomes,
     partner_score_summaries,
     partners,
@@ -56,9 +54,8 @@ RECOMMENDED_PROTECTED_FIELDS = {
     "recommended_to_send", "recommendation_reasoning",
 }
 from core.lead_likelihood import compute_lead_likelihood
-from core.llm.client import MODEL_BATCH, LLMClient
+from core.llm.client import LLMClient, MODEL_BATCH
 from core.round_fit import compute_round_fit
-from core.runs import RunLogger
 from schemas.candidate_score import CandidateScore
 
 STAGE = "06_score_candidates"
@@ -392,126 +389,122 @@ def main() -> int:
     if args.force_rescore and not args.reason:
         parser.error("--force-rescore requires --reason \"...\"")
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(ws, stage=STAGE)
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
-    today = date.today()
-    # Batch 39 (#24/#25): scoring config knobs. recent_outreach_window_days
-    # tunes how long a fresh active-outreach outcome suppresses re-
-    # recommendation (default 30). min_deal_confidence filters out Stage
-    # 3 attributions below the threshold from counting as deal evidence
-    # (default 0.0 = keep all).
-    scoring_cfg = (ws.company or {}).get("scoring") or {}
-    recent_outreach_window_days = int(
-        scoring_cfg.get("recent_outreach_window_days", 30)
-    )
-    min_deal_confidence = float(
-        scoring_cfg.get("min_deal_confidence", 0.0)
-    )
+    # Refactor sweep: stage_run() boilerplate collapse.
+    with stage_run(args, stage=STAGE) as ctx:
+        ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
+        today = date.today()
+        # Batch 39 (#24/#25): scoring config knobs. recent_outreach_window_days
+        # tunes how long a fresh active-outreach outcome suppresses re-
+        # recommendation (default 30). min_deal_confidence filters out Stage
+        # 3 attributions below the threshold from counting as deal evidence
+        # (default 0.0 = keep all).
+        scoring_cfg = (ws.company or {}).get("scoring") or {}
+        recent_outreach_window_days = int(
+            scoring_cfg.get("recent_outreach_window_days", 30)
+        )
+        min_deal_confidence = float(
+            scoring_cfg.get("min_deal_confidence", 0.0)
+        )
 
-    # ---- load all the data we need in one pass ----
-    with engine.begin() as conn:
-        partner_rows = list(conn.execute(select(partners)))
-        fund_rows = {r.fund_id: r for r in conn.execute(select(funds))}
+        # ---- load all the data we need in one pass ----
+        with engine.begin() as conn:
+            partner_rows = list(conn.execute(select(partners)))
+            fund_rows = {r.fund_id: r for r in conn.execute(select(funds))}
 
-        # Per-partner: quality>=2 verified signals (used for composite + Stage 7).
-        verified_signals_by_partner: dict[str, list[dict]] = {}
-        # Per-partner: ALL verified signals incl. quality=1, used only for the
-        # honest verified_signal_count we persist for audit. Previously this
-        # field was len(verified_signals_by_partner[pid]) which dropped the
-        # quality-1 verified signals -- two columns ended up identical.
-        all_verified_count_by_partner: dict[str, int] = {}
-        for s in conn.execute(
-            select(signals).where(signals.c.verified.is_(True))
-        ):
-            all_verified_count_by_partner[s.partner_id] = (
-                all_verified_count_by_partner.get(s.partner_id, 0) + 1
-            )
-            q = int(s.signal_quality_score or 0)
-            if q < 2:
-                continue
-            verified_signals_by_partner.setdefault(s.partner_id, []).append({
-                "id": int(s.signal_id),
-                "quote": s.quoted_text,
-                "source_url": s.source_url,
-                "source_type": s.source_type,
-                "axes": json.loads(s.axis_relevance or "[]"),
-                "direction": s.signal_direction,
-                "quality": q,
-                "date": s.quote_date,
-            })
-
-        # Per-fund deals (for round_fit recent_relevant_deals + has_led_recently).
-        deals_by_fund: dict[str, list[dict]] = {}
-        for d in conn.execute(select(deal_attributions)):
-            tags_raw = d.sector_tags
-            try:
-                sector_tags = json.loads(tags_raw) if tags_raw else []
-            except (TypeError, ValueError):
-                sector_tags = []
-            deals_by_fund.setdefault(d.lead_fund_id, []).append({
-                "company": d.company,
-                "round_type": d.round_type,
-                "round_size_usd": d.round_size_usd,
-                "announcement_date": d.announcement_date,
-                "sector_tags": sector_tags,
-                "source_url": d.source_url,
-            })
-        # Per-partner attributed deals (for lead_likelihood).
-        # Batch 39 (#25): apply min_deal_confidence filter so low-
-        # confidence Stage 3 fuzzy attributions don't count as evidence.
-        # Rows pre-dating the match_confidence column (NULL value) are
-        # KEPT for backward compat -- only explicitly-low rows get
-        # filtered.
-        partner_deals: dict[str, list[dict]] = {}
-        filtered_low_confidence = 0
-        for d in conn.execute(
-            select(deal_attributions).where(
-                deal_attributions.c.attributed_partner_id.isnot(None)
-            )
-        ):
-            if (
-                min_deal_confidence > 0.0
-                and d.match_confidence is not None
-                and d.match_confidence < min_deal_confidence
+            # Per-partner: quality>=2 verified signals (used for composite + Stage 7).
+            verified_signals_by_partner: dict[str, list[dict]] = {}
+            # Per-partner: ALL verified signals incl. quality=1, used only for the
+            # honest verified_signal_count we persist for audit. Previously this
+            # field was len(verified_signals_by_partner[pid]) which dropped the
+            # quality-1 verified signals -- two columns ended up identical.
+            all_verified_count_by_partner: dict[str, int] = {}
+            for s in conn.execute(
+                select(signals).where(signals.c.verified.is_(True))
             ):
-                filtered_low_confidence += 1
-                continue
-            partner_deals.setdefault(d.attributed_partner_id, []).append({
-                "company": d.company,
-                "round_type": d.round_type,
-                "round_size_usd": d.round_size_usd,
-                "announcement_date": d.announcement_date,
-                "source_url": d.source_url,
-            })
-        # Batch 19: latest outcome per partner so evaluate_recommended can
-        # suppress re-outreach when a partner is in active or terminal
-        # outreach state. Iterate ascending so the LAST iteration wins =
-        # most recent by synced_from_attio_at (with outcome_id as tiebreak).
-        latest_outcome_by_partner: dict[str, dict] = {}
-        for o in conn.execute(
-            select(outcomes).order_by(
-                outcomes.c.synced_from_attio_at, outcomes.c.outcome_id,
-            )
-        ):
-            latest_outcome_by_partner[o.partner_id] = {
-                "outreach_status": o.outreach_status,
-                "reply_type": o.reply_type,
-                "meeting_booked": o.meeting_booked,
-                "meeting_date": o.meeting_date,
-                "meeting_outcome": o.meeting_outcome,
-                "synced_from_attio_at": o.synced_from_attio_at,
-                "source": o.source,
-            }
+                all_verified_count_by_partner[s.partner_id] = (
+                    all_verified_count_by_partner.get(s.partner_id, 0) + 1
+                )
+                q = int(s.signal_quality_score or 0)
+                if q < 2:
+                    continue
+                verified_signals_by_partner.setdefault(s.partner_id, []).append({
+                    "id": int(s.signal_id),
+                    "quote": s.quoted_text,
+                    "source_url": s.source_url,
+                    "source_type": s.source_type,
+                    "axes": json.loads(s.axis_relevance or "[]"),
+                    "direction": s.signal_direction,
+                    "quality": q,
+                    "date": s.quote_date,
+                })
 
-    cutoff_18mo = today - timedelta(days=ACTIVITY_WINDOW_DAYS)
+            # Per-fund deals (for round_fit recent_relevant_deals + has_led_recently).
+            deals_by_fund: dict[str, list[dict]] = {}
+            for d in conn.execute(select(deal_attributions)):
+                tags_raw = d.sector_tags
+                try:
+                    sector_tags = json.loads(tags_raw) if tags_raw else []
+                except (TypeError, ValueError):
+                    sector_tags = []
+                deals_by_fund.setdefault(d.lead_fund_id, []).append({
+                    "company": d.company,
+                    "round_type": d.round_type,
+                    "round_size_usd": d.round_size_usd,
+                    "announcement_date": d.announcement_date,
+                    "sector_tags": sector_tags,
+                    "source_url": d.source_url,
+                })
+            # Per-partner attributed deals (for lead_likelihood).
+            # Batch 39 (#25): apply min_deal_confidence filter so low-
+            # confidence Stage 3 fuzzy attributions don't count as evidence.
+            # Rows pre-dating the match_confidence column (NULL value) are
+            # KEPT for backward compat -- only explicitly-low rows get
+            # filtered.
+            partner_deals: dict[str, list[dict]] = {}
+            filtered_low_confidence = 0
+            for d in conn.execute(
+                select(deal_attributions).where(
+                    deal_attributions.c.attributed_partner_id.isnot(None)
+                )
+            ):
+                if (
+                    min_deal_confidence > 0.0
+                    and d.match_confidence is not None
+                    and d.match_confidence < min_deal_confidence
+                ):
+                    filtered_low_confidence += 1
+                    continue
+                partner_deals.setdefault(d.attributed_partner_id, []).append({
+                    "company": d.company,
+                    "round_type": d.round_type,
+                    "round_size_usd": d.round_size_usd,
+                    "announcement_date": d.announcement_date,
+                    "source_url": d.source_url,
+                })
+            # Batch 19: latest outcome per partner so evaluate_recommended can
+            # suppress re-outreach when a partner is in active or terminal
+            # outreach state. Iterate ascending so the LAST iteration wins =
+            # most recent by synced_from_attio_at (with outcome_id as tiebreak).
+            latest_outcome_by_partner: dict[str, dict] = {}
+            for o in conn.execute(
+                select(outcomes).order_by(
+                    outcomes.c.synced_from_attio_at, outcomes.c.outcome_id,
+                )
+            ):
+                latest_outcome_by_partner[o.partner_id] = {
+                    "outreach_status": o.outreach_status,
+                    "reply_type": o.reply_type,
+                    "meeting_booked": o.meeting_booked,
+                    "meeting_date": o.meeting_date,
+                    "meeting_outcome": o.meeting_outcome,
+                    "synced_from_attio_at": o.synced_from_attio_at,
+                    "source": o.source,
+                }
 
-    partner_id_filter = set(args.partner_id) if args.partner_id else None
+        cutoff_18mo = today - timedelta(days=ACTIVITY_WINDOW_DAYS)
 
-    with RunLogger(engine, ws.name, STAGE) as run:
-        run.attach_llm_usage(llm.usage)
+        partner_id_filter = set(args.partner_id) if args.partner_id else None
+
         recommended_count = 0
         for p in partner_rows:
             run.processed += 1
@@ -870,8 +863,8 @@ def main() -> int:
         print(f"[stage 6] llm stub mode: {llm.stub}")
         # Batch 11 (#357): previously returned 0 even when per-partner
         # exceptions had landed in run.failed -- cron / wrapping scripts
-        # never noticed partial scoring failures.
-        any_failed = run.failed > 0
+        # never noticed partial scoring failures. ctx.exit_code now
+        # surfaces run.failed > 0 as exit 2 automatically.
         # Batch 36 (#29): if the run processed partners but EVERY one was
         # skipped (no qualifying signals across the board), the scoring
         # pass produced nothing usable. That's almost always a Stage 4
@@ -893,9 +886,8 @@ def main() -> int:
             print(f"[stage 6] {msg}")
             run.note(msg)
             run.failed = 1
-            any_failed = True
 
-    return 2 if any_failed else 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

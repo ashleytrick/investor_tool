@@ -42,19 +42,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import yaml
 from sqlalchemy import delete, select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
+from core.config_loader import add_workspace_arg
 from core.db import (
     axis_weight_suggestions,
     email_drafts,
-    get_engine,
     learning_runs,
     outcomes,
     partner_score_summaries,
     scores,
 )
-from core.runs import RunLogger
+from core.stage_runner import stage_run
 
 STAGE = "monthly_learning_report"
 WEIGHT_DELTA_THRESHOLD = 0.5  # axis-score mean diff needed to suggest a change
@@ -274,15 +271,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(ws, stage=STAGE)
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
+    # Refactor sweep: stage_run() boilerplate collapse. Learning report does
+    # not call the LLM directly; suggestions are deterministic.
+    with stage_run(args, stage=STAGE, require_llm=False) as ctx:
+        ws, engine, run = ctx.ws, ctx.engine, ctx.run
 
-    if args.seed_fixture_outcomes:
-        _seed_outcomes(ws, engine, force=args.force_seed)
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+        if args.seed_fixture_outcomes:
+            _seed_outcomes(ws, engine, force=args.force_seed)
         # ---- load per-partner state ----
         with engine.begin() as conn:
             # Finding 35: pick latest outcome per partner by EVENT timestamp
@@ -338,7 +333,7 @@ def main() -> int:
                 "attio_outcome_sync first."
             )
             run.note("no outcomes data")
-            return 0
+            return ctx.exit_code
 
         # ---- by axis: mean booked vs not-booked -> suggestions ----
         # Finding 2: clear stale unapproved suggestions before generating new
@@ -529,7 +524,7 @@ def main() -> int:
         run.note(f"suggestions_written={suggestions_written}")
         print(f"[learning] {suggestions_written} suggestion(s) written")
 
-    return 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

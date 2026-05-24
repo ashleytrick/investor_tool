@@ -27,10 +27,8 @@ from sqlalchemy import select
 
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
 from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.db import get_engine, outcomes, partners
-from core.runs import RunLogger
-from core.validate_config import preflight_or_exit
+from core.db import outcomes, partners
+from core.stage_runner import stage_run
 
 STAGE = "attio_outcome_sync"
 
@@ -95,26 +93,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(
-        ws, stage=STAGE, require_attio=bool(ws.attio),
-    )
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    cfg = ws.attio or {}
-    attio_cfg = cfg.get("attio") or cfg
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    # Refactor sweep: stage_run() boilerplate collapse. require_attio is
+    # dynamic (only enforce when workspace declares attio.yaml).
+    _require_attio = bool(load_workspace(args.workspace).attio)
+    with stage_run(args, stage=STAGE, require_attio=_require_attio,
+                   require_llm=False) as ctx:
+        ws, engine, run = ctx.ws, ctx.engine, ctx.run
+        cfg = ws.attio or {}
+        attio_cfg = cfg.get("attio") or cfg
         if not attio_cfg:
             print(f"[outcome_sync] no attio.yaml in workspace {ws.name!r}; skipping")
             run.skipped = 1
-            return 0
+            return ctx.exit_code
         try:
             client = AttioClient.from_workspace(ws)
         except AttioNotConfigured as exc:
             print(f"[outcome_sync] {exc}; skipping")
             run.skipped = 1
-            return 0
+            return ctx.exit_code
 
         with engine.begin() as conn:
             attio_to_partner: dict[str, str] = {
@@ -129,7 +125,7 @@ def main() -> int:
                   "run Stage 8 sync first")
             run.skipped = 1
             client.close()
-            return 0
+            return ctx.exit_code
 
         person_object = (attio_cfg.get("objects") or {}).get("partners", "people")
         cutoff = (
@@ -150,7 +146,7 @@ def main() -> int:
             run.failed = 1
             run.log_error("__query__", "AttioError", str(exc))
             client.close()
-            return 2
+            return ctx.exit_code
         print(f"[outcome_sync] pulled {len(records)} modified record(s) from Attio")
 
         for rec in records:
@@ -236,9 +232,9 @@ def main() -> int:
         )
         # Batch 35: non-zero exit when any per-record sync failed so
         # cron / wrapping scripts notice partial sync failures.
-        any_failed = run.failed > 0
+        # ctx.exit_code surfaces run.failed > 0 as exit 2.
 
-    return 2 if any_failed else 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

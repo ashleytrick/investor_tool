@@ -30,11 +30,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import yaml
 from sqlalchemy import select
 
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
-from core.db import axis_weight_suggestions, get_engine
-from core.runs import RunLogger
-from core.validate_config import preflight_or_exit
+from core.config_loader import add_workspace_arg
+from core.db import axis_weight_suggestions
+from core.stage_runner import stage_run
 
 STAGE = "apply_axis_suggestion"
 BACKUP_KEEP = 10  # rotate; keep this many most-recent axes.yaml backups
@@ -190,12 +188,10 @@ def main() -> int:
         or "unknown"
     )
 
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    # Refactor sweep: stage_run() boilerplate collapse. Apply-axis is a
+    # config-mutation tool, not a Stage 6/7 LLM job; no LLM needed.
+    with stage_run(args, stage=STAGE, require_llm=False) as ctx:
+        ws, engine, run = ctx.ws, ctx.engine, ctx.run
         # ---- --list mode ----
         if args.list:
             with engine.begin() as conn:
@@ -218,7 +214,7 @@ def main() -> int:
             # like a real apply-run in the audit, cluttering history.
             # Surface the count via run.note instead.
             run.note(f"listed {len(pending)} pending suggestion(s)")
-            return 0
+            return ctx.exit_code
 
         # ---- --all-above mode ----
         if args.all_above:
@@ -267,8 +263,9 @@ def main() -> int:
                 f"(failed={failed})"
             )
             # Previously this returned 0 unconditionally. Non-zero exit when
-            # any application failed so cron / wrapping scripts notice.
-            return 2 if failed else 0
+            # any application failed so cron / wrapping scripts notice;
+            # ctx.exit_code surfaces run.failed > 0 as exit 2.
+            return ctx.exit_code
 
         # ---- --suggestion-id mode (single) ----
         with engine.begin() as conn:
@@ -282,7 +279,7 @@ def main() -> int:
             run.failed = 1
             run.log_error(str(args.suggestion_id), "not_found",
                           "no such suggestion")
-            return 2
+            return ctx.exit_code
         # Finding 67: applying a confidence=low suggestion via --suggestion-id
         # requires --accept-low-confidence so the operator can't bulk-paste
         # IDs without realizing they came from sparse data. Already-approved
@@ -302,7 +299,7 @@ def main() -> int:
             print(f"[apply] {msg}")
             run.note(msg)
             run.failed = 1
-            return 2
+            return ctx.exit_code
         run.processed = 1
         if _apply_one(
             engine, ws, row, run,
@@ -315,9 +312,9 @@ def main() -> int:
             run.skipped = 1
         else:
             run.failed = 1
-            return 2
+            return ctx.exit_code
 
-    return 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":
