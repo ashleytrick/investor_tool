@@ -130,9 +130,26 @@ class Workspace:
         self.mode: str = raw_mode
 
         # Environment values, layered.
+        # Batch 42 (#76): track WHICH file supplied each key so
+        # diagnostics can show provenance without printing the value.
         self._env: dict[str, str] = {}
-        self._env.update({k: v for k, v in dotenv_values(REPO_ROOT / ".env").items() if v is not None})
-        self._env.update({k: v for k, v in dotenv_values(ws / ".env").items() if v is not None})
+        self._env_source: dict[str, str] = {}
+        for k, v in dotenv_values(REPO_ROOT / ".env").items():
+            if v is not None:
+                self._env[k] = v
+                self._env_source[k] = "root_env"
+        for k, v in dotenv_values(ws / ".env").items():
+            if v is not None:
+                self._env[k] = v
+                self._env_source[k] = "workspace_env"
+
+    def env_provenance(self, key: str) -> str:
+        """Where did `key` come from? Returns "process_env",
+        "workspace_env", "root_env", or "unset". Never returns the
+        value itself."""
+        if key in os.environ and os.environ[key]:
+            return "process_env"
+        return self._env_source.get(key, "unset")
 
     def env(self, key: str, default: str | None = None) -> str | None:
         """Process env overrides both .env files; otherwise layered .env wins."""

@@ -351,6 +351,50 @@ def main() -> int:
         for s in stale:
             print(f"  - {s}")
 
+    # Batch 42 (#76): show .env key provenance so the operator knows
+    # WHICH file supplied each credential. Never prints the value itself.
+    print()
+    print("== Credential provenance ==")
+    for key in ("ANTHROPIC_API_KEY", "ATTIO_API_KEY"):
+        src = ws.env_provenance(key)
+        set_state = "set" if src != "unset" else "MISSING"
+        print(f"  {key:25s} {set_state:8s} source={src}")
+
+    # Batch 42 (#80): "next unsafe action blocked because..." -- show
+    # the specific safety gate(s) that would refuse the next mutation,
+    # not just the next-command suggestion. Helps operators see WHY
+    # they can't move forward.
+    print()
+    print("== Safety gates ==")
+    blocked: list[str] = []
+    if config_issues:
+        blocked.append(
+            f"{len(config_issues)} preflight config issue(s) above"
+        )
+    if ws.mode == "fixture":
+        blocked.append(
+            "workspace mode=fixture: Stage 8 + Gmail draft creation "
+            "require --allow-fixture-mode"
+        )
+    if failed_recent := [
+        st for st in expected
+        if (lr := last_by_stage.get(st))
+        and (lr.records_failed or 0) > 0
+    ]:
+        blocked.append(
+            f"recent failures on: {', '.join(failed_recent)} "
+            "(see error_summary above)"
+        )
+    if stale:
+        blocked.append(
+            f"{len(stale)} stage(s) older than their upstream"
+        )
+    if blocked:
+        for b in blocked:
+            print(f"  - {b}")
+    else:
+        print("  no blocking gates -- pipeline clean for mutation")
+
     # Recommended next command.
     print()
     # Finding 10: don't suggest moving forward if a recent run failed.

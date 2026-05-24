@@ -419,6 +419,74 @@ def _check_placeholders_in_recommended_drafts(engine) -> list[tuple[Severity, st
     return out
 
 
+def _check_source_reachability(ws) -> list[tuple[Severity, str]]:
+    """Batch 42 (#72): live-HEAD each configured source URL and report.
+    Network failures = error; non-2xx = warn; 2xx = silent.
+
+    Sources checked:
+      - sources.yaml.public_lists[*].url
+      - sources.yaml.funding_announcement_feeds[*].url
+      - data/raw/partner_content_urls.csv source_url column
+    Local `path:` sources just check file existence.
+    """
+    import asyncio
+    import csv as _csv
+    from core.http_client import HttpClient
+
+    out: list[tuple[Severity, str]] = []
+    targets: list[tuple[str, str]] = []  # (label, url-or-path)
+    sources = ws.sources or {}
+    for s in (sources.get("public_lists") or []):
+        if s.get("url"):
+            targets.append((f"public_lists:{s.get('name', '?')}", s["url"]))
+        elif s.get("path"):
+            p = (ws.path / s["path"]).resolve()
+            if not p.exists():
+                out.append((
+                    "error",
+                    f"public_lists:{s.get('name', '?')} path {p} not found",
+                ))
+    for f in (sources.get("funding_announcement_feeds") or []):
+        if f.get("url"):
+            targets.append((f"feed:{f.get('name', '?')}", f["url"]))
+    csv_path = ws.path / "data" / "raw" / "partner_content_urls.csv"
+    if csv_path.exists():
+        with csv_path.open(encoding="utf-8") as fh:
+            for row in _csv.DictReader(fh):
+                url = (row.get("source_url") or "").strip()
+                if url:
+                    targets.append(
+                        (f"partner_content:{row.get('partner_id')}", url),
+                    )
+
+    if not targets:
+        return out
+
+    client = HttpClient()
+
+    async def _hit(label: str, url: str) -> tuple[Severity, str] | None:
+        try:
+            res = await client.fetch(url)
+        except Exception as exc:  # noqa: BLE001
+            return ("error", f"{label} {url!r}: fetch failed: {exc}")
+        if res.status >= 500:
+            return ("error", f"{label} {url!r}: HTTP {res.status}")
+        if res.status >= 400:
+            return ("warn", f"{label} {url!r}: HTTP {res.status}")
+        return None
+
+    async def _all():
+        results: list[tuple[Severity, str] | None] = []
+        for label, url in targets:
+            results.append(await _hit(label, url))
+        return results
+
+    for r in asyncio.run(_all()):
+        if r is not None:
+            out.append(r)
+    return out
+
+
 CHECKS = [
     _check_orphan_summaries,
     _check_partners_have_funds,
@@ -443,6 +511,12 @@ def main() -> int:
         "--json", action="store_true",
         help="Emit findings as JSON for programmatic consumption.",
     )
+    parser.add_argument(
+        "--check-source-reachability", action="store_true",
+        help="Live-fetch each configured source (sources.yaml +"
+             " partner_content_urls.csv) and report HTTP status. "
+             "Opt-in because it makes real network requests. (Batch 42 #72)",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -457,6 +531,11 @@ def main() -> int:
     findings.extend(_check_score_axis_ids_match_yaml(engine, ws))
     for fn in CHECKS:
         findings.extend(fn(engine))
+    # Batch 42 (#72): optional live reachability check for configured
+    # sources. Defers the actual fetch into a small helper so the
+    # default `doctor.py` stays read-only/offline.
+    if args.check_source_reachability:
+        findings.extend(_check_source_reachability(ws))
 
     by_sev: dict[str, list[str]] = {"error": [], "warn": [], "info": []}
     for sev, msg in findings:
