@@ -19,6 +19,31 @@ Strategy = Literal[
     "traction_led",
 ]
 
+# Batch 22 (#607): template_smell is consumed by Stage 7's downgrade
+# logic and the batch_qa report; only these four values have meaning.
+TemplateSmell = Literal["high", "medium", "low", "unscored"]
+
+# Batch 22 (#608): forbidden phrases that must NOT appear in ANY draft
+# (subject, body, alternate body, deck reply, follow-up). Keep in sync
+# with scripts/07_generate_emails.py UNIVERSAL_FORBIDDEN.
+_UNIVERSAL_FORBIDDEN_LOWER = (
+    "building the future of", "would love", "circling back",
+    "wanted to reach out", "hope this finds you", "quick question",
+    "pressure-test", "compare notes", "thesis chat", "get your feedback",
+    "synergy", "game-changing", "excited to",
+)
+
+
+def _contains_forbidden(text: str | None) -> str | None:
+    """Return the first forbidden phrase present, or None if clean."""
+    if not text:
+        return None
+    low = text.lower()
+    for p in _UNIVERSAL_FORBIDDEN_LOWER:
+        if p in low:
+            return p
+    return None
+
 
 class EmailVariant(BaseModel):
     strategy: Strategy
@@ -34,7 +59,24 @@ class EmailVariant(BaseModel):
     likely_objection: str = ""
     objection_preempted: bool = False
     preemption_line: Optional[str] = None
-    template_smell: str = "unscored"
+    # Batch 22 (#607): bound template_smell to the four meaningful values.
+    template_smell: TemplateSmell = "unscored"
+
+    @field_validator("body")
+    @classmethod
+    def body_no_em_dash_or_exclamation(cls, v: str) -> str:
+        """Batch 22 (#612): block em dashes and exclamation marks at the
+        schema layer (alternate variants used to flow through Stage 7's
+        check_hard_gates only for the recommended draft). The brief's
+        prose: 'No em dashes. No exclamation marks.'"""
+        if "—" in v:
+            raise ValueError("body must not contain em dashes (—)")
+        if "!" in v:
+            raise ValueError("body must not contain exclamation marks")
+        forbidden = _contains_forbidden(v)
+        if forbidden:
+            raise ValueError(f"body contains forbidden phrase: {forbidden!r}")
+        return v
 
     @field_validator("subject")
     @classmethod
@@ -53,6 +95,14 @@ class EmailVariant(BaseModel):
             raise ValueError(
                 f"subject must be <= 5 words (brief STEP 2); got "
                 f"{word_count} words: {v!r}"
+            )
+        # Batch 22 (#374): subjects must also avoid the universal
+        # forbidden phrases. A "Quick question" subject used to slip
+        # through because the hard gate only inspected bodies.
+        forbidden = _contains_forbidden(v)
+        if forbidden:
+            raise ValueError(
+                f"subject contains forbidden phrase: {forbidden!r}"
             )
         return v
 
@@ -84,6 +134,24 @@ class EmailOutput(BaseModel):
     # empty string from the LLM should retry, not flow into the CSV.
     deck_request_response: str = Field(..., min_length=1)
     followup_draft: str = Field(..., min_length=1)
+
+    @field_validator("deck_request_response", "followup_draft")
+    @classmethod
+    def deck_followup_no_forbidden_or_em(cls, v: str) -> str:
+        """Batch 22 (#373/#608): the deck-request reply and the follow-up
+        draft used to flow straight into the CSV / Attio sync without any
+        forbidden-phrase or em-dash gate -- those checks only fired on
+        the recommended email body. Apply the same baseline."""
+        if "—" in v:
+            raise ValueError("deck/followup must not contain em dashes (—)")
+        if "!" in v:
+            raise ValueError("deck/followup must not contain exclamation marks")
+        forbidden = _contains_forbidden(v)
+        if forbidden:
+            raise ValueError(
+                f"deck/followup contains forbidden phrase: {forbidden!r}"
+            )
+        return v
 
     @field_validator("variants")
     @classmethod

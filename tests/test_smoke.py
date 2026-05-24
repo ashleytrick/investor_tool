@@ -1665,6 +1665,88 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch22_email_schema_extends_to_alternate_and_deck():
+    """Inventory #373/#374/#607/#608/#612: forbidden-phrase, em-dash, and
+    exclamation-mark checks now fire at the SCHEMA layer for variant
+    bodies (recommended AND alternate) and for deck_request_response /
+    followup_draft. Previously only the recommended draft's body was
+    inspected by Stage 7's check_hard_gates."""
+    import pytest
+    from pydantic import ValidationError
+    from schemas.email_generation import EmailOutput, EmailVariant
+
+    good_var = dict(
+        strategy="signal_led",
+        subject="Tendril seed round",
+        body="We are raising a $3M seed and would like to share the deck with you "
+             "next week if it is helpful. Quick call to walk through the round.",
+        conversion_hypothesis="x",
+        likely_objection="y",
+    )
+
+    # Baseline EmailVariant: passes.
+    EmailVariant.model_validate(good_var)
+
+    # #612: em dash in body refused.
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **good_var,
+            "body": "We are raising — closing in 8 weeks — first close soon. "
+                    "Quick call to walk through it." * 2,
+        })
+    # #612: exclamation refused.
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **good_var,
+            "body": "We are raising! Closing in 8 weeks soon. " * 3,
+        })
+    # #608: forbidden phrase in body refused.
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **good_var,
+            "body": "We are raising and would love to share the deck. "
+                    "Quick call to walk through it next week sometime." * 2,
+        })
+    # #374: forbidden phrase in subject refused.
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **good_var, "subject": "Quick question",
+        })
+    # #607: template_smell out of enum refused.
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **good_var, "template_smell": "weird-value",
+        })
+
+    # #373/#608: forbidden phrase / em dash / ! in deck_request_response.
+    base_out = dict(
+        variants=[EmailVariant.model_validate(good_var)],
+        recommended_variant_strategy="signal_led",
+        recommendation_reasoning="strong q3 signal",
+        limited_variation=True,
+        limited_variation_reason="only one eligible strategy",
+        deck_request_response="Deck attached. Happy to walk through next week.",
+        followup_draft="Following up to ask about the round.",
+    )
+    EmailOutput.model_validate(base_out)  # baseline OK
+
+    with pytest.raises(ValidationError):
+        EmailOutput.model_validate({
+            **base_out,
+            "deck_request_response": "Deck attached — happy to walk through.",
+        })
+    with pytest.raises(ValidationError):
+        EmailOutput.model_validate({
+            **base_out,
+            "followup_draft": "Excited to share an update on the round.",
+        })
+    with pytest.raises(ValidationError):
+        EmailOutput.model_validate({
+            **base_out,
+            "followup_draft": "Follow up: new milestone hit!",
+        })
+
+
 def test_batch21_config_validators():
     """Inventory #716/#717/#718/#723/#724/#727: preflight catches the
     common config drift problems that would otherwise silently corrupt
