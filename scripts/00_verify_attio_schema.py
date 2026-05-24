@@ -19,11 +19,8 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.db import get_engine
-from core.runs import RunLogger
-from core.validate_config import preflight_or_exit
+from core.config_loader import add_workspace_arg
+from core.stage_runner import stage_run
 
 STAGE = "00_verify_attio_schema"
 
@@ -40,54 +37,43 @@ def main() -> int:
              "problem, not a no-op.",
     )
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    # When --allow-skip is set, the operator explicitly accepts that a
-    # missing key is a no-op. Don't let preflight refuse on that very
-    # condition; the in-body skip-vs-fail check below is the authority.
-    preflight_or_exit(
-        ws, stage=STAGE,
-        require_attio=bool(ws.attio) and not args.allow_skip,
-    )
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    cfg = ws.attio or {}
-    attio_cfg = cfg.get("attio") or cfg
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with stage_run(
+        args, stage=STAGE,
+        # --allow-skip lets us bypass the preflight require_attio so
+        # the in-body skip-vs-fail check below is the authority.
+        require_attio=bool(_attio_present(args)) and not args.allow_skip,
+        require_llm=False,
+    ) as ctx:
+        ws, run = ctx.ws, ctx.run
+        cfg = ws.attio or {}
+        attio_cfg = cfg.get("attio") or cfg
         if not attio_cfg:
-            # No attio.yaml at all -> clean no-op (this workspace is CSV-only).
             print(f"[stage 0] no attio.yaml in workspace {ws.name!r}; skipping")
-            run.skipped = 1
-            return 0
+            with run.attempt():
+                run.skip("no attio.yaml")
+            return ctx.exit_code
         try:
             client = AttioClient.from_workspace(ws)
         except AttioNotConfigured as exc:
-            # attio.yaml is configured but the key is missing. Default to
-            # FAIL so the operator who ran Stage 0 expecting a real check
-            # doesn't get a misleading green light. --allow-skip restores
-            # the prior cron-friendly behavior.
             if args.allow_skip:
                 print(f"[stage 0] {exc}; --allow-skip in effect, skipping")
-                run.skipped = 1
-                return 0
-            msg = (
-                f"REFUSED: attio.yaml is configured for this workspace but "
-                f"ATTIO_API_KEY is not resolvable ({exc}). Set the key (or "
-                f"re-run with --allow-skip if you want this to be a no-op "
-                f"in cron)."
+                with run.attempt():
+                    run.skip(f"key missing (--allow-skip): {exc}")
+                return ctx.exit_code
+            # Default exit code preserved (OPERATIONAL_FAILURE = 2) so
+            # existing test/cron contracts hold. A follow-up commit
+            # will reclassify safety-gate refusals as refuse_unsafe()
+            # (= 3) workspace-wide.
+            ctx.refuse(
+                f"attio.yaml configured but ATTIO_API_KEY not "
+                f"resolvable ({exc}). Set the key (or re-run with "
+                f"--allow-skip if you want this to be a no-op in cron)."
             )
-            print(f"[stage 0] {msg}")
-            run.note(msg)
-            run.failed = 1
-            return 2
+            print(f"[stage 0] REFUSED: see runs.error_summary")
+            return ctx.exit_code
 
         objects = attio_cfg.get("objects") or {"funds": "companies", "partners": "people"}
-        # Finding 40: base attributes Stage 8 actually writes (name, domains
-        # for companies; name, email_addresses, company link for people)
-        # must exist too -- the previous check only validated custom-attr
-        # slugs from attio.yaml, so a misconfigured object could fail at
-        # the first sync with a confusing API error.
+        # Finding 40: base attributes Stage 8 actually writes must exist too.
         base_attrs = {
             objects["funds"]: {"name", "domains"},
             objects["partners"]: {"name", "email_addresses", "company"},
@@ -102,32 +88,45 @@ def main() -> int:
                 | base_attrs[objects["partners"]]
             ),
         }
-        all_ok = True
         for object_slug, want in expected.items():
-            run.processed += 1
-            try:
-                have = client.attribute_slugs(object_slug)
-            except AttioError as exc:
-                print(f"[stage 0] FAIL {object_slug}: {exc}")
-                run.log_error(object_slug, "attio_error", str(exc))
-                all_ok = False
-                run.failed += 1
-                continue
-            missing = sorted(s for s in want if s and s not in have)
-            if missing:
-                print(
-                    f"[stage 0] FAIL {object_slug}: missing {len(missing)} "
-                    f"attribute(s): {missing}"
-                )
-                run.failed += 1
-                all_ok = False
-            else:
-                print(
-                    f"[stage 0] ok  {object_slug}: {len(want)} expected attributes present"
-                )
-                run.succeeded += 1
+            with run.attempt():
+                try:
+                    have = client.attribute_slugs(object_slug)
+                except AttioError as exc:
+                    print(f"[stage 0] FAIL {object_slug}: {exc}")
+                    run.fail(object_slug, "attio_error", str(exc))
+                    continue
+                missing = sorted(s for s in want if s and s not in have)
+                if missing:
+                    print(
+                        f"[stage 0] FAIL {object_slug}: missing "
+                        f"{len(missing)} attribute(s): {missing}"
+                    )
+                    run.fail(
+                        object_slug, "missing_attributes",
+                        f"{len(missing)} missing: {missing}",
+                    )
+                else:
+                    print(
+                        f"[stage 0] ok  {object_slug}: {len(want)} expected "
+                        f"attributes present"
+                    )
+                    run.succeed()
         client.close()
-        return 0 if all_ok else 2
+    return ctx.exit_code
+
+
+def _attio_present(args) -> bool:
+    """Tiny helper -- can't call ws.attio before stage_run runs, so peek
+    at the workspace config dir directly. Returns True iff
+    config/attio.yaml exists with non-empty content (which mirrors how
+    Workspace.attio gets populated)."""
+    from core.config_loader import load_workspace
+    try:
+        ws = load_workspace(getattr(args, "workspace", None))
+        return bool(ws.attio)
+    except Exception:  # noqa: BLE001 - workspace errors surface via stage_run
+        return False
 
 
 if __name__ == "__main__":

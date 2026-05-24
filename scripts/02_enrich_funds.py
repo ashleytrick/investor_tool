@@ -27,14 +27,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from selectolax.parser import HTMLParser
 from sqlalchemy import select
 
-from core.config_loader import add_workspace_arg, load_workspace
-from core.banner import print_banner
-from core.validate_config import preflight_or_exit
-from core.db import funds, get_engine, partners, source_snapshots, upsert
+from core.config_loader import add_workspace_arg
+from core.db import funds, partners, source_snapshots, upsert
+from core.stage_runner import stage_run
 from core.http_client import HttpClient
 from core.ids import partner_id_for
-from core.llm.client import MODEL_BATCH, LLMClient
-from core.runs import RunLogger
+from core.llm.client import MODEL_BATCH
 from schemas.fund_enrichment import FundEnrichment
 
 STAGE = "02_enrich_funds"
@@ -233,39 +231,33 @@ def main() -> int:
         help="Read pages from data/fixtures/fund_pages instead of the network.",
     )
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    preflight_or_exit(
-        ws, stage=STAGE, require_anthropic=not args.fixtures,
-    )
-    print_banner(ws, stage=STAGE)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
-
-    with engine.begin() as conn:
-        fund_rows = [
-            dict(r._mapping) for r in conn.execute(
-                select(funds).where(funds.c.domain.isnot(None))
-            )
-        ]
-
-    with RunLogger(engine, ws.name, STAGE) as run:
-        run.attach_llm_usage(llm.usage)
+    # Refactor sweep: stage_run() collapses the workspace/preflight/
+    # banner/engine/LLM/RunLogger boilerplate. require_anthropic
+    # mirrors the live-mode policy.
+    with stage_run(
+        args, stage=STAGE,
+        require_anthropic=not args.fixtures,
+    ) as ctx:
+        ws, engine, run, llm = ctx.ws, ctx.engine, ctx.run, ctx.llm
+        with engine.begin() as conn:
+            fund_rows = [
+                dict(r._mapping) for r in conn.execute(
+                    select(funds).where(funds.c.domain.isnot(None))
+                )
+            ]
         # Live mode requires an LLM. The deterministic_enrichment() stub is
         # designed for our fixture HTML's <meta name="..."> tags; against a
         # real fund site it would happily return mostly-empty enrichment and
         # the operator would never know. Refuse upfront like Stages 3/4.
         if not args.fixtures and llm.stub:
-            msg = (
+            ctx.refuse(
                 "REFUSED: live Stage 2 requires ANTHROPIC_API_KEY. The "
                 "deterministic stub extractor only understands fixture HTML "
                 "and would silently produce empty enrichment against real "
                 "fund pages. Set the key, or run with --fixtures."
             )
-            print(f"[stage 2] {msg}")
-            run.note(msg)
-            run.failed = max(run.failed, 1)
-            return 2
+            print(f"[stage 2] REFUSED: see runs.error_summary")
+            return ctx.exit_code
         for fund in fund_rows:
             run.processed += 1
             try:
@@ -385,11 +377,10 @@ def main() -> int:
                 run.log_error(fund["fund_id"], type(exc).__name__, str(exc))
 
         print(f"[stage 2] llm stub mode: {llm.stub}")
-        # Batch 35: non-zero exit when any per-fund enrichment failed so
-        # cron / wrapping scripts notice partial Stage 2 failures.
-        any_failed = run.failed > 0
-
-    return 2 if any_failed else 0
+        # Refactor sweep: ctx.exit_code maps run.failed > 0 to
+        # StageResult.OPERATIONAL_FAILURE = 2, preserving the prior
+        # behavior from Batch 35.
+    return ctx.exit_code
 
 
 if __name__ == "__main__":
