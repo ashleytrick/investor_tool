@@ -68,7 +68,34 @@ def build_axes_block(axes_cfg: dict) -> str:
     return "\n".join(lines)
 
 
-def upsert_snapshot(engine, source_url: str, text: str) -> int:
+# Batch 36 (#12/#14): when a Stage 4 fetch fails OR returns non-200, we
+# still want a source_snapshots row so the audit trail captures the
+# attempt. http_status carries the real status (or -1 for transport
+# failures); extracted_text stays NULL. final_url is the post-redirect
+# URL when available.
+def upsert_snapshot_failure(
+    engine, source_url: str, *, http_status: int, final_url: str | None,
+    note: str,
+) -> int | None:
+    chash = _content_hash(f"FAIL:{http_status}:{note}")
+    with engine.begin() as conn:
+        try:
+            result = conn.execute(source_snapshots.insert().values(
+                source_url=source_url,
+                final_url=final_url,
+                fetched_at=_now(),
+                http_status=http_status,
+                content_hash=chash,
+                extracted_text=None,
+                fetched_during_stage=STAGE,
+            ))
+            return int(result.inserted_primary_key[0])
+        except Exception:  # noqa: BLE001 - UNIQUE collision on (url, hash)
+            return None
+
+
+def upsert_snapshot(engine, source_url: str, text: str,
+                    *, final_url: str | None = None) -> int:
     """Return snapshot_id; create if (source_url, content_hash) not present."""
     chash = _content_hash(text)
     with engine.begin() as conn:
@@ -82,6 +109,7 @@ def upsert_snapshot(engine, source_url: str, text: str) -> int:
             return int(existing.snapshot_id)
         result = conn.execute(source_snapshots.insert().values(
             source_url=source_url,
+            final_url=final_url,  # Batch 36 (#14): post-redirect URL
             fetched_at=_now(),
             http_status=200,
             content_hash=chash,
@@ -91,13 +119,26 @@ def upsert_snapshot(engine, source_url: str, text: str) -> int:
         return int(result.inserted_primary_key[0])
 
 
-def _fetch_live_partner_content(ws) -> dict:
+CSV_REQUIRED_HEADERS = {"partner_id", "source_type", "source_url"}
+
+
+def _fetch_live_partner_content(
+    ws, engine, run, known_partner_ids: set[str],
+    *, strict_unknown_partners: bool = True,
+) -> dict:
     """Read data/raw/partner_content_urls.csv (cols: partner_id, source_type,
     source_url), fetch each URL via http_client, and return a dict matching
     the partner_signals_seed.json shape so the rest of Stage 4 is identical.
 
-    No `_extraction` is set on live entries -- the LLM will produce signals
-    in live mode. Stub mode would refuse upfront.
+    Batch 36 (#8/#10/#11/#12/#14):
+    - Validates the CSV header against CSV_REQUIRED_HEADERS upfront and
+      raises a clear error if missing.
+    - Unknown partner_id rows are recorded in run_errors (and the run
+      EXITS with run.failed when strict_unknown_partners=True).
+    - Per-URL fetch failures land in run_errors AND a source_snapshots
+      row with http_status set (or -1 for transport errors), instead of
+      vanishing into stdout.
+    - Successful fetches now record final_url (post-redirect).
     """
     csv_path = ws.path / PARTNER_CONTENT_URLS_PATH
     if not csv_path.exists():
@@ -106,30 +147,83 @@ def _fetch_live_partner_content(ws) -> dict:
     out: dict[str, dict] = {}
     by_partner: dict[str, list[tuple[str, str]]] = defaultdict(list)
     with csv_path.open(encoding="utf-8", newline="") as fh:
-        for row in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        # Batch 36 (#10): header validation. Reject upfront if a column
+        # is missing -- otherwise we'd silently treat every row as
+        # missing partner_id.
+        missing = CSV_REQUIRED_HEADERS - set(reader.fieldnames or [])
+        if missing:
+            msg = (
+                f"partner_content_urls.csv missing required column(s): "
+                f"{sorted(missing)} (have: {reader.fieldnames})"
+            )
+            run.log_error(str(csv_path), "csv_schema", msg)
+            run.failed += 1
+            raise ValueError(msg)
+        for row in reader:
             pid = (row.get("partner_id") or "").strip()
             url = (row.get("source_url") or "").strip()
             stype = (row.get("source_type") or "blog").strip()
-            if pid and url:
-                by_partner[pid].append((stype, url))
+            if not pid or not url:
+                continue
+            # Batch 36 (#11): unknown partner_id is a CSV error, not a
+            # silent skip. Log + count as failure; the operator gets a
+            # non-zero exit unless they pass --allow-unknown-partner-ids.
+            if pid not in known_partner_ids:
+                run.log_error(
+                    pid, "unknown_partner_in_csv",
+                    f"row references partner_id not in partners table; "
+                    f"source_url={url}",
+                )
+                if strict_unknown_partners:
+                    run.failed += 1
+                continue
+            by_partner[pid].append((stype, url))
 
     for pid, items in by_partner.items():
         sources: list[dict] = []
         for stype, url in items:
             try:
                 res = asyncio.run(client.fetch(url))
-            except Exception as exc:  # noqa: BLE001 - log, move on
+            except Exception as exc:  # noqa: BLE001 - log + audit, move on
                 print(f"[stage 4] {pid} fetch {url} failed: {exc}")
+                # Batch 36 (#8/#12): record in run_errors AND snapshot
+                # so the audit captures the failed attempt.
+                run.log_error(
+                    f"{pid}:{url}", "fetch_failed", str(exc),
+                )
+                upsert_snapshot_failure(
+                    engine, url, http_status=-1, final_url=None,
+                    note=str(exc),
+                )
+                run.failed += 1
                 continue
             if res.status != 200 or not res.text:
                 print(f"[stage 4] {pid} {url} -> HTTP {res.status}; skipping")
+                run.log_error(
+                    f"{pid}:{url}", "http_error",
+                    f"HTTP {res.status} (final_url={res.final_url!r})",
+                )
+                upsert_snapshot_failure(
+                    engine, url, http_status=res.status,
+                    final_url=res.final_url,
+                    note=f"HTTP {res.status}",
+                )
+                run.failed += 1
                 continue
             text = HTMLParser(res.text).text(separator=" ", strip=True)
             if not text:
+                run.log_error(
+                    f"{pid}:{url}", "empty_body",
+                    f"HTTP 200 but extracted text was empty "
+                    f"(final_url={res.final_url!r})",
+                )
+                run.failed += 1
                 continue
             sources.append({
                 "source_type": stype,
                 "source_url": url,
+                "final_url": res.final_url,
                 "quote_date": None,
                 "text": text,
             })
@@ -161,6 +255,22 @@ def main() -> int:
     parser.add_argument("--fixtures", action="store_true",
                         help="Read per-partner content from "
                              "data/fixtures/partner_signals_seed.json")
+    parser.add_argument(
+        "--allow-unknown-partner-ids", action="store_true",
+        help="Don't fail when partner_content_urls.csv references "
+             "partner_ids that aren't in the partners table; just skip "
+             "those rows (Batch 36 #11). Useful when the CSV is being "
+             "drafted incrementally.",
+    )
+    parser.add_argument(
+        "--allow-incomplete-content-csv", action="store_true",
+        help="Permit clearing stale reachability partials for partners "
+             "MISSING from partner_content_urls.csv (Batch 36 #9). By "
+             "default Stage 4 refuses to clear partials when the CSV is "
+             "incomplete (covers fewer than 50%% of known partners), to "
+             "avoid losing all reachability when the operator only "
+             "drafted a subset.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -196,7 +306,16 @@ def main() -> int:
                 (ws.fixtures_dir / "partner_signals_seed.json").read_text(encoding="utf-8")
             )
         else:
-            fixture = _fetch_live_partner_content(ws)
+            known_pids = {p.partner_id for p in partner_rows}
+            try:
+                fixture = _fetch_live_partner_content(
+                    ws, engine, run, known_pids,
+                    strict_unknown_partners=not args.allow_unknown_partner_ids,
+                )
+            except ValueError as exc:
+                # CSV schema validation refusal -- already logged.
+                print(f"[stage 4] REFUSED: {exc}")
+                return 2
             csv_path = ws.path / PARTNER_CONTENT_URLS_PATH
             configured_rows = 0
             if csv_path.exists():
@@ -231,6 +350,27 @@ def main() -> int:
                 run.note(msg)
                 run.failed = 1
                 return 2
+        # Batch 36 (#9): safety gate on stale-reachability clearing.
+        # Batch 11 added the clear, but if the operator runs Stage 4
+        # with a partial CSV (e.g. only the 5 most recent partners), we
+        # would wipe reachability for every OTHER partner -- catastrophic
+        # data loss disguised as a routine re-run. Skip the clear when
+        # coverage is below 50%, unless the operator explicitly opts in.
+        coverage = len(fixture) / max(1, len(partner_rows))
+        clear_stale_partials = (
+            coverage >= 0.5 or args.allow_incomplete_content_csv
+            or args.fixtures
+        )
+        if not clear_stale_partials and not args.fixtures:
+            msg = (
+                f"content coverage is {coverage:.0%} of known partners "
+                f"({len(fixture)}/{len(partner_rows)}); REFUSING to clear "
+                f"stale reachability partials. Pass "
+                f"--allow-incomplete-content-csv to override, OR add the "
+                f"missing partners to data/raw/partner_content_urls.csv."
+            )
+            print(f"[stage 4] {msg}")
+            run.note(msg)
         partners_with_signals = 0
         total_signals = 0
         for p in partner_rows:
@@ -242,9 +382,15 @@ def main() -> int:
                 # partner whose evidence was N runs old. Clear the partial
                 # score + evidence so Stage 6 treats reachability as unknown
                 # (post-Batch 5: unknown contributes 0, not 5).
+                # Batch 36 (#9): gated by `clear_stale_partials` so a
+                # partial CSV can't accidentally wipe reachability for
+                # every absent partner.
                 if (
-                    p.cold_reachability_partial_score is not None
-                    or p.cold_reachability_partial_evidence is not None
+                    clear_stale_partials
+                    and (
+                        p.cold_reachability_partial_score is not None
+                        or p.cold_reachability_partial_evidence is not None
+                    )
                 ):
                     with engine.begin() as conn:
                         conn.execute(

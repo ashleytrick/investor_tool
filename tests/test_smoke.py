@@ -1673,6 +1673,121 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch36_stage4_csv_validation_and_unknown_partner():
+    """Inventory #10/#11: Stage 4 validates partner_content_urls.csv
+    header upfront and refuses unknown partner_ids in live mode."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+        # Set fake ANTHROPIC_API_KEY so Stage 4 preflight (which requires
+        # the key in live mode) doesn't refuse before our CSV checks run.
+        env = {**os.environ, "ANTHROPIC_API_KEY": "fake-key-for-csv-tests"}
+
+        # #10: write a malformed CSV missing the partner_id column.
+        bad = ws_dst / "data" / "raw" / "partner_content_urls.csv"
+        bad.write_text("source_type,source_url\nblog,https://x.example/p\n",
+                       encoding="utf-8")
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "04_mine_partner_signals.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2, (
+            f"expected refusal on malformed CSV; got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout}"
+        )
+        assert "missing required column" in res.stdout
+
+        # #11: well-formed CSV with an unknown partner_id.
+        bad.write_text(
+            "partner_id,source_type,source_url\n"
+            "not-a-real-partner-id,blog,https://x.example/p\n",
+            encoding="utf-8",
+        )
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "04_mine_partner_signals.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        # Stage 4 exits non-zero either via our refusal OR the LLM live-key
+        # check; the important thing is the run_errors row was logged.
+        c = sqlite3.connect(db)
+        n_unknown_errors = c.execute(
+            "select count(*) from run_errors "
+            "where error_type='unknown_partner_in_csv'"
+        ).fetchone()[0]
+        c.close()
+        assert n_unknown_errors >= 1, (
+            f"expected unknown_partner_in_csv run_error; got 0"
+        )
+
+
+def test_batch36_stage6_lead_likelihood_none_blocks():
+    """Inventory #22: parallel to the cold_reachability None fix --
+    lead_likelihood_score=None now blocks recommendation."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "s6", REPO_ROOT / "scripts" / "06_score_candidates.py"
+    )
+    s6 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s6)
+    from datetime import date as _date
+
+    base = dict(
+        composite=7.5, round_fit_score=8.0, disqualifier_present=False,
+        distinct_source_types=2, q2_plus_signal_count=2,
+        deal_attribution_count=1,
+        most_recent_signal_date=_date.today(),
+        employment_status="likely_current", major_kill=False,
+        warm_path_available=False, today=_date.today(),
+        cold_reachability_score=7.0,
+    )
+    ok, _r = s6.evaluate_recommended(lead_likelihood_score=6.0, **base)
+    assert ok is True
+    ok, reason = s6.evaluate_recommended(lead_likelihood_score=None, **base)
+    assert ok is False
+    assert "lead_likelihood_score is unknown" in reason
+
+
+def test_batch36_stage1_required_source_blocks():
+    """Inventory #7: a source with required: true that fails to load
+    must cause Stage 1 to exit 2."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        # Replace sources.yaml so the seed CSV is REQUIRED but the path
+        # points to a non-existent file.
+        (ws_dst / "config" / "sources.yaml").write_text(
+            "public_lists:\n"
+            "  - name: 'Missing Required'\n"
+            "    path: 'data/raw/does-not-exist.csv'\n"
+            "    parser: csv\n"
+            "    required: true\n"
+            "funding_announcement_feeds: []\n"
+            "partner_signal_sources:\n"
+            "  podcast_search_api: 'listennotes'\n",
+            encoding="utf-8",
+        )
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "01_aggregate_sources.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2
+        assert "REQUIRED" in res.stdout
+
+
 def test_batch35_cold_reachability_unknown_blocks_recommendation():
     """Stage 6 used to permit recommendation when cold_reachability_score
     was None (the check was `is not None and < 5.0`). Now None blocks."""

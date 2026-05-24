@@ -125,6 +125,17 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001 - logged, run continues
                 run.skipped += 1
                 run.log_error(name, type(exc).__name__, str(exc))
+                # Batch 36 (#7): sources.yaml entries can declare
+                # `required: true`. A required source that fails to load
+                # turns into a hard run failure -- partial ingestion is
+                # only acceptable for sources the operator explicitly
+                # marked optional. Default behavior (no `required` key)
+                # is OPTIONAL, preserving back-compat.
+                if src.get("required"):
+                    run.failed += 1
+                    print(
+                        f"[stage 1] REQUIRED source {name!r} failed: {exc}"
+                    )
                 continue
 
             for row in parsed:
@@ -143,6 +154,14 @@ def main() -> int:
         # Loud failure: sources were configured but produced nothing usable.
         # Quiet success of an empty pipeline is the old "no silent failures"
         # trap wearing a new jacket -- exit 2 so wrappers notice.
+        # Batch 36 (#7): a required-source failure trips run.failed
+        # inside the loop; surface it as exit 2 here too.
+        if run.failed > 0:
+            print(
+                f"[stage 1] {run.failed} REQUIRED source(s) failed; "
+                f"refusing to publish a partial fund universe."
+            )
+            return 2
         if not seen and run.processed > 0:
             print(
                 f"[stage 1] FAIL: {run.processed} source(s) configured but "

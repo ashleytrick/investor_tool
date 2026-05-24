@@ -294,6 +294,13 @@ def _check_sources(sources_cfg: dict, issues: list[str]) -> None:
             issues.append(
                 f"sources.yaml: public_lists[{i}] must have 'path:' or 'url:'"
             )
+        # Batch 36 (#7): required flag must be bool if present.
+        req = src.get("required")
+        if req is not None and not isinstance(req, bool):
+            issues.append(
+                f"sources.yaml: public_lists[{i}].required must be bool "
+                f"(got {req!r})"
+            )
     feeds = (sources_cfg or {}).get("funding_announcement_feeds") or []
     if not isinstance(feeds, list):
         issues.append("sources.yaml: 'funding_announcement_feeds:' must be a list")

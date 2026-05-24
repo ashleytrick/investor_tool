@@ -311,7 +311,17 @@ def evaluate_recommended(
         fails.append(
             f"round_fit_score ({round_fit_score:.1f}) < 6.0 or disqualifier present"
         )
-    if lead_likelihood_score is not None and lead_likelihood_score < 5.0:
+    # Batch 36 (#22): same semantics as Batch 35's cold_reachability fix.
+    # None used to permit recommendation; now it blocks with an explicit
+    # reason so the operator knows Stage 6's lead_likelihood input is
+    # missing for this partner.
+    if lead_likelihood_score is None:
+        fails.append(
+            "lead_likelihood_score is unknown (Stage 6 had no inputs to "
+            "compute it); the partner needs at least one attributed deal "
+            "before recommendation"
+        )
+    elif lead_likelihood_score < 5.0:
         fails.append(f"lead_likelihood_score ({lead_likelihood_score:.1f}) < 5.0")
     # criterion 4: 2 distinct evidence sources at quality>=2
     crit4_ok = (
@@ -821,6 +831,28 @@ def main() -> int:
         # exceptions had landed in run.failed -- cron / wrapping scripts
         # never noticed partial scoring failures.
         any_failed = run.failed > 0
+        # Batch 36 (#29): if the run processed partners but EVERY one was
+        # skipped (no qualifying signals across the board), the scoring
+        # pass produced nothing usable. That's almost always a Stage 4
+        # / Stage 5 upstream problem the operator needs to see -- treat
+        # as failure so cron / wrappers notice. Filter-mode runs are
+        # excluded (they intentionally process a subset).
+        if (
+            not partner_id_filter
+            and run.processed > 0
+            and run.succeeded == 0
+            and run.failed == 0
+        ):
+            msg = (
+                f"every partner skipped (no qualifying signals); "
+                f"this usually means Stage 4/5 produced no verified "
+                f"quality>=2 signals. Check Stage 5's verification rate "
+                f"and re-run Stage 4 if needed."
+            )
+            print(f"[stage 6] {msg}")
+            run.note(msg)
+            run.failed = 1
+            any_failed = True
 
     return 2 if any_failed else 0
 

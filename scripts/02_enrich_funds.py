@@ -71,17 +71,22 @@ def gather_fixture_pages(fund: dict, ws) -> dict[str, str]:
 
 async def gather_live_pages(
     fund: dict,
-) -> tuple[dict[str, str], list[tuple[str, str]]]:
-    """Fetch standard fund pages. Returns (pages, failures) where failures is
-    a list of (url, reason) tuples for the operator audit trail.
+) -> tuple[dict[str, dict], list[tuple[str, str]]]:
+    """Fetch standard fund pages. Returns ({url: {html, final_url}}, failures)
+    where failures is a list of (url, reason) tuples for the operator
+    audit trail.
 
-    Previously every per-URL exception was caught and silently discarded.
-    Now non-200 responses are still ignored (a missing /portfolio is normal),
-    but transport-layer errors and 5xx responses are surfaced to the caller
-    so they can land in run_errors.
+    Batch 36 (#13): result dict now carries final_url alongside the
+    HTML so store_snapshots can persist the post-redirect URL into
+    source_snapshots.final_url. Previously the post-redirect URL was
+    discarded.
+
+    Non-200 responses are still ignored (a missing /portfolio is normal),
+    but transport-layer errors and 5xx responses are surfaced to the
+    caller so they can land in run_errors.
     """
     client = HttpClient()
-    pages: dict[str, str] = {}
+    pages: dict[str, dict] = {}
     failures: list[tuple[str, str]] = []
     for path in LIVE_PATHS:
         url = _page_url(fund["domain"], path)
@@ -91,14 +96,14 @@ async def gather_live_pages(
             failures.append((url, f"{type(exc).__name__}: {exc}"))
             continue
         if res.status == 200 and res.text.strip():
-            pages[url] = res.text
+            pages[url] = {"html": res.text, "final_url": res.final_url}
         elif res.status >= 500:
             # Server errors are interesting; 404 is not.
             failures.append((url, f"HTTP {res.status}"))
     return pages, failures
 
 
-def deterministic_enrichment(pages: dict[str, str]) -> dict:
+def deterministic_enrichment(pages: dict) -> dict:
     """Offline stub: extract enrichment from the structured fixture HTML.
 
     Designed for the fixture HTML format (meta tags + .partner / .portfolio-company
@@ -115,7 +120,8 @@ def deterministic_enrichment(pages: dict[str, str]) -> dict:
         "explicit_kill_signals": [],
         "source_urls_used": sorted(pages.keys()),
     }
-    for html in pages.values():
+    for entry in pages.values():
+        html = _page_html(entry)
         tree = HTMLParser(html)
 
         def meta(name: str) -> str | None:
@@ -151,10 +157,19 @@ def deterministic_enrichment(pages: dict[str, str]) -> dict:
     return out
 
 
-def enrich(llm: LLMClient, fund: dict, pages: dict[str, str]) -> FundEnrichment:
+def _page_html(entry) -> str:
+    """Pages may be {url: html_str} (fixture) or {url: {html, final_url}}
+    (live; Batch 36 #13). Normalize."""
+    if isinstance(entry, dict):
+        return entry.get("html", "")
+    return entry
+
+
+def enrich(llm: LLMClient, fund: dict, pages: dict) -> FundEnrichment:
     """Run enrichment. Live: LLM over fetched content. Stub: deterministic."""
     content = "\n\n".join(
-        f"--- {url} ---\n{_extract_text(html)}" for url, html in pages.items()
+        f"--- {url} ---\n{_extract_text(_page_html(html))}"
+        for url, html in pages.items()
     )
     prompt = (
         PROMPT_PATH.read_text(encoding="utf-8")
@@ -170,11 +185,23 @@ def enrich(llm: LLMClient, fund: dict, pages: dict[str, str]) -> FundEnrichment:
     )
 
 
-def store_snapshots(engine, pages: dict[str, str]) -> int:
-    """Write each fetched page to source_snapshots, deduped on (url, hash)."""
+def store_snapshots(engine, pages: dict) -> int:
+    """Write each fetched page to source_snapshots, deduped on (url, hash).
+
+    `pages` accepts either:
+      - {url: html_str}  (fixture path; final_url stays NULL)
+      - {url: {"html": ..., "final_url": ...}}  (live path; final_url is
+        captured from the post-redirect httpx response, Batch 36 #13)
+    """
     written = 0
     with engine.begin() as conn:
-        for url, html in pages.items():
+        for url, entry in pages.items():
+            if isinstance(entry, dict):
+                html = entry.get("html", "")
+                final_url = entry.get("final_url")
+            else:
+                html = entry
+                final_url = None
             text = _extract_text(html)
             chash = _content_hash(text)
             exists = conn.execute(
@@ -187,6 +214,7 @@ def store_snapshots(engine, pages: dict[str, str]) -> int:
                 continue
             conn.execute(source_snapshots.insert().values(
                 source_url=url,
+                final_url=final_url,
                 fetched_at=_now(),
                 http_status=200,
                 content_hash=chash,
