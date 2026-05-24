@@ -1665,6 +1665,83 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch31_compare_and_restore_batches():
+    """Inventory #698/#699: compare_batches diffs two Stage 7 batches and
+    restore_batch rebuilds review_queue.csv from a prior batch."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Run Stage 7 once, then synthesize a second batch by copying the
+        # current recommended drafts under a new batch_id. (Re-running
+        # Stage 7 wipes prior drafts for the same partners; the
+        # compare/restore tools are designed for cases where you've kept
+        # an older batch around in the DB.)
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+        c = sqlite3.connect(db)
+        first_batch = c.execute(
+            "select distinct batch_id from email_drafts order by batch_id"
+        ).fetchone()[0]
+        c.execute(
+            "insert into email_drafts (partner_id, batch_id, strategy, "
+            "subject, body, conversion_hypothesis, likely_objection, "
+            "objection_preempted, preemption_line, template_smell, "
+            "qa_status, is_recommended, generated_at) "
+            "select partner_id, 'batch_synthetic_older', strategy, "
+            "subject, body, conversion_hypothesis, likely_objection, "
+            "objection_preempted, preemption_line, template_smell, "
+            "qa_status, is_recommended, generated_at "
+            "from email_drafts where batch_id = ?",
+            (first_batch,),
+        )
+        c.commit()
+        c.close()
+
+        # compare_batches --json should return two batch ids + zero added
+        # / zero dropped (synthetic second batch has the same partners).
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "compare_batches.py"),
+             "--workspace", ws, "--json"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        diff = json.loads(res.stdout)
+        assert diff["before"] != diff["after"]
+        assert diff["added"] == []
+        assert diff["dropped"] == []
+
+        # restore_batch --list shows both batches.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "restore_batch.py"),
+             "--workspace", ws, "--list"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        # Two batch_ids listed.
+        assert res.stdout.count("batch_") >= 2
+
+        # restore_batch from the synthetic older batch -- CSV gets rewritten
+        # with the "RESTORED from" tag in recommendation_reasoning.
+        csv_path = ws_dst / "exports" / "review_queue.csv"
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "restore_batch.py"),
+             "--workspace", ws, "--batch-id", "batch_synthetic_older"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        after_text = csv_path.read_text()
+        assert "RESTORED from" in after_text
+
+
 def test_batch30_fixture_mode_refusal():
     """Inventory #528/#529/#531: a workspace with company.yaml `mode:
     fixture` must refuse Stage 8 sync + Gmail draft creation without

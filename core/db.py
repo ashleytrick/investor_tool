@@ -381,8 +381,17 @@ outcomes = Table(
     # report refuse to train on fixture rows if it later runs in a real
     # workspace that was scaffolded from a fixture seed.
     Column("source", Text),
+    # Batch 31 (#522): external event ID for cross-source dedup. Attio
+    # rows can be keyed by the Attio activity-event id; manual rows can
+    # use a stable hash. A future outcome_sync rewrite can ON CONFLICT
+    # on this column to avoid duplicate ingestion across cron retries.
+    Column("external_event_id", Text),
     Index("ix_outcomes_partner_id", "partner_id"),
     Index("ix_outcomes_source", "source"),
+    Index(
+        "ux_outcomes_external_event_id",
+        "external_event_id", unique=True,
+    ),
 )
 
 calibration_cohorts = Table(
