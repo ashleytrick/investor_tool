@@ -1673,6 +1673,259 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch43_stage2_partial_failure_exits_nonzero():
+    """Inventory #83: Stage 2 exits 2 when any per-fund enrichment
+    raises. Verifies the Batch 35 fix is wired through enrich()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+
+        # Drive Stage 2 with a monkey-patched enrich() that raises on
+        # the first fund (same pattern as Batch 11's Stage 6 test).
+        driver = ws_dst / "_drive_stage2_fail.py"
+        driver.write_text(
+            "import sys, importlib.util\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "spec = importlib.util.spec_from_file_location("
+            f"'s2', {str(REPO_ROOT / 'scripts' / '02_enrich_funds.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "real = m.enrich\n"
+            "calls = {'n': 0}\n"
+            "def boom(*a, **kw):\n"
+            "    calls['n'] += 1\n"
+            "    if calls['n'] == 1:\n"
+            "        raise RuntimeError('synthetic Stage 2 failure for #83')\n"
+            "    return real(*a, **kw)\n"
+            "m.enrich = boom\n"
+            f"sys.argv = ['s2', '--workspace', {ws!r}, '--fixtures']\n"
+            "raise SystemExit(m.main())\n"
+        )
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        res = subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        assert res.returncode == 2, (
+            f"Stage 2 partial failure should exit 2; got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout[-800:]}"
+        )
+
+        c = sqlite3.connect(db)
+        failed = c.execute(
+            "select records_failed from runs where stage='02_enrich_funds' "
+            "order by run_id desc limit 1"
+        ).fetchone()[0]
+        c.close()
+        assert failed >= 1
+
+
+def test_batch43_attio_outcome_sync_row_failure_exits_nonzero():
+    """Inventory #86: attio_outcome_sync exits 2 when row-level
+    exceptions occur. Drive via stubbed AttioClient that returns one
+    valid record + one broken record so _bool/_option_title raise."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+
+        # Inject Attio config so outcome_sync runs.
+        (ws_dst / "config" / "attio.yaml").write_text(
+            "attio:\n"
+            "  workspace_id: dummy\n"
+            "  api_base: https://api.attio.com/v2\n"
+            "  matching_attributes:\n"
+            "    companies: domains\n"
+            "    people: email_addresses\n"
+            "  objects:\n"
+            "    funds: companies\n"
+            "    partners: people\n"
+            "  fund_attributes: {}\n"
+            "  partner_attributes: {}\n",
+            encoding="utf-8",
+        )
+        # Stamp attio_record_id on one partner so the sync has someone
+        # to walk.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update partners set attio_record_id='fake_rec_1' "
+            "where partner_id='northbeam.example_priya_anand'"
+        )
+        c.commit()
+        c.close()
+
+        # Driver: stub query_records_all to return a malformed values
+        # dict that trips the per-row try/except (passing a non-dict
+        # raises in _option_title).
+        driver = ws_dst / "_drive_outcome_sync.py"
+        driver.write_text(
+            "import sys, importlib.util\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "import core.attio_client as ac\n"
+            "class FakeClient:\n"
+            "    def query_records_all(self, slug, filt, **kw):\n"
+            "        return [\n"
+            "            {'id': {'record_id': 'fake_rec_1'},\n"
+            "             'values': 'not-a-dict-deliberately'},\n"
+            "        ]\n"
+            "    def close(self): pass\n"
+            "ac.AttioClient.from_workspace = classmethod(lambda cls, w: FakeClient())\n"
+            "spec = importlib.util.spec_from_file_location("
+            f"'o', {str(REPO_ROOT / 'jobs' / 'attio_outcome_sync.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.AttioClient.from_workspace = classmethod(lambda cls, w: FakeClient())\n"
+            f"sys.argv = ['o', '--workspace', {ws!r}]\n"
+            "raise SystemExit(m.main())\n"
+        )
+        env = {**os.environ, "ANTHROPIC_API_KEY": "",
+                "ATTIO_API_KEY": "fake-key"}
+        res = subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2, (
+            f"outcome_sync row failure should exit 2; got {res.returncode}\n"
+            f"STDOUT:\n{res.stdout[-500:]}"
+        )
+
+
+def test_batch43_stage7_preserves_prior_draft_on_qa_fail():
+    """Inventory #87: Stage 7's Batch 37 #38 behavior -- when a
+    partner's NEW recommended draft has hard-gate failures, the prior
+    good draft is preserved (not overwritten by the bad regeneration).
+    Drive by stubbing build_stub_response so one partner's regenerated
+    body is identical to the prior (similar enough) AND contains a
+    forbidden phrase that trips check_hard_gates."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+
+        # First Stage 7 run: produce a good batch.
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+        c = sqlite3.connect(db)
+        first_batch_id, prior_body = c.execute(
+            "select batch_id, body from email_drafts "
+            "where is_recommended=1 limit 1"
+        ).fetchone()
+        prior_partner = c.execute(
+            "select partner_id from email_drafts "
+            "where batch_id=? and is_recommended=1 limit 1",
+            (first_batch_id,),
+        ).fetchone()[0]
+        c.close()
+        assert prior_body and "would love" not in prior_body.lower()
+
+        # Force a re-run where the recommended draft has a forbidden
+        # phrase. The cleanest way: monkey-patch build_stub_response so
+        # the chosen partner's recommended body contains "would love".
+        driver = ws_dst / "_drive_stage7_bad_regen.py"
+        driver.write_text(
+            "import sys, importlib.util\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "spec = importlib.util.spec_from_file_location("
+            f"'s7', {str(REPO_ROOT / 'scripts' / '07_generate_emails.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "real = m.build_stub_response\n"
+            "def patched(partner_id, strategies):\n"
+            "    out = real(partner_id, strategies)\n"
+            f"    if out and partner_id == {prior_partner!r}:\n"
+            "        # corrupt the recommended variant with a forbidden phrase\n"
+            "        rec = out['recommended_variant_strategy']\n"
+            "        for v in out['variants']:\n"
+            "            if v['strategy'] == rec:\n"
+            "                v['body'] = ('We are raising and would love to chat soon '\n"
+            "                             'next week. ' * 4)\n"
+            "    return out\n"
+            "m.build_stub_response = patched\n"
+            f"sys.argv = ['s7', '--workspace', {ws!r}, '--top', '5',\n"
+            "             '--allow-example-domains',\n"
+            "             '--skip-freshness-check', '--reason', 'test #87']\n"
+            "raise SystemExit(m.main())\n"
+        )
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+        # The corrupted draft will fail per-draft hard gates. Stage 7
+        # batch-QA might or might not fail batch-wide; either way the
+        # prior draft for that partner must survive.
+        subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+
+        c = sqlite3.connect(db)
+        # Surviving recommended draft for the targeted partner: ANY
+        # recommended row whose body == prior_body (matches old) must
+        # still exist OR no NEW row replaced it.
+        surviving = c.execute(
+            "select count(*) from email_drafts "
+            "where partner_id = ? and is_recommended = 1 and body = ?",
+            (prior_partner, prior_body),
+        ).fetchone()[0]
+        c.close()
+        assert surviving >= 1, (
+            f"prior good draft for {prior_partner} was overwritten by "
+            f"the failed regeneration; #38 regression"
+        )
+
+
+def test_batch43_review_queue_csv_golden_columns():
+    """Inventory #90: pin the review_queue.csv column order +
+    expected per-status mix. Acts as a smoke test for the column
+    contract that downstream operators / spreadsheets rely on."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5",
+             "--allow-example-domains", cwd=REPO_ROOT)
+
+        csv_path = ws_dst / "exports" / "review_queue.csv"
+        with csv_path.open(encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            cols = list(reader.fieldnames or [])
+            rows = list(reader)
+        # Golden column list (must match core/csv_export.py CSV_COLUMNS).
+        from core.csv_export import CSV_COLUMNS
+        assert cols == CSV_COLUMNS, (
+            f"CSV column drift!\nactual:   {cols}\nexpected: {CSV_COLUMNS}"
+        )
+        # Every row has an outreach_status from the known set.
+        valid_statuses = {
+            "ready_to_send", "draft", "warm_path_needed",
+        }
+        for r in rows:
+            assert r["outreach_status"] in valid_statuses, (
+                f"unexpected outreach_status {r['outreach_status']!r}"
+            )
+            assert r["partner_id"]
+            assert r["partner_name"]
+            assert r["email_subject_line"]
+            assert r["outreach_email_draft"]
+        # Fixture always produces 5 rows (top=5).
+        assert len(rows) == 5
+
+
 def test_batch36_stage4_csv_validation_and_unknown_partner():
     """Inventory #10/#11: Stage 4 validates partner_content_urls.csv
     header upfront and refuses unknown partner_ids in live mode."""
