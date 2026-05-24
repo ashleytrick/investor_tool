@@ -42,3 +42,23 @@ jobs:
           name: pytest-log
           path: pytest.log
           if-no-files-found: warn
+      - name: Post pytest tail to PR on failure
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR="${{ github.event.pull_request.number }}"
+          BODY=$(mktemp)
+          {
+            echo "### smoke CI failure on \`${GITHUB_SHA::7}\`"
+            echo ""
+            echo "Tail of pytest output:"
+            echo '```'
+            tail -120 pytest.log
+            echo '```'
+          } > "$BODY"
+          curl -sX POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+            -d "$(jq -Rs --rawfile body "$BODY" '{body: $body}' < /dev/null)"
