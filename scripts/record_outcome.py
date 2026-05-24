@@ -155,48 +155,45 @@ def main() -> int:
                 reader = csv.DictReader(fh)
                 with engine.begin() as conn:
                     for row in reader:
-                        run.processed += 1
-                        pid = (row.get("partner_id") or "").strip()
-                        if not pid:
-                            run.skipped += 1
-                            continue
-                        if pid not in known:
-                            run.failed += 1
-                            run.log_error(
-                                pid, "unknown_partner",
-                                "partner_id not in partners table",
-                            )
-                            continue
-                        try:
-                            _status = (row.get("status") or "").strip() or None
-                            _rt = (row.get("reply_type") or "").strip() or None
-                            _mo = (row.get("meeting_outcome") or "").strip() or None
-                            _mb = (row.get("meeting_booked") or "").strip().lower() in (
-                                "true", "1", "yes",
-                            )
-                            _md = _parse_date(
-                                (row.get("meeting_date") or "").strip() or None
-                            )
-                            _validate_choices(
-                                status=_status, reply_type=_rt, meeting_outcome=_mo,
-                            )
-                            _validate_meeting_consistency(
-                                meeting_booked=_mb,
-                                meeting_date=_md,
-                                meeting_outcome=_mo,
-                                status=_status,
-                                reply_type=_rt,
-                            )
-                            _insert(
-                                conn, partner_id=pid,
-                                status=_status, reply_type=_rt,
-                                meeting_booked=_mb, meeting_date=_md,
-                                meeting_outcome=_mo,
-                            )
-                            run.succeeded += 1
-                        except SystemExit as exc:
-                            run.failed += 1
-                            run.log_error(pid, "validation", str(exc))
+                        with run.attempt():
+                            pid = (row.get("partner_id") or "").strip()
+                            if not pid:
+                                run.skip()
+                                continue
+                            if pid not in known:
+                                run.fail(
+                                    pid, "unknown_partner",
+                                    "partner_id not in partners table",
+                                )
+                                continue
+                            try:
+                                _status = (row.get("status") or "").strip() or None
+                                _rt = (row.get("reply_type") or "").strip() or None
+                                _mo = (row.get("meeting_outcome") or "").strip() or None
+                                _mb = (row.get("meeting_booked") or "").strip().lower() in (
+                                    "true", "1", "yes",
+                                )
+                                _md = _parse_date(
+                                    (row.get("meeting_date") or "").strip() or None
+                                )
+                                _validate_choices(
+                                    status=_status, reply_type=_rt, meeting_outcome=_mo,
+                                )
+                                _validate_meeting_consistency(
+                                    meeting_booked=_mb,
+                                    meeting_date=_md,
+                                    meeting_outcome=_mo,
+                                    status=_status,
+                                    reply_type=_rt,
+                                )
+                                _insert(
+                                    conn, partner_id=pid,
+                                    status=_status, reply_type=_rt,
+                                    meeting_booked=_mb, meeting_date=_md,
+                                    meeting_outcome=_mo,
+                                )
+                            except SystemExit as exc:
+                                run.fail(pid, "validation", str(exc))
             print(
                 f"[record_outcome] from-csv: processed={run.processed} "
                 f"ok={run.succeeded} failed={run.failed} skipped={run.skipped}"
