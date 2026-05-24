@@ -24,7 +24,10 @@ SourceType = Literal[
 
 
 class Signal(BaseModel):
-    quoted_text: str
+    # quoted_text: 8000-char cap is generous (multi-paragraph essay quote =
+    # ~3000) but rejects "the entire article was relevant, here is its
+    # 30KB body" LLM mistakes that would balloon source_snapshots.
+    quoted_text: str = Field(..., min_length=1, max_length=8000)
     source_url: HttpUrl
     source_type: SourceType
     quote_date: Optional[date] = None
@@ -37,6 +40,15 @@ class Signal(BaseModel):
     def axis_relevance_nonempty(cls, v: list[str]) -> list[str]:
         if not v:
             raise ValueError("axis_relevance must be non-empty")
+        return v
+
+    @field_validator("quote_date")
+    @classmethod
+    def quote_date_not_future(cls, v: Optional[date]) -> Optional[date]:
+        if v is not None and v > date.today():
+            raise ValueError(
+                f"quote_date {v} is in the future; LLM misparse"
+            )
         return v
 
 

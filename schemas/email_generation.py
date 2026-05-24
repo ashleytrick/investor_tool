@@ -36,6 +36,43 @@ class EmailVariant(BaseModel):
     preemption_line: Optional[str] = None
     template_smell: str = "unscored"
 
+    @field_validator("subject")
+    @classmethod
+    def subject_constraints(cls, v: str) -> str:
+        """Brief STEP 2: subject is 'Not a question. 5 words maximum.
+        Specific.' The hard 80-char + min_length=1 floor stays; this
+        validator enforces the structural rules so a live LLM ignoring
+        them retries instead of producing a non-conforming subject."""
+        stripped = v.strip()
+        if stripped.endswith("?"):
+            raise ValueError(
+                f"subject must not be a question; got {v!r}"
+            )
+        word_count = len(stripped.split())
+        if word_count > 5:
+            raise ValueError(
+                f"subject must be <= 5 words (brief STEP 2); got "
+                f"{word_count} words: {v!r}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def preemption_consistency(self) -> "EmailVariant":
+        """objection_preempted=True requires a non-empty preemption_line,
+        and vice versa. The pair must agree so downstream consumers can
+        trust either field as the source of truth."""
+        line = (self.preemption_line or "").strip()
+        if self.objection_preempted and not line:
+            raise ValueError(
+                "objection_preempted=True requires a non-empty preemption_line"
+            )
+        if line and not self.objection_preempted:
+            raise ValueError(
+                "preemption_line is set but objection_preempted is False; "
+                "set objection_preempted=True or clear the line"
+            )
+        return self
+
 
 class EmailOutput(BaseModel):
     variants: list[EmailVariant]

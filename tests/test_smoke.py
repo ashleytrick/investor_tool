@@ -1101,3 +1101,102 @@ def test_stage7_downgrades_example_domains_to_draft_by_default():
             f"--allow-example-domains should restore ready_to_send; "
             f"got statuses={statuses2}"
         )
+
+
+def test_batch10_schema_validators():
+    """Batch 10: schema-level tightening on LLM output shapes. A malformed
+    LLM output should raise ValidationError instead of silently flowing
+    into the DB. Each helper here builds an otherwise-valid payload and
+    perturbs one field at a time."""
+    import pytest
+    from datetime import date, timedelta
+
+    # --- DealAttribution ---
+    from schemas.deal_attribution import DealAttribution
+    from pydantic import ValidationError
+
+    base_deal = dict(
+        company="Acme", round_type="Seed",
+        round_size_usd=1_000_000,
+        announcement_date=date.today(),
+    )
+    DealAttribution.model_validate(base_deal)  # baseline OK
+
+    with pytest.raises(ValidationError):
+        DealAttribution.model_validate({**base_deal, "company": ""})
+    with pytest.raises(ValidationError):
+        DealAttribution.model_validate({**base_deal, "round_type": "  "})
+    with pytest.raises(ValidationError):
+        DealAttribution.model_validate({**base_deal, "round_size_usd": -1})
+    with pytest.raises(ValidationError):
+        DealAttribution.model_validate({
+            **base_deal,
+            "announcement_date": date.today() + timedelta(days=1),
+        })
+
+    # --- partner_signals.Signal ---
+    from schemas.partner_signals import Signal
+    base_signal = dict(
+        quoted_text="some quote",
+        source_url="https://example.test/post",
+        source_type="blog",
+        signal_direction="positive",
+        confidence="high",
+        axis_relevance=["axis_1"],
+    )
+    Signal.model_validate(base_signal)
+    with pytest.raises(ValidationError):
+        Signal.model_validate({**base_signal, "quoted_text": ""})
+    with pytest.raises(ValidationError):
+        Signal.model_validate({**base_signal, "quoted_text": "x" * 8001})
+    with pytest.raises(ValidationError):
+        Signal.model_validate({
+            **base_signal,
+            "quote_date": date.today() + timedelta(days=1),
+        })
+
+    # --- FundEnrichment.stated_stage_focus canonicalization ---
+    from schemas.fund_enrichment import FundEnrichment
+    fe = FundEnrichment.model_validate({"stated_stage_focus": "Series-A"})
+    assert fe.stated_stage_focus == "series a"
+    fe = FundEnrichment.model_validate({"stated_stage_focus": "preseed"})
+    assert fe.stated_stage_focus == "pre-seed"
+    with pytest.raises(ValidationError):
+        FundEnrichment.model_validate({"stated_stage_focus": "stealth-mode"})
+
+    # --- email subject + preemption consistency ---
+    from schemas.email_generation import EmailVariant
+    base_var = dict(
+        strategy="signal_led",
+        subject="Tendril seed round",
+        body="x" * 60,
+    )
+    EmailVariant.model_validate(base_var)
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({**base_var, "subject": "Hello there?"})
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **base_var, "subject": "this is a six word subject line",
+        })
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **base_var,
+            "objection_preempted": True,
+            "preemption_line": "",
+        })
+    with pytest.raises(ValidationError):
+        EmailVariant.model_validate({
+            **base_var,
+            "objection_preempted": False,
+            "preemption_line": "some line",
+        })
+
+    # --- SignalQuality reasoning required ---
+    from schemas.signal_quality import SignalQuality
+    SignalQuality.model_validate({
+        "signal_quality_score": 3, "quality_reasoning": "specific quote",
+    })
+    with pytest.raises(ValidationError):
+        SignalQuality.model_validate({
+            "signal_quality_score": 3, "quality_reasoning": "",
+        })
