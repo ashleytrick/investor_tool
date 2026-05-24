@@ -11,6 +11,7 @@ import csv
 import pathlib
 import sys
 from datetime import datetime, timezone
+from email.utils import parseaddr
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -26,6 +27,14 @@ STAGE = "set_partner_email"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _valid_email(email: str) -> bool:
+    parsed_name, parsed_email = parseaddr(email)
+    if parsed_name or parsed_email != email:
+        return False
+    local, sep, domain = email.partition("@")
+    return bool(local and sep and domain and "." in domain)
 
 
 def main() -> int:
@@ -71,6 +80,10 @@ def main() -> int:
                     run.failed += 1
                     run.log_error(pid, "unknown_partner", "not in partners table")
                     continue
+                if not _valid_email(email):
+                    run.failed += 1
+                    run.log_error(pid, "invalid_email", f"invalid email: {email!r}")
+                    continue
                 conn.execute(
                     partners.update().where(partners.c.partner_id == pid).values(
                         email=email, last_updated=_now(),
@@ -83,6 +96,7 @@ def main() -> int:
             f"[set_partner_email] processed={run.processed} "
             f"ok={run.succeeded} failed={run.failed}"
         )
+        return 2 if run.failed else 0
 
     return 0
 
