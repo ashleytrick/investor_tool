@@ -111,6 +111,24 @@ class Workspace:
         self.sources = _load_yaml(self.config_dir / "sources.yaml")
         self.attio = _load_yaml(self.config_dir / "attio.yaml")
 
+        # Batch 30 (#528): explicit environment type. Operators declare
+        # whether a workspace is fixture/dev/prod by adding `mode: ...`
+        # to company.yaml. Defaults to "dev" so existing workspaces
+        # remain unaffected. The fixture clients/test_workspace declares
+        # mode=fixture so Stage 8 / Gmail draft creation can refuse to
+        # touch it without an explicit override.
+        raw_mode = (
+            (self.company or {}).get("mode")
+            or (self.company or {}).get("workspace", {}).get("mode")
+            or "dev"
+        )
+        if raw_mode not in ("fixture", "dev", "prod"):
+            raise SystemExit(
+                f"company.yaml mode={raw_mode!r} must be one of "
+                f"'fixture', 'dev', or 'prod'."
+            )
+        self.mode: str = raw_mode
+
         # Environment values, layered.
         self._env: dict[str, str] = {}
         self._env.update({k: v for k, v in dotenv_values(REPO_ROOT / ".env").items() if v is not None})

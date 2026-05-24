@@ -213,6 +213,14 @@ def main() -> int:
              "runs ONLY; production sync should refuse fictional data so "
              "fixture leakage cannot pollute a real Attio workspace.",
     )
+    # Batch 30 (#529/#531): refuse to sync a workspace whose company.yaml
+    # declares mode=fixture without an explicit override.
+    parser.add_argument(
+        "--allow-fixture-mode", action="store_true",
+        help="Bypass the mode=fixture refusal. Required when the workspace's "
+             "company.yaml has `mode: fixture` -- prevents accidental syncs "
+             "of fictional data to real Attio.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -220,6 +228,17 @@ def main() -> int:
         ws, stage=STAGE, require_attio=bool(ws.attio),
     )
     print_banner(ws, stage=STAGE)
+    # Batch 30 (#529/#531): mode-aware refusal. A workspace explicitly
+    # marked `mode: fixture` should never sync to real Attio without
+    # the operator stating the intent.
+    if ws.mode == "fixture" and not args.allow_fixture_mode:
+        msg = (
+            f"REFUSED: workspace mode=fixture; sync to Attio would "
+            f"propagate fictional data. Pass --allow-fixture-mode if "
+            f"you really intend to test against Attio."
+        )
+        print(f"[stage 8] {msg}")
+        return 2
     engine = get_engine(ws.db_url)
     cfg = ws.attio or {}
     attio_cfg = cfg.get("attio") or cfg

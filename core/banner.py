@@ -34,6 +34,9 @@ def print_banner(ws: Workspace, *, stage: str | None = None) -> None:
         attio_mode = _attio_state(ws)
     parts = [
         f"workspace={ws.name}",
+        # Batch 30 (#528): surface the declared mode (fixture/dev/prod)
+        # so the operator sees the safety state at run start.
+        f"mode={getattr(ws, 'mode', 'dev')}",
         f"llm={llm_mode}",
         f"attio={attio_mode}",
     ]

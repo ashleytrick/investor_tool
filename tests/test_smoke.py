@@ -461,10 +461,10 @@ def test_operator_clis():
         assert "GCP setup" in res.stdout or "Gmail isn't linked" in res.stdout
 
         # create_gmail_drafts without credentials -> skip cleanly + point at
-        # connect_gmail
+        # connect_gmail (mode=fixture override needed for the test workspace).
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "create_gmail_drafts.py"),
-             "--workspace", ws],
+             "--workspace", ws, "--allow-fixture-mode"],
             capture_output=True, text=True, env=env, timeout=60,
         )
         assert res.returncode == 0
@@ -1338,7 +1338,7 @@ def test_stage8_pushed_at_timestamps_via_driver():
             "m.find_partner_record = lambda *a, **kw: None\n"
             "# AttioClient.from_workspace is module-level used inside s8\n"
             "m.AttioClient.from_workspace = classmethod(lambda cls, ws: FakeClient())\n"
-            f"sys.argv = ['s8', '--workspace', {ws!r}, '--top', '5', '--allow-example-domains']\n"
+            f"sys.argv = ['s8', '--workspace', {ws!r}, '--top', '5', '--allow-example-domains', '--allow-fixture-mode']\n"
             "raise SystemExit(m.main())\n"
         )
         env = {**os.environ, "ANTHROPIC_API_KEY": "", "ATTIO_API_KEY": "fake-key"}
@@ -1663,6 +1663,76 @@ def test_batch16_check_size_parser_edge_cases():
     }
     rf = compute_round_fit(fund, partner, [], False, company)
     assert 0.0 <= rf.round_fit_score <= 10.0
+
+
+def test_batch30_fixture_mode_refusal():
+    """Inventory #528/#529/#531: a workspace with company.yaml `mode:
+    fixture` must refuse Stage 8 sync + Gmail draft creation without
+    --allow-fixture-mode."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        # The fixture workspace already has mode: fixture; confirm at the
+        # Workspace API.
+        from core.config_loader import Workspace
+        ws_obj = Workspace(str(ws_dst))
+        assert ws_obj.mode == "fixture"
+
+        # Add a minimal attio.yaml so the Stage 8 preflight doesn't skip.
+        (ws_dst / "config" / "attio.yaml").write_text(
+            "attio:\n"
+            "  workspace_id: dummy\n"
+            "  api_base: https://api.attio.com/v2\n"
+            "  matching_attributes:\n"
+            "    companies: domains\n"
+            "    people: email_addresses\n"
+            "  objects:\n"
+            "    funds: companies\n"
+            "    partners: people\n"
+            "  fund_attributes: {}\n"
+            "  partner_attributes: {}\n",
+            encoding="utf-8",
+        )
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        env = {**os.environ, "ANTHROPIC_API_KEY": "", "ATTIO_API_KEY": "fake"}
+
+        # Stage 8 without --allow-fixture-mode -> refuse.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "08_sync_to_attio.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        assert "mode=fixture" in res.stdout
+
+        # Gmail draft creation without --allow-fixture-mode -> refuse.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "create_gmail_drafts.py"),
+             "--workspace", ws],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 2
+        assert "mode=fixture" in res.stdout
+
+        # Invalid mode is rejected at load time.
+        bad_path = Path(tmpdir) / "bad_mode_workspace"
+        shutil.copytree(ws_src, bad_path)
+        bad_company = (bad_path / "config" / "company.yaml").read_text()
+        (bad_path / "config" / "company.yaml").write_text(
+            bad_company.replace("mode: fixture", "mode: staging"),
+            encoding="utf-8",
+        )
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            Workspace(str(bad_path))
+        assert "must be one of" in str(exc_info.value)
 
 
 def test_batch29_fetch_result_final_url():

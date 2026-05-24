@@ -53,11 +53,25 @@ def main() -> int:
              "production runs should refuse so fictional partners cannot "
              "be drafted in Gmail.",
     )
+    # Batch 30 (#529): mode-aware refusal.
+    parser.add_argument(
+        "--allow-fixture-mode", action="store_true",
+        help="Bypass the mode=fixture refusal. Required when company.yaml "
+             "has `mode: fixture` -- prevents accidental Gmail drafts of "
+             "fictional partners.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
     print_banner(ws, stage=STAGE)
+    # Batch 30 (#529): mode-aware refusal.
+    if ws.mode == "fixture" and not args.allow_fixture_mode:
+        print(
+            f"[gmail_drafts] REFUSED: workspace mode=fixture; would draft "
+            f"fictional partners. Pass --allow-fixture-mode to override."
+        )
+        return 2
     founder_email = (ws.company.get("company") or {}).get("founder_email")
 
     try:
