@@ -59,6 +59,7 @@ from core.db import (
     signals,
 )
 from core.llm.client import MODEL_EMAIL, LLMClient
+from core.production_guards import production_gate_for_ready_to_send
 from core.runs import RunLogger
 from core.similarity import first_sentence, ratio_similarity, token_set_similarity
 from schemas.email_generation import EmailOutput
@@ -750,6 +751,13 @@ def main() -> int:
         "--reason", default=None,
         help="Required with --approve-bulk-ready or --skip-calibration.",
     )
+    parser.add_argument(
+        "--allow-example-domains", action="store_true",
+        help="Permit RFC 2606 reserved domains (.example/.test/.invalid) "
+             "in scheduling links, founder email, and partner email when "
+             "deciding ready_to_send. Use for fixture / smoke-test runs "
+             "ONLY; production workspaces should configure real domains.",
+    )
     args = parser.parse_args()
     if (args.approve_bulk_ready or args.skip_calibration) and not args.reason:
         parser.error(
@@ -1239,6 +1247,26 @@ def main() -> int:
                 qa_fails.append("template_smell=high")
             if pid in sim_failed_partners:
                 qa_fails.append("body similarity > 0.82 with another draft")
+            # Batch 9: production guards. A workspace scaffolded from a
+            # fixture can have `.example` scheduling links, `{PLACEHOLDER}`
+            # founder emails, or missing meeting_ask config. Downgrade
+            # ready_to_send -> draft and surface the reasons so the
+            # operator sees what to fix.
+            prod_fails = production_gate_for_ready_to_send(
+                subject=rec.get("subject"),
+                body=rec.get("body"),
+                scheduling_link=(
+                    (ws.company.get("company") or {})
+                    .get("meeting_ask", {})
+                    .get("preferred_scheduling_link")
+                ),
+                founder_email=(ws.company.get("company") or {}).get(
+                    "founder_email"
+                ),
+                partner_email=None,  # partner email is optional at CSV stage
+                allow_example_domains=args.allow_example_domains,
+            )
+            qa_fails.extend(prod_fails)
 
             base["recommendation_reasoning"] = ctx["recommendation_reasoning"]
             if ctx.get("warm_path_available"):

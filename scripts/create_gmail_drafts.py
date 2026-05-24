@@ -29,6 +29,7 @@ from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import email_drafts, get_engine, partner_score_summaries, partners
 from core.gmail_client import GmailClient, GmailError, GmailNotConfigured
+from core.production_guards import production_gate_for_gmail_draft
 from core.runs import RunLogger
 
 STAGE = "create_gmail_drafts"
@@ -45,6 +46,13 @@ def main() -> int:
                         help="Only create drafts for top-N partners by send_now_priority.")
     parser.add_argument("--regenerate", action="store_true",
                         help="Recreate drafts even if pushed_to_gmail_at is already set.")
+    parser.add_argument(
+        "--allow-example-domains", action="store_true",
+        help="Permit RFC 2606 reserved domains (.example/.test/.invalid) "
+             "in recipient/sender email. Use for fixture testing ONLY; "
+             "production runs should refuse so fictional partners cannot "
+             "be drafted in Gmail.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -129,6 +137,30 @@ def main() -> int:
                 )
                 run.log_error(row.partner_id, "empty_draft", msg)
                 print(f"[gmail_drafts] {row.partner_id}: FAILED -- {msg}")
+                continue
+            # Batch 9 production guard: refuse to push to a fictional
+            # recipient (.example/.test/.invalid) or with a placeholder
+            # subject/body left over from an unedited workspace.
+            prod_fails = production_gate_for_gmail_draft(
+                to_email=row.email,
+                from_email=founder_email,
+                subject=rec.subject,
+                body=rec.body,
+            )
+            # Filter out .example checks if the operator opted in.
+            if args.allow_example_domains:
+                prod_fails = [
+                    f for f in prod_fails
+                    if "example/reserved domain" not in f
+                ]
+            if prod_fails:
+                run.failed += 1
+                msg = "; ".join(prod_fails)
+                run.log_error(row.partner_id, "prod_guard", msg)
+                print(
+                    f"[gmail_drafts] {row.partner_id}: PROD GUARD -- {msg} "
+                    f"(pass --allow-example-domains for fixture testing)"
+                )
                 continue
             try:
                 draft_id, url = gmail.create_draft(

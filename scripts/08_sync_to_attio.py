@@ -34,6 +34,7 @@ from sqlalchemy import select
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
 from core.config_loader import add_workspace_arg, load_workspace
 from core.banner import print_banner
+from core.production_guards import production_gate_for_attio_sync
 from core.validate_config import preflight_or_exit
 from core.db import (
     attio_sync_log,
@@ -205,6 +206,13 @@ def main() -> int:
              "AND whose recommended draft has qa_status='pass'. Use this "
              "before a real send batch (Findings 42, 43).",
     )
+    parser.add_argument(
+        "--allow-example-domains", action="store_true",
+        help="Permit RFC 2606 reserved domains (.example/.test/.invalid) "
+             "in fund domains and partner emails. Use for fixture / smoke "
+             "runs ONLY; production sync should refuse fictional data so "
+             "fixture leakage cannot pollute a real Attio workspace.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -263,6 +271,28 @@ def main() -> int:
         fund_attio_ids: dict[str, str] = {}
         for f in fund_rows:
             run.processed += 1
+            # Batch 9 production guard: refuse to push fictional fixture
+            # data (.example/.test/.invalid domains) to a real Attio
+            # workspace. --allow-example-domains lets fixture / smoke
+            # runs through.
+            prod_fails = production_gate_for_attio_sync(
+                fund_domain=f.domain, partner_email=None,
+            )
+            if prod_fails and not args.allow_example_domains:
+                run.skipped += 1
+                msg = (
+                    f"refused fund {f.fund_id}: "
+                    + "; ".join(prod_fails)
+                    + " (pass --allow-example-domains to override)"
+                )
+                print(f"[stage 8] PROD GUARD: {msg}")
+                run.note(msg)
+                log_sync(
+                    engine, object_type="company", local_id=f.fund_id,
+                    attio_record_id=None, operation="skip_prod_guard",
+                    success=False, error_message="; ".join(prod_fails),
+                )
+                continue
             source = dict(f._mapping)
             # `domains` on Attio takes a list of {domain: "..."} objects.
             base_payload = {

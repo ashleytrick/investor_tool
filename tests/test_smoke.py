@@ -974,3 +974,130 @@ def test_verify_attio_schema_fails_without_key_when_attio_configured():
         )
         assert res.returncode == 0
         assert "skipping" in res.stdout
+
+
+def test_production_guards_block_example_domains():
+    """Batch 9: Stage 7 should downgrade ready_to_send -> draft when the
+    workspace uses .example scheduling links / founder emails, AND
+    --allow-example-domains should restore the prior behavior."""
+    from core.production_guards import (
+        contains_placeholder,
+        is_example_domain,
+        is_example_email,
+        production_gate_for_ready_to_send,
+        production_gate_for_attio_sync,
+        production_gate_for_gmail_draft,
+    )
+
+    # Helpers
+    assert contains_placeholder("Hi {NAME}") is True
+    assert contains_placeholder("Hi Priya") is False
+    assert is_example_domain("cal.example") is True
+    assert is_example_domain("example.com") is True
+    assert is_example_domain("foundry.vc") is False
+    assert is_example_email("a@b.example") is True
+    assert is_example_email("a@b.com") is False
+    assert is_example_email("not-an-email") is False
+    assert is_example_email(None) is False
+
+    # ready_to_send gate refuses .example by default
+    fails = production_gate_for_ready_to_send(
+        subject="Tendril seed round", body="We are raising a $3M seed.",
+        scheduling_link="https://cal.example/dana",
+        founder_email="dana@tendril.example",
+        partner_email=None,
+    )
+    assert any(".example" in f or "example/reserved" in f for f in fails)
+
+    # ...but allow-example-domains permits .example
+    fails = production_gate_for_ready_to_send(
+        subject="Tendril seed round", body="We are raising a $3M seed.",
+        scheduling_link="https://cal.example/dana",
+        founder_email="dana@tendril.example",
+        partner_email=None,
+        allow_example_domains=True,
+    )
+    assert fails == [], f"allow_example_domains should clear all fails, got {fails}"
+
+    # Placeholder check fires even WITH allow_example_domains
+    fails = production_gate_for_ready_to_send(
+        subject="Tendril {ROUND_NAME}", body="raise body",
+        scheduling_link="https://cal.example/dana",
+        founder_email="dana@tendril.example",
+        partner_email=None,
+        allow_example_domains=True,
+    )
+    assert any("placeholder" in f for f in fails), (
+        f"placeholder check must fire even with allow_example_domains, "
+        f"got {fails}"
+    )
+
+    # Attio sync gate refuses .example fund domain
+    fails = production_gate_for_attio_sync(
+        fund_domain="foundrynorth.example", partner_email=None,
+    )
+    assert any(".example" in f or "example/reserved" in f for f in fails)
+    fails = production_gate_for_attio_sync(
+        fund_domain="foundrynorth.vc", partner_email=None,
+    )
+    assert fails == []
+
+    # Gmail draft gate
+    fails = production_gate_for_gmail_draft(
+        to_email="priya@northbeam.example", from_email="dana@tendril.example",
+        subject="x", body="y",
+    )
+    assert len(fails) >= 1
+
+
+def test_stage7_downgrades_example_domains_to_draft_by_default():
+    """Batch 9 end-to-end: running Stage 7 against the fixture workspace
+    (which uses cal.example) without --allow-example-domains should
+    downgrade every otherwise-ready row to outreach_status=draft, with
+    the prod-guard reasons surfaced in recommendation_reasoning."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        _run_pipeline_through_stage_6(ws_dst)
+        ws = str(ws_dst)
+        # Default behavior (no --allow-example-domains).
+        _run("07_generate_emails.py", "--workspace", ws, "--top", "5", cwd=REPO_ROOT)
+
+        csv_path = ws_dst / "exports" / "review_queue.csv"
+        with csv_path.open(encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        statuses = {r["outreach_status"] for r in rows}
+        assert "ready_to_send" not in statuses, (
+            f"ready_to_send must be blocked when .example domains in use; "
+            f"got statuses={statuses}"
+        )
+        # At least one row should carry the prod-guard reasoning.
+        prod_guard_rows = [
+            r for r in rows
+            if "example/reserved" in (r.get("recommendation_reasoning") or "")
+            or ".example" in (r.get("recommendation_reasoning") or "")
+        ]
+        assert prod_guard_rows, (
+            f"no row recorded a prod-guard downgrade; "
+            f"reasonings={[r['recommendation_reasoning'] for r in rows]}"
+        )
+
+        # With --allow-example-domains, ready_to_send returns.
+        # Re-run pipeline (Stage 6 invalidates from prior run; this just
+        # re-runs Stage 7 to overwrite the CSV).
+        _run(
+            "07_generate_emails.py", "--workspace", ws, "--top", "5",
+            "--allow-example-domains", cwd=REPO_ROOT,
+        )
+        with csv_path.open(encoding="utf-8") as f:
+            rows2 = list(csv.DictReader(f))
+        statuses2 = {r["outreach_status"] for r in rows2}
+        assert "ready_to_send" in statuses2, (
+            f"--allow-example-domains should restore ready_to_send; "
+            f"got statuses={statuses2}"
+        )
