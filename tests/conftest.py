@@ -72,6 +72,27 @@ def table_counts(db: Path) -> dict[str, int]:
 _counts = table_counts
 
 
+def run_pipeline_through_stage_6(ws_dst: Path) -> None:
+    """Drive the fixture pipeline up to Stage 6 (no emails yet).
+
+    Used by tests that need a fully-scored workspace as their starting
+    state (Stage 7 / Stage 8 / operator CLI tests).
+    """
+    ws = str(ws_dst)
+    for s, extra in (
+        ("01_aggregate_sources.py", ()),
+        ("02_enrich_funds.py", ("--fixtures",)),
+        ("03_mine_activity.py", ("--fixtures",)),
+        ("04_mine_partner_signals.py", ("--fixtures",)),
+        ("05_verify_and_quality.py", ()),
+        ("06_score_candidates.py", ()),
+    ):
+        run_script(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+
+_run_pipeline_through_stage_6 = run_pipeline_through_stage_6
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     """Fresh copy of clients/test_workspace in a per-test temp dir.
