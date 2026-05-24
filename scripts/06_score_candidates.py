@@ -419,43 +419,14 @@ def main() -> int:
                         today=today,
                     )
 
-                    # Major kill signal aggregation. components.get() rather than
-                    # bracket access so a future shape change in compute_round_fit
-                    # doesn't KeyError here.
-                    # fund.kill_signals (Stage 2 LLM extraction) was previously
-                    # stored but never consulted by Stage 6 -- a fund whose
-                    # extracted thesis said "pre-seed only" would NOT trigger
-                    # major_kill unless round_fit also caught it. Treat any
-                    # non-empty extracted kill_signals string as a kill.
-                    fund_kill_signals_str = (fund.kill_signals or "").strip()
-                    fund_has_kill = bool(fund_kill_signals_str)
-                    # Batch 26 (#441/#684): per-partner do_not_contact flag.
-                    # getattr() guards against older partners rows that pre-
-                    # date the column.
-                    do_not_contact = bool(getattr(p, "do_not_contact", False))
-                    major_kill = (
-                        rf.disqualifier_present
-                        or (p.employment_status == "left_fund")
-                        or (
-                            not fund.is_active
-                            and rf.components.get("active_fund", 0) == 0
-                        )
-                        or fund_has_kill
-                        or do_not_contact
+                    # Major-kill aggregation owned by
+                    # core/scoring/major_kill.py (Refactor 7/13).
+                    from core.scoring.major_kill import aggregate_major_kill
+                    mk = aggregate_major_kill(
+                        round_fit_result=rf, fund=fund, partner=p,
                     )
-                    kill_summary_parts: list[str] = []
-                    if rf.triggered_disqualifiers:
-                        kill_summary_parts.extend(rf.triggered_disqualifiers)
-                    if fund_has_kill:
-                        kill_summary_parts.append(
-                            f"fund kill_signals: {fund_kill_signals_str}"
-                        )
-                    if do_not_contact:
-                        kill_summary_parts.append(
-                            f"do_not_contact: "
-                            f"{(getattr(p, 'do_not_contact_reason', None) or '-')}"
-                        )
-                    kill_summary = "; ".join(kill_summary_parts) if major_kill else ""
+                    major_kill = mk.present
+                    kill_summary = mk.summary
 
                     recency_bonus = signal_recency_bonus(most_recent, today)
                     # Previously: `cold_reachability or 5.0` -- unknown reachability
