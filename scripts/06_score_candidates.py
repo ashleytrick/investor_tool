@@ -331,7 +331,19 @@ def evaluate_recommended(
         fails.append(f"employment_status={employment_status!r} not current")
     if major_kill:
         fails.append("major kill signal present")
-    if cold_reachability_score is not None and cold_reachability_score < 5.0:
+    # Batch 35: unknown reachability (None) used to permit recommendation
+    # because the check was `is not None and < 5.0`. That left partners
+    # with zero reachability evidence treated as "good enough" while
+    # partners with a measured low score were blocked -- the opposite of
+    # the safety-conscious default. Treat None as blocking; the operator
+    # can promote via --force-rescore after Stage 4 produces a partial.
+    if cold_reachability_score is None:
+        fails.append(
+            "cold_reachability_score is unknown (Stage 4 produced no "
+            "partial); re-run Stage 4 to score reachability before "
+            "recommending"
+        )
+    elif cold_reachability_score < 5.0:
         fails.append(
             f"cold_reachability_score ({cold_reachability_score:.1f}) < 5.0"
         )

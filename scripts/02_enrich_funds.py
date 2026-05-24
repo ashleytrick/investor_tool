@@ -357,8 +357,11 @@ def main() -> int:
                 run.log_error(fund["fund_id"], type(exc).__name__, str(exc))
 
         print(f"[stage 2] llm stub mode: {llm.stub}")
+        # Batch 35: non-zero exit when any per-fund enrichment failed so
+        # cron / wrapping scripts notice partial Stage 2 failures.
+        any_failed = run.failed > 0
 
-    return 0
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

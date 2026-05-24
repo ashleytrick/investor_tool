@@ -1673,6 +1673,159 @@ def test_batch16_check_size_parser_edge_cases():
     assert 0.0 <= rf.round_fit_score <= 10.0
 
 
+def test_batch35_cold_reachability_unknown_blocks_recommendation():
+    """Stage 6 used to permit recommendation when cold_reachability_score
+    was None (the check was `is not None and < 5.0`). Now None blocks."""
+    # evaluate_recommended() is the function under test; import via
+    # importlib so we don't depend on the module's CLI setup.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "s6", REPO_ROOT / "scripts" / "06_score_candidates.py"
+    )
+    s6 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s6)
+    from datetime import date as _date
+
+    base = dict(
+        composite=7.5, round_fit_score=8.0, disqualifier_present=False,
+        lead_likelihood_score=6.0, distinct_source_types=2,
+        q2_plus_signal_count=2, deal_attribution_count=1,
+        most_recent_signal_date=_date.today(),
+        employment_status="likely_current", major_kill=False,
+        warm_path_available=False, today=_date.today(),
+    )
+
+    # cold_reachability=7.0 -> recommended.
+    ok, _r = s6.evaluate_recommended(cold_reachability_score=7.0, **base)
+    assert ok is True
+
+    # cold_reachability=4.0 -> blocked (existing behavior).
+    ok, reason = s6.evaluate_recommended(cold_reachability_score=4.0, **base)
+    assert ok is False
+    assert "cold_reachability_score" in reason and "< 5.0" in reason
+
+    # cold_reachability=None -> blocked (Batch 35 fix).
+    ok, reason = s6.evaluate_recommended(cold_reachability_score=None, **base)
+    assert ok is False, (
+        f"None reachability should block recommendation; got reason={reason!r}"
+    )
+    assert "unknown" in reason
+
+
+def test_batch35_set_partner_email_validation_and_exit():
+    """Inventory followup: set_partner_email rejects bad email shape,
+    exits 2 when ANY row failed (unknown partner OR bad email)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures",
+             cwd=REPO_ROOT)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Bad email shape -> exit 2.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_partner_email.py"),
+             "--workspace", ws, "--partner-id",
+             "northbeam.example_priya_anand", "--email", "not-an-email"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2, (
+            f"bad email should exit 2; got {res.returncode}\n{res.stdout}"
+        )
+        assert "REFUSED" in res.stdout or "not a valid" in res.stdout
+
+        # Unknown partner -> exit 2.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_partner_email.py"),
+             "--workspace", ws, "--partner-id", "no-such-partner",
+             "--email", "x@y.com"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 2
+
+        # Valid email + known partner -> exit 0.
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "set_partner_email.py"),
+             "--workspace", ws, "--partner-id",
+             "northbeam.example_priya_anand", "--email", "priya@northbeam.example"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0
+
+
+def test_batch35_gmail_not_configured_records_skipped_run():
+    """Gmail not configured used to return 0 with NO run row.
+    Batch 35: opens RunLogger with skipped=1 so status.py + audit
+    can see when this stage was last attempted."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+
+        # Run create_gmail_drafts with fixture mode allowed (no creds).
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "create_gmail_drafts.py"),
+             "--workspace", ws, "--allow-fixture-mode"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert res.returncode == 0  # skip is success
+        assert "Gmail not linked" in res.stdout
+
+        c = sqlite3.connect(db)
+        row = c.execute(
+            "select records_skipped, error_summary from runs "
+            "where stage='create_gmail_drafts' order by run_id desc limit 1"
+        ).fetchone()
+        c.close()
+        assert row is not None, (
+            "Gmail-not-configured run should land in `runs` table for audit"
+        )
+        skipped, summary = row
+        assert skipped == 1
+        assert summary and "Gmail not linked" in summary
+
+
+def test_batch35_stage6_partial_failure_already_tested():
+    """Stage 6's partial-failure exit code was added in Batch 11 and is
+    pinned by test_stage6_returns_nonzero_when_partner_fails. This stub
+    just asserts Stage 2/3/4 follow the same pattern by checking that
+    a clean fixture run still exits 0 (regression: the new
+    `return 2 if any_failed` shouldn't fire for a green pipeline)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+
+        ws = str(ws_dst)
+        for s, extra in (
+            ("01_aggregate_sources.py", ()),
+            ("02_enrich_funds.py", ("--fixtures",)),
+            ("03_mine_activity.py", ("--fixtures",)),
+            ("04_mine_partner_signals.py", ("--fixtures",)),
+            ("05_verify_and_quality.py", ()),
+        ):
+            # _run() asserts exit 0, so this implicitly verifies the
+            # new return-on-failure logic doesn't accidentally trip on
+            # the green fixture path.
+            _run(s, "--workspace", ws, *extra, cwd=REPO_ROOT)
+
+
 def test_batch34_attribution_overrides_and_backfill():
     """Inventory #346/#757/#758/#759/#760: operator overrides preserved
     across Stage 3 re-runs (reject, set), and backfill resolves

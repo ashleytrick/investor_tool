@@ -203,8 +203,11 @@ def main() -> int:
             f"[outcome_sync] synced {run.succeeded} outcome row(s); "
             f"skipped={run.skipped} failed={run.failed}"
         )
+        # Batch 35: non-zero exit when any per-record sync failed so
+        # cron / wrapping scripts notice partial sync failures.
+        any_failed = run.failed > 0
 
-    return 0
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

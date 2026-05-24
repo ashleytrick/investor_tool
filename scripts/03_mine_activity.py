@@ -639,8 +639,11 @@ def main() -> int:
             f"{partner_attributed} with a specific partner"
         )
         print(f"[stage 3] llm stub mode: {llm.stub}")
+        # Batch 35: non-zero exit when any per-announcement attribution
+        # failed so cron / wrapping scripts notice partial Stage 3 failures.
+        any_failed = run.failed > 0
 
-    return 0
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

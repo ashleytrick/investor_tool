@@ -74,17 +74,22 @@ def main() -> int:
         return 2
     founder_email = (ws.company.get("company") or {}).get("founder_email")
 
+    # Batch 35: open RunLogger BEFORE the GmailNotConfigured branch so
+    # the "Gmail not linked, skipping" outcome lands in `runs` with
+    # records_skipped=1 instead of writing no run row at all. status.py
+    # + the operator can then see when this stage was last attempted.
     try:
         gmail = GmailClient.from_workspace(ws)
     except GmailNotConfigured:
-        print(
-            f"[gmail_drafts] Gmail not linked for workspace {ws.name!r}.\n"
-            f"  Run: uv run scripts/connect_gmail.py "
-            f"--workspace {args.workspace or ws.path}\n"
-            f"  That script walks through the one-time GCP setup."
-        )
-        # Treat as skip not failure -- consistent with attio_sync and
-        # outcome_sync no-op paths.
+        with RunLogger(engine, ws.name, STAGE) as run:
+            msg = (
+                f"Gmail not linked for workspace {ws.name!r}. Run: "
+                f"uv run scripts/connect_gmail.py "
+                f"--workspace {args.workspace or ws.path}"
+            )
+            print(f"[gmail_drafts] {msg}")
+            run.note(msg)
+            run.skipped = 1
         return 0
 
     with RunLogger(engine, ws.name, STAGE) as run:
@@ -202,7 +207,11 @@ def main() -> int:
             f"skipped={run.skipped} failed={run.failed}\n"
             f"Open https://mail.google.com/mail/u/0/#drafts to review and send."
         )
-    return 0
+        # Batch 35: non-zero exit if any per-partner draft failed so cron
+        # / wrapping scripts notice partial Gmail draft failures.
+        any_failed = run.failed > 0
+
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

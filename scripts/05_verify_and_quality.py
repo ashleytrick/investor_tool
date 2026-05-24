@@ -195,8 +195,11 @@ def main() -> int:
             print(f"[stage 5] llm stub mode: {llm.stub}")
             return 2
         print(f"[stage 5] llm stub mode: {llm.stub}")
+        # Batch 35: non-zero exit when any per-signal verification failed
+        # so cron / wrapping scripts notice partial Stage 5 failures.
+        any_failed = run.failed > 0
 
-    return 0
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

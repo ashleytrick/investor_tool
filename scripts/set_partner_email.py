@@ -20,6 +20,7 @@ from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import get_engine, partners
 from core.runs import RunLogger
+from core.validate_config import _looks_like_email
 
 STAGE = "set_partner_email"
 
@@ -71,6 +72,20 @@ def main() -> int:
                     run.failed += 1
                     run.log_error(pid, "unknown_partner", "not in partners table")
                     continue
+                # Batch 35: validate email shape before writing. A typo
+                # ("priya at northbeam") used to write garbage that only
+                # failed at Gmail draft time with a cryptic API error.
+                if not _looks_like_email(email):
+                    run.failed += 1
+                    run.log_error(
+                        pid, "invalid_email",
+                        f"{email!r} does not look like an email address",
+                    )
+                    print(
+                        f"[set_partner_email] {pid}: REFUSED -- "
+                        f"{email!r} is not a valid email shape"
+                    )
+                    continue
                 conn.execute(
                     partners.update().where(partners.c.partner_id == pid).values(
                         email=email, last_updated=_now(),
@@ -83,8 +98,11 @@ def main() -> int:
             f"[set_partner_email] processed={run.processed} "
             f"ok={run.succeeded} failed={run.failed}"
         )
+        any_failed = run.failed > 0
 
-    return 0
+    # Batch 35: non-zero exit when any row failed (unknown partner, bad
+    # email shape) so cron / wrapping scripts notice.
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":

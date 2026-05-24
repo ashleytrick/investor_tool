@@ -379,8 +379,11 @@ def main() -> int:
             f"{total_signals} new signal rows"
         )
         print(f"[stage 4] llm stub mode: {llm.stub}")
+        # Batch 35: non-zero exit when any per-partner extraction failed
+        # so cron / wrapping scripts notice partial Stage 4 failures.
+        any_failed = run.failed > 0
 
-    return 0
+    return 2 if any_failed else 0
 
 
 if __name__ == "__main__":
