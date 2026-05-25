@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from core.config_loader import add_workspace_arg
 from core.stage_runner import stage_run
@@ -756,12 +756,71 @@ def main() -> int:
                 f"recommended draft failed per-draft hard gates: "
                 f"{sorted(partner_ids_with_failed_rec)} (Batch 37 #38)"
             )
+        # Slice 17: immutable history for email_drafts. The prior
+        # shape (DELETE then INSERT) made a buggy re-run irrecoverable.
+        # Now we SUPERSEDE the prior live rows: stamp superseded_at,
+        # clear is_recommended (so latest-rec readers see only the
+        # new draft), and -- when the prior row was approved_to_send
+        # -- run the state-machine stale_after_approval transition so
+        # the approval event log records the body-changed
+        # invalidation. The old rows stay queryable by
+        # partner_id + version for audit. Followups + decks still
+        # DELETE (their re-run semantics haven't been extended).
+        # Pre-compute the next version per-partner so the INSERTed
+        # new rows know what version to use.
+        from core.approval.persistence import mark_stale
+        from core.approval.state_machine import (
+            STATE_APPROVED_TO_SEND, TRIGGER_BODY_REGENERATED,
+        )
+        max_versions: dict[str, int] = {}
+        approved_to_stale: list[tuple[int, str]] = []
         with engine.begin() as conn:
             for pid in partner_ids_in_batch:
-                conn.execute(delete(email_drafts).where(email_drafts.c.partner_id == pid))
+                cur_max = conn.execute(
+                    select(func.coalesce(func.max(email_drafts.c.version), 0))
+                    .where(email_drafts.c.partner_id == pid)
+                ).scalar() or 0
+                max_versions[pid] = int(cur_max)
+                # Capture currently-approved drafts BEFORE the
+                # supersede UPDATE so mark_stale's state-machine
+                # check sees the right pointer state.
+                for r in conn.execute(
+                    select(email_drafts.c.draft_id, email_drafts.c.partner_id)
+                    .where(
+                        email_drafts.c.partner_id == pid,
+                        email_drafts.c.approval_status == STATE_APPROVED_TO_SEND,
+                        email_drafts.c.superseded_at.is_(None),
+                    )
+                ):
+                    approved_to_stale.append((int(r.draft_id), r.partner_id))
+                conn.execute(
+                    email_drafts.update()
+                    .where(
+                        email_drafts.c.partner_id == pid,
+                        email_drafts.c.superseded_at.is_(None),
+                    )
+                    .values(
+                        superseded_at=_now(),
+                        is_recommended=False,
+                    )
+                )
                 conn.execute(delete(followup_drafts).where(followup_drafts.c.partner_id == pid))
                 conn.execute(delete(deck_request_responses).where(
                     deck_request_responses.c.partner_id == pid))
+        # Run stale_after_approval transitions OUTSIDE the supersede
+        # transaction; mark_stale opens its own engine.begin().
+        for draft_id, pid in approved_to_stale:
+            mark_stale(
+                engine,
+                draft_id=draft_id,
+                partner_id=pid,
+                trigger=TRIGGER_BODY_REGENERATED,
+                notes=(
+                    f"Stage 7 regeneration: prior draft superseded "
+                    f"by new version {max_versions[pid] + 1}"
+                ),
+            )
+        with engine.begin() as conn:
 
             # Index per-draft QA results by (partner_id, strategy).
             qa_by_key = {
@@ -811,6 +870,7 @@ def main() -> int:
                     result = conn.execute(email_drafts.insert().values(
                         partner_id=pid,
                         batch_id=batch_id,
+                        version=max_versions.get(pid, 0) + 1,
                         strategy=v.strategy,
                         subject=v.subject,
                         body=v.body,

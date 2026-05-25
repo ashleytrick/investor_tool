@@ -447,8 +447,16 @@ email_drafts = Table(
     # stale_after_approval automatically. Full append-only history
     # lives in draft_approvals.
     Column("draft_hash", Text),
-    # Stage 7 does `DELETE FROM email_drafts WHERE partner_id = ?` for every
-    # partner in the batch; this index keeps that bounded.
+    # Slice 17: immutable history. Stage 7's re-run used to
+    # `DELETE FROM email_drafts WHERE partner_id = ?` then INSERT a
+    # fresh set -- a buggy run could wipe a good prior batch
+    # irrecoverably. The new shape SUPERSEDES the prior rows
+    # (sets superseded_at + clears is_recommended + state-machine-
+    # stales any approved draft) and INSERTS the new ones with
+    # version + 1. Operator audit can replay any prior generation by
+    # filtering on partner_id + version.
+    Column("version", Integer, default=1),
+    Column("superseded_at", DateTime),
     Index("ix_email_drafts_partner_id", "partner_id"),
     Index("ix_email_drafts_batch_id", "batch_id"),
     # Approval queue / Gmail send queries filter on approval_status;
