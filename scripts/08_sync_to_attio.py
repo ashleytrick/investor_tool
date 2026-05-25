@@ -427,18 +427,53 @@ def main() -> int:
                     rec = drafts.get("recommended")
                     alt = drafts.get("alternate")
                     source = dict(p._mapping)
+                    # Slice 8: ownership clarity. Local app owns draft
+                    # truth / history / approval; Attio owns CRM state.
+                    # Only push the draft body + subject + strategy
+                    # WHEN APPROVED. Unapproved drafts get a minimal
+                    # payload (partner identity + score context + the
+                    # approval status itself) so the CRM reflects
+                    # pipeline state without leaking
+                    # not-yet-approved bodies.
+                    rec_status = getattr(
+                        rec, "approval_status", None,
+                    ) if rec else None
+                    is_approved = rec_status == "approved_to_send"
+                    is_stale = rec_status == "stale_after_approval"
                     source.update({
-                        "outreach_email_draft": rec.body if rec else None,
-                        "email_strategy_used": rec.strategy if rec else None,
-                        "email_subject_line": rec.subject if rec else None,
-                        "conversion_hypothesis": rec.conversion_hypothesis if rec else None,
-                        "likely_objection": rec.likely_objection if rec else None,
-                        "objection_preempted": rec.objection_preempted if rec else None,
-                        "email_draft_alternate": alt.body if alt else None,
-                        "email_alternate_strategy": alt.strategy if alt else None,
-                        "template_smell": rec.template_smell if rec else None,
-                        "followup_email_draft": followups_by_partner.get(p.partner_id),
-                        "deck_request_response": deck_by_partner.get(p.partner_id),
+                        # Always-shared partner-level CRM context.
+                        "email_strategy_used":
+                            rec.strategy if rec else None,
+                        "template_smell":
+                            rec.template_smell if rec else None,
+                        # Body + subject + alternate body + followup +
+                        # deck only ship to Attio when the draft has
+                        # been HUMAN-approved. needs_review / qa_failed
+                        # / rejected / stale see these as NULL in
+                        # Attio so an external CRM viewer can't read
+                        # an unapproved body.
+                        "outreach_email_draft":
+                            rec.body if is_approved else None,
+                        "email_subject_line":
+                            rec.subject if is_approved else None,
+                        "conversion_hypothesis":
+                            rec.conversion_hypothesis if is_approved else None,
+                        "likely_objection":
+                            rec.likely_objection if is_approved else None,
+                        "objection_preempted":
+                            rec.objection_preempted if is_approved else None,
+                        "email_draft_alternate":
+                            alt.body if (alt and is_approved) else None,
+                        "email_alternate_strategy":
+                            alt.strategy if (alt and is_approved) else None,
+                        "followup_email_draft": (
+                            followups_by_partner.get(p.partner_id)
+                            if is_approved else None
+                        ),
+                        "deck_request_response": (
+                            deck_by_partner.get(p.partner_id)
+                            if is_approved else None
+                        ),
                     })
                     fund_attio_id = (
                         fund_attio_ids.get(p.fund_id)
@@ -533,10 +568,13 @@ def main() -> int:
                             # as skip so the run summary doesn't claim
                             # successful syncs (mirrors the company-loop
                             # dry-run behavior).
-                            print(f"[stage 8] DRY-RUN: would PATCH person "
-                                  f"{p.partner_id} attio_id={attio_id} "
-                                  f"with {len(payload)} attrs "
-                                  f"(preserved: {sorted(removed)})")
+                            print(
+                                f"[stage 8] DRY-RUN: would PATCH person "
+                                f"{p.partner_id} attio_id={attio_id} "
+                                f"with {len(payload)} attrs "
+                                f"keys={sorted(payload.keys())} "
+                                f"(preserved: {sorted(removed)})"
+                            )
                             run.skip()
                             continue
                         if attio_id and payload:
@@ -559,8 +597,11 @@ def main() -> int:
                             )
                     else:
                         if args.dry_run:
-                            print(f"[stage 8] DRY-RUN: would CREATE person "
-                                  f"{p.partner_id} with {len(payload)} attrs")
+                            print(
+                                f"[stage 8] DRY-RUN: would CREATE person "
+                                f"{p.partner_id} with {len(payload)} attrs "
+                                f"keys={sorted(payload.keys())}"
+                            )
                             run.skip()
                             continue
                         result = client.create_record(person_object, payload)
