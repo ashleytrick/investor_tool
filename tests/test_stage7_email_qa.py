@@ -481,10 +481,41 @@ def test_batch43_stage7_preserves_prior_draft_on_qa_fail():
             "where partner_id = ? and is_recommended = 1 and body = ?",
             (prior_partner, prior_body),
         ).fetchone()[0]
+        # Launch-blocker fix: the prior fix only excluded failed-
+        # regeneration partners from the DELETE; the INSERT loop still
+        # wrote their corrupted new drafts as new recommended rows.
+        # Stage 8 picks the LATEST recommended draft, so the prior good
+        # body could survive while a NEWER bad row became the active
+        # one. Tighten the test: ZERO recommended drafts for this
+        # partner should contain the forbidden phrase.
+        bad_count = c.execute(
+            "select count(*) from email_drafts "
+            "where partner_id = ? and is_recommended = 1 "
+            "and lower(body) like '%would love%'",
+            (prior_partner,),
+        ).fetchone()[0]
+        # AND no draft from a batch_id newer than first_batch_id for the
+        # corrupted partner -- the preservation must skip the INSERT
+        # entirely, not just rely on DELETE skipping.
+        newer_draft_count = c.execute(
+            "select count(*) from email_drafts "
+            "where partner_id = ? and batch_id != ?",
+            (prior_partner, first_batch_id),
+        ).fetchone()[0]
         c.close()
         assert surviving >= 1, (
             f"prior good draft for {prior_partner} was overwritten by "
             f"the failed regeneration; #38 regression"
+        )
+        assert bad_count == 0, (
+            f"a failed-QA draft (containing 'would love') was inserted "
+            f"as the newest recommended row for {prior_partner}; the "
+            f"preservation skipped the DELETE but not the INSERT."
+        )
+        assert newer_draft_count == 0, (
+            f"new draft rows for {prior_partner} from a different "
+            f"batch_id leaked in; the bad regeneration's drafts must "
+            f"not land at all when the recommended variant fails QA."
         )
 
 

@@ -760,6 +760,15 @@ def main() -> int:
             }
             for pctx, output, _ in partner_outputs:
                 pid = pctx["partner_id"]
+                # Launch-blocker fix: previously we excluded
+                # failed-regeneration partners from the DELETE but still
+                # INSERTED their failed new drafts -- the prior good
+                # draft survived but the bad draft became the newest
+                # recommended row, which Stage 8's "latest draft wins"
+                # ordering would pick up. Skip the insert too so the
+                # preservation guarantee is actually airtight.
+                if pid in partner_ids_with_failed_rec:
+                    continue
                 for v in output.variants:
                     is_rec = (v.strategy == output.recommended_variant_strategy)
                     smell_info = qa_by_key.get((pid, v.strategy), {})
