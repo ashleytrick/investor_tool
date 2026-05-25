@@ -116,49 +116,90 @@ def main() -> int:
         return 2 if require_gmail else 0
 
     with RunLogger(engine, ws.name, STAGE) as run:
-        with engine.begin() as conn:
-            rows = list(conn.execute(
-                select(
-                    partner_score_summaries.c.partner_id,
-                    partner_score_summaries.c.send_now_priority,
-                    partners.c.name.label("partner_name"),
-                    partners.c.email,
-                )
-                .join(partners,
-                      partners.c.partner_id == partner_score_summaries.c.partner_id)
-                .where(partner_score_summaries.c.recommended_to_send.is_(True))
-                .order_by(desc(partner_score_summaries.c.send_now_priority))
-                .limit(args.top)
-            ))
+        # Slice 1: Gmail send queue reads ONLY drafts in
+        # approval_status='approved_to_send'. Recommended_to_send is
+        # no longer sufficient -- a human must have explicitly
+        # approved the exact body. core.approval.persistence.approved_for_send
+        # is the single canonical read.
+        from core.approval.persistence import approved_for_send
 
-        if not rows:
-            print("[gmail_drafts] no recommended_to_send partners; run Stage 6 + 7 first")
+        approved_drafts = approved_for_send(engine)
+        if not approved_drafts:
+            print(
+                "[gmail_drafts] no approved_to_send drafts. "
+                "Run Stage 7 to generate, then "
+                "scripts/list_pending_review.py / approve_draft.py "
+                "to approve."
+            )
             run.skipped = 1
             return 0
 
-        for row in rows:
+        # Join the approved drafts to partner email + name. Done in
+        # Python to keep the canonical approval read intact.
+        with engine.begin() as conn:
+            partner_rows = {
+                r.partner_id: r for r in conn.execute(
+                    select(
+                        partners.c.partner_id,
+                        partners.c.name.label("partner_name"),
+                        partners.c.email,
+                    )
+                )
+            }
+
+        # Apply --top by partner send_now_priority. Multiple approved
+        # drafts per partner go in priority order; ties broken by
+        # draft_id ascending so the earliest approval wins.
+        with engine.begin() as conn:
+            priority_by_partner = {
+                r.partner_id: r.send_now_priority for r in conn.execute(
+                    select(
+                        partner_score_summaries.c.partner_id,
+                        partner_score_summaries.c.send_now_priority,
+                    )
+                )
+            }
+        # Sort approved drafts: priority DESC then draft_id ASC.
+        approved_drafts = sorted(
+            approved_drafts,
+            key=lambda d: (
+                -(priority_by_partner.get(d.partner_id) or 0.0),
+                d.draft_id,
+            ),
+        )[: args.top]
+
+        for rec in approved_drafts:
             with run.attempt():
-                if not row.email:
-                    run.skip()
-                    print(
-                        f"[gmail_drafts] skip {row.partner_id}: no email on file. "
-                        f"Use scripts/set_partner_email.py to set one."
+                partner = partner_rows.get(rec.partner_id)
+                if partner is None:
+                    run.fail(
+                        rec.partner_id, "orphan_approval",
+                        "approved draft references unknown partner",
                     )
                     continue
-                with engine.begin() as conn:
-                    rec = conn.execute(
-                        select(email_drafts).where(
-                            email_drafts.c.partner_id == row.partner_id,
-                            email_drafts.c.is_recommended.is_(True),
-                        ).order_by(desc(email_drafts.c.draft_id)).limit(1)
-                    ).first()
-                if not rec:
-                    run.skip()
-                    print(
-                        f"[gmail_drafts] skip {row.partner_id}: no recommended "
-                        f"email draft. Re-run Stage 7."
+                if not partner.email:
+                    # An approved draft should always have an email
+                    # (Slice 1's approval blocker prevents otherwise).
+                    # Defense in depth: surface as fail, not silent skip.
+                    run.fail(
+                        rec.partner_id, "missing_email_post_approval",
+                        f"draft_id={rec.draft_id} approved but partner "
+                        f"email is missing -- approval should be stale",
                     )
                     continue
+                if rec.pushed_to_gmail_at and not args.regenerate:
+                    run.skip()
+                    print(
+                        f"[gmail_drafts] skip draft_id={rec.draft_id}"
+                        f" partner={rec.partner_id}: already pushed at"
+                        f" {rec.pushed_to_gmail_at}. Use --regenerate to "
+                        f"force."
+                    )
+                    continue
+                # Keep `row` shape for the rest of the body which
+                # was written against the old (partner-row, draft-row)
+                # pair.
+                row = partner
                 if rec.pushed_to_gmail_at and not args.regenerate:
                     run.skip()
                     print(

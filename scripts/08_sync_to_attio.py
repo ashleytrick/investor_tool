@@ -394,25 +394,32 @@ def main() -> int:
             with run.attempt():
                 try:
                     drafts = drafts_by_partner.get(p.partner_id, {})
-                    # Findings 42, 43: --require-ready-to-send only syncs
-                    # partners whose recommended draft passed Stage 7 QA AND
-                    # whose recommended_to_send is True. Prevents pushing
-                    # known-bad drafts as ready-to-send into Attio. In
-                    # prod-mode workspaces this is on by default unless
-                    # --include-not-ready opts out.
+                    # Slice 1: under --require-ready-to-send (default
+                    # in prod mode), only sync partners whose
+                    # recommended draft is approved_to_send. qa_status
+                    # alone is no longer enough -- a human must have
+                    # explicitly approved.
                     if require_ready_to_send:
                         rec_draft = drafts.get("recommended")
                         if not p.recommended_to_send:
                             run.skip()
                             continue
-                        if rec_draft is None or rec_draft.qa_status != "pass":
+                        if rec_draft is None or (
+                            getattr(rec_draft, "approval_status", None)
+                            != "approved_to_send"
+                        ):
+                            current = getattr(
+                                rec_draft, "approval_status", None,
+                            ) if rec_draft else "<no draft>"
                             log_sync(
                                 engine, object_type="person",
                                 local_id=p.partner_id, attio_record_id=None,
-                                operation="skip_qa_fail", success=False,
+                                operation="skip_unapproved",
+                                success=False,
                                 error_message=(
-                                    "draft qa_status != 'pass'; --require-ready-to-send "
-                                    "refused to sync"
+                                    f"draft approval_status={current!r}; "
+                                    f"--require-ready-to-send refused to "
+                                    f"sync (only approved_to_send allowed)"
                                 ),
                             )
                             run.skip()
