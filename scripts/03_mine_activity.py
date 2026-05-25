@@ -30,6 +30,14 @@ from core.db import (
     ambiguous_matches, deal_attribution_overrides, deal_attributions,
     funds, partners,
 )
+from core.attribution.review_queue import (
+    KIND_AMBIGUOUS_ATTRIBUTION, queue_review,
+)
+from core.attribution.status import (
+    MATCHED_BY_LLM, MATCHED_BY_MANUAL,
+    STATUS_AMBIGUOUS, STATUS_LIKELY, STATUS_UNMATCHED,
+    classify_from_candidates,
+)
 from core.http_client import HttpClient
 from core.ids import normalize_name, partner_id_for
 from core.llm.client import MODEL_BATCH
@@ -425,6 +433,14 @@ def main() -> int:
                     lead_fund_id, lead_candidates = match_fund_with_candidates(
                         deal.lead_investor, funds_by_name,
                     )
+                    # Slice 6: classify the match honestly so Stage 6
+                    # can filter scoring on `confirmed` + strong `likely`.
+                    lead_match_status, lead_matched_by = classify_from_candidates(
+                        chosen_fund_id=lead_fund_id,
+                        candidates=lead_candidates,
+                        ambiguity_delta=FUND_NAME_AMBIGUITY_DELTA,
+                        fuzzy_threshold=FUND_NAME_FUZZY_THRESHOLD,
+                    )
                     # Batch 33 (#341/#342): when fuzzy match was ambiguous
                     # (top two candidates within FUND_NAME_AMBIGUITY_DELTA),
                     # record an ambiguous_matches row so the operator can
@@ -456,6 +472,20 @@ def main() -> int:
                             f"chose {lead_fund_id!r} from candidates "
                             f"{lead_candidates}; review via "
                             f"scripts/list_ambiguous_matches.py"
+                        )
+                        # Slice 6: also queue a generic review_items
+                        # row so the new review CLI surfaces it
+                        # alongside other kinds.
+                        queue_review(
+                            engine,
+                            kind=KIND_AMBIGUOUS_ATTRIBUTION,
+                            target_id=source_url,
+                            context={
+                                "raw_lead_investor": deal.lead_investor,
+                                "chosen_fund_id": lead_fund_id,
+                                "candidates": lead_candidates,
+                                "source_url": source_url,
+                            },
                         )
                     # Batch 32 (#742): when --allow-provisional is set AND the
                     # named lead investor doesn't resolve, create a
@@ -545,6 +575,9 @@ def main() -> int:
                                 "raw_lead_investor": deal.lead_investor,
                                 "raw_attributed_partners": raw_attributed,
                                 "match_confidence": match_conf,
+                                # Slice 6: honest match status.
+                                "match_status": lead_match_status,
+                                "matched_by": lead_matched_by,
                                 "snapshot_id": None,
                             })
                         else:
@@ -574,6 +607,8 @@ def main() -> int:
                             "raw_lead_investor": deal.lead_investor,
                             "raw_attributed_partners": raw_attributed,
                             "match_confidence": match_conf,
+                            "match_status": lead_match_status,
+                            "matched_by": lead_matched_by,
                             "snapshot_id": None,
                         })
                     # Batch 32: even when there is NO fund match at all, we
@@ -597,6 +632,8 @@ def main() -> int:
                             "raw_lead_investor": deal.lead_investor,
                             "raw_attributed_partners": raw_attributed,
                             "match_confidence": None,
+                            "match_status": STATUS_UNMATCHED,
+                            "matched_by": None,
                             "snapshot_id": None,
                         })
                         run.note(

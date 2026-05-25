@@ -240,8 +240,15 @@ def main() -> int:
             # Rows pre-dating the match_confidence column (NULL value) are
             # KEPT for backward compat -- only explicitly-low rows get
             # filtered.
+            # Slice 6: also filter on honest match_status. Only
+            # `confirmed` and strong `likely` (confidence >= 0.85)
+            # count toward lead_likelihood. Ambiguous / rejected /
+            # unmatched rows are context only -- they MUST NOT pad
+            # the partner's deal count.
+            from core.attribution.status import counts_toward_scoring
             partner_deals: dict[str, list[dict]] = {}
             filtered_low_confidence = 0
+            filtered_unscored_status = 0
             for d in conn.execute(
                 select(deal_attributions).where(
                     deal_attributions.c.attributed_partner_id.isnot(None)
@@ -253,6 +260,16 @@ def main() -> int:
                     and d.match_confidence < min_deal_confidence
                 ):
                     filtered_low_confidence += 1
+                    continue
+                # Slice 6 filter. If match_status is NULL (legacy
+                # row from before Slice 6), be permissive: keep the
+                # row so existing fixtures + workspaces don't lose
+                # their pre-existing attributions on first upgrade.
+                if d.match_status is not None and not counts_toward_scoring(
+                    match_status=d.match_status,
+                    match_confidence=d.match_confidence,
+                ):
+                    filtered_unscored_status += 1
                     continue
                 partner_deals.setdefault(d.attributed_partner_id, []).append({
                     "company": d.company,
