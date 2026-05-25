@@ -784,6 +784,18 @@ def main() -> int:
                 from core.approval.persistence import (
                     compute_draft_hash, seed_draft,
                 )
+                # Slice 11: build the founder-conviction-to-partner
+                # bridge once per partner; every variant for that
+                # partner shares the same bridge (same founder belief,
+                # same supporting signal).
+                from core.email.founder_conviction import (
+                    build_bridge, founder_conviction_from_company,
+                )
+                fc = founder_conviction_from_company(ws.company)
+                bridge = build_bridge(
+                    founder_conviction=fc,
+                    partner_signals=signals_by_partner.get(pid, []),
+                )
                 for v in output.variants:
                     is_rec = (v.strategy == output.recommended_variant_strategy)
                     smell_info = qa_by_key.get((pid, v.strategy), {})
@@ -814,6 +826,24 @@ def main() -> int:
                         written_to_csv_at=None,
                         approval_status="needs_review",
                         draft_hash=draft_hash_value,
+                        bridge_founder_claim=(
+                            bridge.founder_claim if bridge else None
+                        ),
+                        bridge_partner_belief=(
+                            bridge.partner_belief if bridge else None
+                        ),
+                        bridge_partner_evidence=(
+                            bridge.partner_evidence if bridge else None
+                        ),
+                        bridge_sentence=(
+                            bridge.bridge_sentence if bridge else None
+                        ),
+                        bridge_factual_risk=(
+                            bridge.factual_risk if bridge else None
+                        ),
+                        bridge_confidence=(
+                            bridge.confidence if bridge else None
+                        ),
                     ))
                     new_draft_id = int(result.inserted_primary_key[0])
                     # Write the initial needs_review event in

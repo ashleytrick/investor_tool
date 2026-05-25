@@ -409,6 +409,24 @@ email_drafts = Table(
     # Gmail draft id once create_gmail_drafts.py has run; idempotent guard.
     Column("pushed_to_gmail_at", DateTime),
     Column("gmail_draft_id", Text),
+    # Slice 11: founder-conviction-to-partner bridge. Built at draft
+    # generation time from company.yaml's founder_conviction block +
+    # this partner's verified signals. The bridge is what makes the
+    # email evidence-backed: it ties the founder's non-obvious belief
+    # to a specific partner-held belief inferred from a partner
+    # signal. Review surface exposes these fields so the operator
+    # can audit the connection before approving.
+    Column("bridge_founder_claim", Text),
+    Column("bridge_partner_belief", Text),
+    Column("bridge_partner_evidence", Text),
+    Column("bridge_sentence", Text),
+    # low | medium | high -- how risky is the factual claim that
+    # connects founder_claim to partner_belief? Operator review
+    # focus.
+    Column("bridge_factual_risk", Text),
+    # low | medium | high -- how confident are we the partner
+    # actually holds this belief, given the evidence shape?
+    Column("bridge_confidence", Text),
     # Slice 1: approval state-machine pointer. Always seeded as
     # 'needs_review' on insert -- only a human action moves it to
     # 'approved_to_send'. Gmail / Attio / CSV-export readers filter
