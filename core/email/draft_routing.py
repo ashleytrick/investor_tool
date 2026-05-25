@@ -158,6 +158,7 @@ def _collect_blockers(
     pctx_relationship_status: str | None = None,
     pctx_last_contacted_at=None,
     pctx_last_reply_at=None,
+    pctx_email_verification_status: str | None = None,
     banned: list[str],
 ) -> list[str]:
     blockers: list[str] = []
@@ -184,6 +185,28 @@ def _collect_blockers(
             "partner email is unknown -- Apollo upload required "
             "before approval"
         )
+    else:
+        # Slice 9: deliverability guardrails on a present email.
+        from core.deliverability import (
+            APPROVAL_OK_VERIFICATION_STATUSES,
+            VERIFICATION_INVALID, VERIFICATION_RISKY,
+            is_generic_or_role_email,
+        )
+        if is_generic_or_role_email(pctx_partner_email):
+            blockers.append(
+                f"partner email {pctx_partner_email!r} is a generic / "
+                f"role mailbox; approve only with explicit override"
+            )
+        verification = pctx_email_verification_status
+        if verification == VERIFICATION_INVALID:
+            blockers.append(
+                f"email verification status = invalid; bounces likely"
+            )
+        elif verification == VERIFICATION_RISKY:
+            blockers.append(
+                f"email verification status = risky; explicit override "
+                f"required before approval"
+            )
     blockers.extend(check_hard_gates(
         {"subject": rec_subject, "body": rec_body}, banned,
     ))
@@ -265,6 +288,7 @@ def decide_draft_routing(
     pctx_relationship_status: str | None = None,
     pctx_last_contacted_at=None,
     pctx_last_reply_at=None,
+    pctx_email_verification_status: str | None = None,
     banned: list[str],
     company_cfg: dict,
     allow_example_domains: bool,
@@ -303,6 +327,7 @@ def decide_draft_routing(
         pctx_relationship_status=pctx_relationship_status,
         pctx_last_contacted_at=pctx_last_contacted_at,
         pctx_last_reply_at=pctx_last_reply_at,
+        pctx_email_verification_status=pctx_email_verification_status,
         banned=banned,
     )
     base_reason = pctx_recommendation_reasoning or ""

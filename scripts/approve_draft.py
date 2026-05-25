@@ -31,6 +31,9 @@ from core.approval.persistence import approve
 from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import email_drafts, get_engine
+from core.deliverability import (
+    DEFAULT_DAILY_APPROVAL_CAP, enforce_daily_approval_cap,
+)
 
 
 def _resolve_actor(cli_value: str | None) -> str:
@@ -62,6 +65,11 @@ def main() -> int:
         "--approved-by", default=None,
         help="Override the operator id (defaults to $USER / $USERNAME).",
     )
+    parser.add_argument(
+        "--override-cap", action="store_true",
+        help="Approve even when today's daily approval cap is reached. "
+             "Use sparingly; the cap exists to prevent runaway sends.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -80,6 +88,18 @@ def main() -> int:
     if row is None:
         print(f"[approve] draft_id={args.draft_id} not found")
         return 1
+
+    # Slice 9: daily approval cap. Block when reached unless the
+    # operator explicitly overrides.
+    blocked, count = enforce_daily_approval_cap(engine)
+    if blocked and not args.override_cap:
+        print(
+            f"[approve] REFUSED: daily approval cap reached "
+            f"({count} approved today / cap "
+            f"{DEFAULT_DAILY_APPROVAL_CAP}). Pass --override-cap to "
+            f"approve anyway."
+        )
+        return 2
 
     try:
         approve(

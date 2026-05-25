@@ -138,6 +138,11 @@ partners = Table(
     # Partner email -- used by create_gmail_drafts.py. Populated manually via
     # scripts/set_partner_email.py or downstream from real enrichment.
     Column("email", Text),
+    # Slice 9: deliverability verification state for the email above.
+    # Values: unknown | valid | risky | invalid
+    # Default is `unknown`; set manually via
+    # scripts/set_email_verification.py or by a future Apollo import.
+    Column("email_verification_status", Text, default="unknown"),
     # Slice 7: cold-outreach relationship state. Drives suppression
     # in the approval gate + Stage 6 recommendation gate. Hydrated
     # automatically by outcome ingestion (see
