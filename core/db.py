@@ -730,6 +730,12 @@ def get_engine(db_url: str) -> Engine:
     # dropped + recreated. Indexes added here ARE picked up on existing
     # tables because metadata.create_all emits CREATE INDEX IF NOT EXISTS.
     _sync_columns_with_metadata(engine)
+    # Slice 16: real migration system runs after additive drift sync.
+    # `_sync_columns_with_metadata` handles the easy ALTER-ADD-COLUMN
+    # case; this picks up renames / drops / backfills / index changes
+    # that can't be derived from the SQLAlchemy metadata alone.
+    from core.migrations import apply_pending_migrations
+    apply_pending_migrations(engine)
     return engine
 
 
