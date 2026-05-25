@@ -71,6 +71,25 @@ APPROVAL_OK_VERIFICATION_STATUSES: Final[frozenset[str]] = frozenset({
 DEFAULT_DAILY_APPROVAL_CAP: Final[int] = 25
 
 
+def configured_daily_cap(ws) -> int:
+    """Resolve the daily approval cap for `ws`. Reads
+    `deliverability.daily_approval_cap` from company.yaml when
+    present; otherwise returns the package default. Negative /
+    zero / non-int values fall back to the default so a typo can't
+    accidentally disable the cap.
+    """
+    cap = (ws.company.get("deliverability") or {}).get(
+        "daily_approval_cap", None,
+    )
+    try:
+        cap_int = int(cap) if cap is not None else None
+    except (TypeError, ValueError):
+        cap_int = None
+    if not cap_int or cap_int < 1:
+        return DEFAULT_DAILY_APPROVAL_CAP
+    return cap_int
+
+
 def is_generic_or_role_email(email: str | None) -> bool:
     """True iff the email's local part is a generic/role mailbox.
     None / empty / no '@' return False (Slice 1's missing-email

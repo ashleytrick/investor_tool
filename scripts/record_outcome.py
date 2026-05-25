@@ -31,10 +31,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
-from core.db import get_engine, outcomes, partners
-from core.runs import RunLogger
+from core.config_loader import add_workspace_arg
+from core.db import outcomes, partners
+from core.operator_command import operator_command_run
 
 STAGE = "record_outcome"
 
@@ -133,18 +132,15 @@ def main() -> int:
     if not args.from_csv and not args.partner_id:
         parser.error("--partner-id is required unless --from-csv is used")
 
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
+        # Build lookup of known partner_ids to validate against.
+        with engine.begin() as conn:
+            known = {
+                r.partner_id
+                for r in conn.execute(select(partners.c.partner_id))
+            }
 
-    # Build lookup of known partner_ids to validate against.
-    with engine.begin() as conn:
-        known = {
-            r.partner_id
-            for r in conn.execute(select(partners.c.partner_id))
-        }
-
-    with RunLogger(engine, ws.name, STAGE) as run:
         if args.from_csv:
             path = pathlib.Path(args.from_csv)
             if not path.exists():

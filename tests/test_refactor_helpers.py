@@ -167,20 +167,23 @@ def test_refactor_batch_a_stage_runner_basic():
 
 
 def test_preflight_failure_lands_in_runs_not_silent_sys_exit():
-    """Launch-blocker fix: a workspace with a config issue used to cause
-    stage_run() to call preflight_or_exit() -> sys.exit(2) BEFORE the
-    RunLogger context opened, so the refusal was invisible in `runs`.
+    """Two-part contract for preflight refusal:
 
-    Now preflight runs INSIDE the RunLogger context; ctx.refuse_unsafe
-    is called with the issue list and the run row commits with
-    records_failed >= 1 and error_summary populated. status.py /
-    audit then sees the refusal.
+    1. The refusal lands in `runs` (was a silent sys.exit before the
+       launch-blocker fix landed -- error_summary now carries the
+       REFUSED note + missing-file detail).
+    2. The stage body MUST NOT execute after a refusal. stage_run
+       raises SystemExit so the caller's `with` block never runs;
+       previously it yielded the refused ctx and the body ran against
+       a half-initialized workspace.
     """
     import argparse
     import shutil
     import sqlite3
     import tempfile
     from pathlib import Path
+
+    import pytest
 
     from core.stage_runner import stage_run
 
@@ -197,12 +200,21 @@ def test_preflight_failure_lands_in_runs_not_silent_sys_exit():
         (ws_dst / "config" / "axes.yaml").unlink()
 
         args = argparse.Namespace(workspace=str(ws_dst))
-        with stage_run(
-            args, stage="test_preflight_refusal", require_llm=False,
-        ) as ctx:
-            # Body runs against a refused ctx; the test exits early
-            # the way real scripts will via `return ctx.exit_code`.
-            assert ctx.exit_code == 3  # REFUSED_UNSAFE
+        body_ran = {"flag": False}
+        with pytest.raises(SystemExit) as excinfo:
+            with stage_run(
+                args, stage="test_preflight_refusal", require_llm=False,
+            ) as ctx:
+                body_ran["flag"] = True
+                _ = ctx  # silence unused warnings
+        # Refusal exits with REFUSED_UNSAFE (=3).
+        assert excinfo.value.code == 3
+        # The stage body never ran -- the SystemExit was raised inside
+        # stage_run before the contextmanager yielded.
+        assert body_ran["flag"] is False, (
+            "stage body executed after preflight refusal; the abort "
+            "guard regressed"
+        )
 
         # Run row landed with the refusal note.
         c = sqlite3.connect(db)
@@ -219,3 +231,7 @@ def test_preflight_failure_lands_in_runs_not_silent_sys_exit():
         assert records_failed >= 1
         assert error_summary and "REFUSED" in error_summary
         assert "axes.yaml" in error_summary
+        # SystemExit must NOT be logged as a fatal "__run__" error.
+        # (The refuse_unsafe note carries the operator-facing message;
+        # a phantom "SystemExit: 3" line would confuse audits.)
+        assert "SystemExit" not in (error_summary or "")

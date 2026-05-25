@@ -161,6 +161,31 @@ def test_daily_count_counts_today_approvals(cap_engine) -> None:
     assert daily_approval_count(cap_engine) == 2
 
 
+def test_configured_daily_cap_reads_from_company_yaml() -> None:
+    """Finding 6: cap is configurable via
+    company.yaml's `deliverability.daily_approval_cap` rather than
+    hardcoded at the CLI."""
+    from types import SimpleNamespace
+    from core.deliverability import (
+        DEFAULT_DAILY_APPROVAL_CAP, configured_daily_cap,
+    )
+    # No config -> default.
+    ws = SimpleNamespace(company={})
+    assert configured_daily_cap(ws) == DEFAULT_DAILY_APPROVAL_CAP
+    # Explicit override.
+    ws = SimpleNamespace(company={"deliverability": {"daily_approval_cap": 7}})
+    assert configured_daily_cap(ws) == 7
+    # Numeric-string override (yaml-shaped).
+    ws = SimpleNamespace(company={"deliverability": {"daily_approval_cap": "12"}})
+    assert configured_daily_cap(ws) == 12
+    # Garbage value falls back to default rather than disabling the cap.
+    for bad in (0, -1, "not-a-number", None):
+        ws = SimpleNamespace(
+            company={"deliverability": {"daily_approval_cap": bad}},
+        )
+        assert configured_daily_cap(ws) == DEFAULT_DAILY_APPROVAL_CAP
+
+
 def test_enforce_cap_blocks_when_reached(cap_engine) -> None:
     from core.db import draft_approvals
     now = datetime.now(timezone.utc)
@@ -191,7 +216,9 @@ def test_approve_cli_refuses_when_daily_cap_reached(tmp_path: Path) -> None:
         "--top", "5", "--allow-example-domains", cwd=REPO_ROOT,
     )
     db = ws_dst / "data" / "pipeline.db"
-    # Seed N approvals for today directly.
+    # Seed N approvals for today directly + give the candidate draft's
+    # partner a valid email so the new approval gate (Finding 2)
+    # doesn't refuse before the cap check fires.
     c = sqlite3.connect(db)
     now = datetime.now(timezone.utc).isoformat()
     for _ in range(DEFAULT_DAILY_APPROVAL_CAP):
@@ -201,28 +228,36 @@ def test_approve_cli_refuses_when_daily_cap_reached(tmp_path: Path) -> None:
             "values (1, 'p', 'approved_to_send', 'sys', ?, '', '')",
             (now,),
         )
-    draft_id = c.execute(
-        "select draft_id from email_drafts where is_recommended = 1 limit 1"
-    ).fetchone()[0]
+    draft_id, pid = c.execute(
+        "select draft_id, partner_id from email_drafts "
+        "where is_recommended = 1 limit 1"
+    ).fetchone()
+    c.execute(
+        "update partners set email='op@operator.com', "
+        "email_verification_status='valid' where partner_id=?",
+        (pid,),
+    )
     c.commit()
     c.close()
 
     res = subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
-         "--workspace", ws, "--draft-id", str(draft_id)],
+         "--workspace", ws, "--draft-id", str(draft_id),
+         "--allow-example-domains"],
         capture_output=True, text=True,
         env={**os.environ, "USER": "t"}, timeout=60,
     )
-    assert res.returncode == 2
+    assert res.returncode == 2, res.stdout + res.stderr
     assert "cap reached" in res.stdout
     # --override-cap allows.
     res2 = subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
-         "--workspace", ws, "--draft-id", str(draft_id), "--override-cap"],
+         "--workspace", ws, "--draft-id", str(draft_id), "--override-cap",
+         "--allow-example-domains"],
         capture_output=True, text=True,
         env={**os.environ, "USER": "t"}, timeout=60,
     )
-    assert res2.returncode == 0
+    assert res2.returncode == 0, res2.stdout + res2.stderr
 
 
 # ----- integration: routing blockers -----

@@ -424,6 +424,31 @@ def main() -> int:
                             )
                             run.skip()
                             continue
+                        # Finding 3 (re-check): an approved_to_send
+                        # pointer might be stale -- partner state may
+                        # have moved (email cleared, DNC flipped,
+                        # verification regressed) since approval. Re-
+                        # run the canonical gate before shipping the
+                        # body to Attio.
+                        from core.approval.gate import can_approve_draft
+                        gate = can_approve_draft(
+                            ws, engine, rec_draft.draft_id,
+                            allow_example_domains=policy.allow_example_domains,
+                            respect_overrides=True,
+                        )
+                        if not gate.ok:
+                            log_sync(
+                                engine, object_type="person",
+                                local_id=p.partner_id, attio_record_id=None,
+                                operation="skip_stale_approval",
+                                success=False,
+                                error_message=(
+                                    f"approved draft now has live "
+                                    f"blockers: {'; '.join(gate.blockers)}"
+                                ),
+                            )
+                            run.skip()
+                            continue
                     rec = drafts.get("recommended")
                     alt = drafts.get("alternate")
                     source = dict(p._mapping)

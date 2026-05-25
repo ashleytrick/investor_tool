@@ -25,12 +25,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
+from core.config_loader import add_workspace_arg
 from core.db import (
-    ambiguous_matches, deal_attributions, funds, get_engine, partners,
+    ambiguous_matches, deal_attributions, funds, partners,
 )
-from core.runs import RunLogger
+from core.operator_command import operator_command_run
 
 STAGE = "resolve_ambiguous_match"
 
@@ -60,11 +59,8 @@ def main() -> int:
         args.resolved_by or os.environ.get("USER") or "unknown"
     )
 
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
         with engine.begin() as conn:
             row = conn.execute(
                 select(ambiguous_matches).where(

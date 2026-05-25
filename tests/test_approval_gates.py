@@ -54,6 +54,19 @@ def test_send_queue_csv_empty_when_nothing_approved():
         assert rows == [], "no rows expected -- nothing was approved"
 
 
+def _prime_partners_for_approval(db: Path) -> None:
+    """Set every partner's email + verification status so the approval
+    gate (Finding 2) accepts a fixture draft. Test partners otherwise
+    have no email and the gate refuses."""
+    c = sqlite3.connect(db)
+    c.execute(
+        "update partners set email = partner_id || '@operator.com', "
+        "email_verification_status='valid'"
+    )
+    c.commit()
+    c.close()
+
+
 def test_send_queue_csv_includes_only_approved_rows():
     """Approve two drafts, leave others in needs_review. send_queue.csv
     must contain exactly the approved two."""
@@ -65,6 +78,7 @@ def test_send_queue_csv_includes_only_approved_rows():
         _run_pipeline_through_stage_6(ws_dst)
         _stage7(ws)
         db = ws_dst / "data" / "pipeline.db"
+        _prime_partners_for_approval(db)
 
         # Pick two distinct recommended drafts to approve.
         c = sqlite3.connect(db)
@@ -78,7 +92,8 @@ def test_send_queue_csv_includes_only_approved_rows():
         for (did,) in draft_ids:
             subprocess.run(
                 [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
-                 "--workspace", ws, "--draft-id", str(did)],
+                 "--workspace", ws, "--draft-id", str(did),
+                 "--allow-example-domains"],
                 capture_output=True, text=True,
                 env={**os.environ, "USER": "tester"},
                 check=True, timeout=60,
@@ -86,7 +101,7 @@ def test_send_queue_csv_includes_only_approved_rows():
 
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "export_send_queue.py"),
-             "--workspace", ws],
+             "--workspace", ws, "--allow-example-domains"],
             capture_output=True, text=True, timeout=60,
         )
         assert res.returncode == 0
@@ -117,6 +132,7 @@ def test_send_queue_excludes_rejected_drafts():
         _run_pipeline_through_stage_6(ws_dst)
         _stage7(ws)
         db = ws_dst / "data" / "pipeline.db"
+        _prime_partners_for_approval(db)
 
         c = sqlite3.connect(db)
         # Approve draft A, reject draft B.
@@ -129,7 +145,8 @@ def test_send_queue_excludes_rejected_drafts():
 
         subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
-             "--workspace", ws, "--draft-id", str(approve_id)],
+             "--workspace", ws, "--draft-id", str(approve_id),
+             "--allow-example-domains"],
             check=True, capture_output=True, timeout=60,
         )
         subprocess.run(
@@ -141,7 +158,7 @@ def test_send_queue_excludes_rejected_drafts():
 
         subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "export_send_queue.py"),
-             "--workspace", ws],
+             "--workspace", ws, "--allow-example-domains"],
             check=True, capture_output=True, timeout=60,
         )
         send_csv = ws_dst / "exports" / "send_queue.csv"

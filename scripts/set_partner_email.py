@@ -15,13 +15,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
+from core.config_loader import add_workspace_arg
 from core.csv_ingest import (
     CsvIngestSchema, ingest_csv, in_set, looks_like_email, require_field,
 )
-from core.db import get_engine, partners
-from core.runs import RunLogger
+from core.db import partners
+from core.operator_command import operator_command_run
 from core.validate_config import _looks_like_email
 
 STAGE = "set_partner_email"
@@ -43,14 +42,12 @@ def main() -> int:
     if not args.from_csv and not (args.partner_id and args.email):
         parser.error("--partner-id AND --email required, unless --from-csv used")
 
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
 
-    with engine.begin() as conn:
-        known = {r.partner_id for r in conn.execute(select(partners.c.partner_id))}
+        with engine.begin() as conn:
+            known = {r.partner_id for r in conn.execute(select(partners.c.partner_id))}
 
-    with RunLogger(engine, ws.name, STAGE) as run:
         rows: list[tuple[str, str]] = []
         if args.from_csv:
             path = pathlib.Path(args.from_csv)
@@ -76,9 +73,8 @@ def main() -> int:
                          f"{result.missing_headers}"
                 )
                 print(f"[set_partner_email] {msg}")
-                run.note(msg)
-                run.failed = 1
-                return 2
+                ctx.usage_error(msg)
+                return ctx.exit_code
             for err in result.row_errors:
                 run.log_error(err.record_id, err.error_type, err.message)
                 run.failed += 1
@@ -119,11 +115,11 @@ def main() -> int:
             f"[set_partner_email] processed={run.processed} "
             f"ok={run.succeeded} failed={run.failed}"
         )
-        any_failed = run.failed > 0
 
-    # Batch 35: non-zero exit when any row failed (unknown partner, bad
-    # email shape) so cron / wrapping scripts notice.
-    return 2 if any_failed else 0
+    # Non-zero exit when any row failed (unknown partner, bad email
+    # shape) so cron / wrapping scripts notice. ctx.exit_code maps
+    # run.failed > 0 -> OPERATIONAL_FAILURE = 2.
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

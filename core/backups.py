@@ -53,6 +53,23 @@ _DESTRUCTIVE_STAGES: frozenset[str] = frozenset({
     "set_do_not_contact",
     "set_partner_email",
     "attio_outcome_sync",
+    # Finding 4: operator CLIs that mutate state via
+    # core.operator_command.operator_command_run also need pre-action
+    # backups so a bad approve / reject / merge is recoverable.
+    "approve_draft",
+    "reject_draft",
+    "promote_provisional",
+    "bulk_reattribute",
+    "set_relationship",
+    "set_warm_path_contact",
+    "set_fund_inactive",
+    "set_employment_status",
+    "set_partner_linkedin",
+    "correct_deal_attribution",
+    "resolve_ambiguous_match",
+    "review_attribution",
+    "clear_fund_field",
+    "classify_reply",
 })
 
 

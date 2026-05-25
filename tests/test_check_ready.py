@@ -122,6 +122,92 @@ def test_blocks_when_approved_draft_has_no_email():
         assert f"draft_id={draft_id}" in res.stdout or "missing partner email" in res.stdout
 
 
+def test_blocks_when_approved_draft_fails_live_gate():
+    """Finding 3: the approved_gate_clean check re-runs the canonical
+    approval gate against every approved_to_send draft. State that
+    moved AFTER approval (DNC flipped on, verification regressed)
+    must surface as BLOCKED so the operator notices before
+    Gmail/Attio/CSV consumes the row."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        _run(
+            "07_generate_emails.py", "--workspace", ws,
+            "--top", "5", "--allow-example-domains", cwd=REPO_ROOT,
+        )
+        db = ws_dst / "data" / "pipeline.db"
+        c = sqlite3.connect(db)
+        draft_id, pid = c.execute(
+            "select draft_id, partner_id from email_drafts "
+            "where is_recommended=1 limit 1"
+        ).fetchone()
+        # Approve with a valid email...
+        c.execute(
+            "update partners set email='op@op.com', "
+            "email_verification_status='valid' where partner_id=?",
+            (pid,),
+        )
+        c.execute(
+            "update email_drafts set approval_status='approved_to_send' "
+            "where draft_id=?", (draft_id,),
+        )
+        # ...then regress verification AFTER approval. The pointer
+        # still says approved_to_send but the live gate now fails.
+        c.execute(
+            "update partners set email_verification_status='invalid' "
+            "where partner_id=?", (pid,),
+        )
+        c.commit()
+        c.close()
+        res = _check(ws, "--allow-example-domains")
+        assert res.returncode == 1
+        assert "approved_gate_clean: BLOCKED" in res.stdout, res.stdout
+        assert "invalid" in res.stdout
+
+
+def test_blocks_when_two_approved_drafts_share_recipient():
+    """Finding 3: a duplicate partner_email across approved drafts is
+    surfaced so the operator catches data drift before sending the
+    same person two emails."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        _run(
+            "07_generate_emails.py", "--workspace", ws,
+            "--top", "5", "--allow-example-domains", cwd=REPO_ROOT,
+        )
+        db = ws_dst / "data" / "pipeline.db"
+        c = sqlite3.connect(db)
+        # Two distinct recommended drafts on two distinct partners,
+        # both approved, both pointing at the same email.
+        rows = c.execute(
+            "select draft_id, partner_id from email_drafts "
+            "where is_recommended=1 limit 2"
+        ).fetchall()
+        assert len(rows) == 2
+        for (did, pid) in rows:
+            c.execute(
+                "update partners set email='shared@op.com', "
+                "email_verification_status='valid' where partner_id=?",
+                (pid,),
+            )
+            c.execute(
+                "update email_drafts set approval_status='approved_to_send' "
+                "where draft_id=?", (did,),
+            )
+        c.commit()
+        c.close()
+        res = _check(ws, "--allow-example-domains")
+        assert res.returncode == 1
+        assert "no_duplicate_recipients: BLOCKED" in res.stdout, res.stdout
+
+
 def test_blocks_when_dnc_partner_has_approved_draft():
     with tempfile.TemporaryDirectory() as tmpdir:
         ws_src = REPO_ROOT / "clients" / "test_workspace"

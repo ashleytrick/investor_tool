@@ -33,6 +33,7 @@ Helper queries:
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -162,6 +163,7 @@ def transition(
     source: str,
     draft_hash: str | None = None,
     notes: str | None = None,
+    overridden_blockers: list[str] | None = None,
 ) -> None:
     """Generic edge writer. Validates the (current -> to_state) edge
     against the state-machine table, then writes the event + updates
@@ -200,6 +202,10 @@ def transition(
             at=_now(),
             draft_hash=effective_hash,
             notes=notes,
+            overridden_blockers=(
+                json.dumps(list(overridden_blockers))
+                if overridden_blockers else None
+            ),
         ))
         conn.execute(
             update(email_drafts)
@@ -256,12 +262,19 @@ def approved_for_send(engine: Any) -> list[Any]:
 def approve(
     engine: Any, *, draft_id: int, partner_id: str,
     actor: str, notes: str | None = None,
+    overridden_blockers: list[str] | None = None,
 ) -> None:
-    """Human approval. Validates the transition + writes the event."""
+    """Human approval. Validates the transition + writes the event.
+
+    `overridden_blockers` is the list of SOFT blockers the operator
+    explicitly acknowledged via `--override-blockers`. Persisted on
+    the event so downstream gate re-checks (Gmail, Attio, send-queue
+    export) can honor the override.
+    """
     transition(
         engine, draft_id=draft_id, partner_id=partner_id,
         to_state="approved_to_send", actor=actor, source="human",
-        notes=notes,
+        notes=notes, overridden_blockers=overridden_blockers,
     )
 
 

@@ -44,6 +44,9 @@ from core.attribution.status import (
 from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import deal_attributions, get_engine
+from core.operator_command import operator_command_run
+
+STAGE = "review_attribution"
 
 
 def _actor(cli: str | None) -> str:
@@ -67,13 +70,13 @@ def main() -> int:
     parser.add_argument("--reason", default=None)
     parser.add_argument("--reviewed-by", default=None)
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage="review_attribution")
     actor = _actor(args.reviewed_by)
 
+    # Read-only listing path: skip lock + backup.
     if args.review_id is None:
+        ws = load_workspace(args.workspace)
+        engine = get_engine(ws.db_url)
+        print_banner(ws, stage=STAGE)
         pending = list_pending(engine, kind=KIND_AMBIGUOUS_ATTRIBUTION)
         if not pending:
             print("[review_attribution] no pending ambiguous attributions")
@@ -83,16 +86,16 @@ def main() -> int:
             f"Use --review-id N --confirm/--reject/--dismiss to act."
         )
         for r in pending:
-            ctx = {}
+            row_ctx = {}
             try:
-                ctx = json.loads(r.context or "{}")
+                row_ctx = json.loads(r.context or "{}")
             except Exception:  # noqa: BLE001
                 pass
             print(
                 f"\n  review_id={r.review_id}  target={r.target_id}\n"
-                f"    raw_lead: {ctx.get('raw_lead_investor', '?')}\n"
-                f"    chosen:   {ctx.get('chosen_fund_id', '?')}\n"
-                f"    candidates: {ctx.get('candidates', [])}"
+                f"    raw_lead: {row_ctx.get('raw_lead_investor', '?')}\n"
+                f"    chosen:   {row_ctx.get('chosen_fund_id', '?')}\n"
+                f"    candidates: {row_ctx.get('candidates', [])}"
             )
         return 0
 
@@ -103,71 +106,82 @@ def main() -> int:
         )
         return 1
 
-    # Look up the review row to get its target (source_url).
-    pending = list_pending(engine, kind=KIND_AMBIGUOUS_ATTRIBUTION)
-    target = None
-    for r in pending:
-        if r.review_id == args.review_id:
-            target = r
-            break
-    if target is None:
-        print(
-            f"[review_attribution] review_id={args.review_id} not "
-            f"pending (may already be resolved)"
-        )
-        return 1
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine = ctx.engine
 
-    if args.confirm:
-        with engine.begin() as conn:
-            conn.execute(
-                update(deal_attributions)
-                .where(deal_attributions.c.source_url == target.target_id)
-                .values(
-                    match_status=STATUS_CONFIRMED,
-                    matched_by=MATCHED_BY_MANUAL,
-                    review_status=STATUS_CONFIRMED,
-                    reviewed_by=actor,
-                    reviewed_at=_now(),
-                )
+        # Look up the review row to get its target (source_url).
+        pending = list_pending(engine, kind=KIND_AMBIGUOUS_ATTRIBUTION)
+        target = None
+        for r in pending:
+            if r.review_id == args.review_id:
+                target = r
+                break
+        if target is None:
+            print(
+                f"[review_attribution] review_id={args.review_id} not "
+                f"pending (may already be resolved)"
             )
-        resolve(engine, review_id=args.review_id, resolved_by=actor,
-                notes=args.reason or "confirmed")
-        print(
-            f"[review_attribution] confirmed source={target.target_id} "
-            f"by {actor}"
-        )
-        return 0
+            ctx.usage_error("review_id not pending")
+            return ctx.exit_code
 
-    if args.reject:
-        if not args.reason:
-            print("[review_attribution] --reject requires --reason")
-            return 1
-        with engine.begin() as conn:
-            conn.execute(
-                update(deal_attributions)
-                .where(deal_attributions.c.source_url == target.target_id)
-                .values(
-                    match_status=STATUS_REJECTED,
-                    review_status=STATUS_REJECTED,
-                    reviewed_by=actor,
-                    reviewed_at=_now(),
+        if args.confirm:
+            with engine.begin() as conn:
+                conn.execute(
+                    update(deal_attributions)
+                    .where(deal_attributions.c.source_url == target.target_id)
+                    .values(
+                        match_status=STATUS_CONFIRMED,
+                        matched_by=MATCHED_BY_MANUAL,
+                        review_status=STATUS_CONFIRMED,
+                        reviewed_by=actor,
+                        reviewed_at=_now(),
+                    )
                 )
+            resolve(engine, review_id=args.review_id, resolved_by=actor,
+                    notes=args.reason or "confirmed")
+            print(
+                f"[review_attribution] confirmed source={target.target_id} "
+                f"by {actor}"
             )
-        resolve(engine, review_id=args.review_id, resolved_by=actor,
-                notes=args.reason)
-        print(
-            f"[review_attribution] rejected source={target.target_id} "
-            f"by {actor}: {args.reason}"
-        )
-        return 0
+            ctx.run.processed = 1
+            ctx.run.succeeded = 1
+            return 0
 
-    if args.dismiss:
-        resolve(engine, review_id=args.review_id, resolved_by=actor,
-                notes=args.reason or "dismissed", status="dismissed")
-        print(
-            f"[review_attribution] dismissed review_id={args.review_id}"
-        )
-        return 0
+        if args.reject:
+            if not args.reason:
+                print("[review_attribution] --reject requires --reason")
+                ctx.usage_error("--reject requires --reason")
+                return ctx.exit_code
+            with engine.begin() as conn:
+                conn.execute(
+                    update(deal_attributions)
+                    .where(deal_attributions.c.source_url == target.target_id)
+                    .values(
+                        match_status=STATUS_REJECTED,
+                        review_status=STATUS_REJECTED,
+                        reviewed_by=actor,
+                        reviewed_at=_now(),
+                    )
+                )
+            resolve(engine, review_id=args.review_id, resolved_by=actor,
+                    notes=args.reason)
+            print(
+                f"[review_attribution] rejected source={target.target_id} "
+                f"by {actor}: {args.reason}"
+            )
+            ctx.run.processed = 1
+            ctx.run.succeeded = 1
+            return 0
+
+        if args.dismiss:
+            resolve(engine, review_id=args.review_id, resolved_by=actor,
+                    notes=args.reason or "dismissed", status="dismissed")
+            print(
+                f"[review_attribution] dismissed review_id={args.review_id}"
+            )
+            ctx.run.processed = 1
+            ctx.run.succeeded = 1
+            return 0
     return 1
 
 

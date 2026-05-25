@@ -173,7 +173,13 @@ class RunLogger:
         elapsed = int(time.monotonic() - self._t0)
         usage = self._llm_usage or LLMUsage()
         parts: list[str] = []
-        if exc is not None:
+        # SystemExit raised mid-stage is an intentional abort
+        # (e.g. stage_runner's preflight refusal). Don't log it as
+        # "fatal" -- the refusal note via run.note() already covers it
+        # and a phantom "SystemExit: 3" line in error_summary would
+        # confuse audits.
+        is_systemexit = isinstance(exc, SystemExit)
+        if exc is not None and not is_systemexit:
             err = f"{exc_type.__name__}: {exc}"
             parts.append(err)
             self.log_error("__run__", "fatal", err)

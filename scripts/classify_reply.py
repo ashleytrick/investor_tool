@@ -23,11 +23,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
-from core.db import get_engine, outcomes, partners
+from core.config_loader import add_workspace_arg
+from core.db import outcomes, partners
 from core.llm.client import MODEL_BATCH, LLMClient
-from core.runs import RunLogger
+from core.operator_command import operator_command_run
 from schemas.reply_classification import ReplyClassification
 
 STAGE = "classify_reply"
@@ -147,23 +146,22 @@ def main() -> int:
         print("[classify_reply] empty reply text; aborting")
         return 2
 
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    llm = LLMClient(workspace=ws)
-    print_banner(ws, stage=STAGE)
-
-    with engine.begin() as conn:
-        partner = conn.execute(
-            select(partners.c.partner_id, partners.c.name).where(
-                partners.c.partner_id == args.partner_id
-            )
-        ).first()
-    if not partner:
-        print(f"[classify_reply] unknown partner_id: {args.partner_id!r}")
-        return 2
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with operator_command_run(args, stage=STAGE) as ctx:
+        ws, engine, run = ctx.ws, ctx.engine, ctx.run
+        llm = LLMClient(workspace=ws)
         run.attach_llm_usage(llm.usage)
+
+        with engine.begin() as conn:
+            partner = conn.execute(
+                select(partners.c.partner_id, partners.c.name).where(
+                    partners.c.partner_id == args.partner_id
+                )
+            ).first()
+        if not partner:
+            print(f"[classify_reply] unknown partner_id: {args.partner_id!r}")
+            ctx.refuse("unknown partner_id")
+            return ctx.exit_code
+
         run.processed = 1
         company_cfg = ws.company or {}
         result = classify(

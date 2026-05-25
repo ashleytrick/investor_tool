@@ -143,7 +143,7 @@ def _company_primary_domain(company_cfg: dict) -> str | None:
     return None
 
 
-def _collect_blockers(
+def collect_blockers(
     *,
     rec_subject: str | None,
     rec_body: str | None,
@@ -313,7 +313,7 @@ def decide_draft_routing(
     seeds as STATE_NEEDS_REVIEW -- this function only computes the
     operator-visible LABEL.
     """
-    blockers = _collect_blockers(
+    blockers = collect_blockers(
         rec_subject=rec_subject,
         rec_body=rec_body,
         rec_template_smell=rec_template_smell,
