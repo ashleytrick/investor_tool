@@ -1,4 +1,4 @@
-"""Outcome dedup + insert (Refactor item 16).
+"""Outcome dedup + insert (Refactor item 16; Slice 7 adds hydration).
 
 Source-neutral persistence layer for OutcomeEvent streams. Two
 dedup paths run BEFORE the insert:
@@ -13,15 +13,22 @@ dedup paths run BEFORE the insert:
 Both checks return True to mean "skip this event". The
 `persist_outcome_event` function applies both then inserts, returning
 the inserted outcome_id or None if the event was a dedup hit.
+
+Slice 7: on a successful insert, the partner's relationship_status
++ last_* timestamps + last_outcome get hydrated from the event so
+the approval-gate suppression rules see fresh state without an
+extra job.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from core.db import outcomes
+from core.db import outcomes, partners
 from core.outcomes.events import OutcomeEvent
+from core.relationships import state_from_outcome_event
 
 
 def is_duplicate_event(engine: Any, external_event_id: str) -> bool:
@@ -86,4 +93,56 @@ def persist_outcome_event(engine: Any, event: OutcomeEvent) -> int | None:
         result = conn.execute(
             outcomes.insert().values(**event.to_row_values())
         )
-        return int(result.inserted_primary_key[0])
+        outcome_id = int(result.inserted_primary_key[0])
+        # Slice 7: hydrate partner relationship state from the new
+        # outcome so suppression rules see fresh state immediately.
+        # Same transaction so a hydrate failure rolls back the
+        # outcome too.
+        _hydrate_partner_from_event(conn, event)
+        return outcome_id
+
+
+def _hydrate_partner_from_event(conn: Any, event: OutcomeEvent) -> None:
+    """Translate the outcome event into partner relationship-state
+    updates. Conservative: only sets fields the event positively
+    implies (state_from_outcome_event returns None for ambiguous
+    events; we leave the existing state alone in that case).
+
+    Always sets `outcome_source` + `relationship_updated_at` + the
+    relevant timestamp so the approval-gate suppression rules can
+    consult freshness.
+    """
+    new_state = state_from_outcome_event(
+        outreach_status=event.outreach_status,
+        reply_type=event.reply_type,
+        meeting_booked=event.meeting_booked,
+        meeting_outcome=event.meeting_outcome,
+    )
+    values: dict[str, Any] = {
+        "outcome_source": event.source,
+        "relationship_updated_at": event.observed_at,
+        "last_outcome": event.reply_type or event.outreach_status,
+    }
+    if new_state is not None:
+        values["relationship_status"] = new_state
+    # Per-field timestamps. last_contacted_at fires on `sent`
+    # outreach_status; last_reply_at on any reply_type; last_meeting_at
+    # on meeting_booked + meeting_date.
+    if event.outreach_status == "sent":
+        values["last_contacted_at"] = event.observed_at
+    if event.reply_type:
+        values["last_reply_at"] = event.observed_at
+    if event.meeting_booked:
+        values["last_meeting_at"] = (
+            datetime.combine(
+                event.meeting_date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            if event.meeting_date else event.observed_at
+        )
+    conn.execute(
+        update(partners)
+        .where(partners.c.partner_id == event.partner_id)
+        .values(**values)
+    )

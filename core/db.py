@@ -138,6 +138,30 @@ partners = Table(
     # Partner email -- used by create_gmail_drafts.py. Populated manually via
     # scripts/set_partner_email.py or downstream from real enrichment.
     Column("email", Text),
+    # Slice 7: cold-outreach relationship state. Drives suppression
+    # in the approval gate + Stage 6 recommendation gate. Hydrated
+    # automatically by outcome ingestion (see
+    # core/outcomes/persistence.py); manually overridable via
+    # scripts/set_relationship.py.
+    # Values:
+    #   none                 -- default; no prior interaction
+    #   known                -- on the operator's radar, no outreach yet
+    #   contacted            -- sent outreach
+    #   active_conversation  -- replied + still talking
+    #   passed               -- declined (with optional cooldown window)
+    #   invested             -- terminal positive outcome
+    #   do_not_contact       -- terminal negative; pairs with do_not_contact column
+    Column("relationship_status", Text, default="none"),
+    Column("last_contacted_at", DateTime),
+    Column("last_reply_at", DateTime),
+    Column("last_meeting_at", DateTime),
+    Column("last_outcome", Text),
+    # Where the most recent outcome-derived state came from.
+    # Values: manual | attio | gmail | csv
+    Column("outcome_source", Text),
+    Column("owner_notes", Text),
+    # When relationship_status was last refreshed (auto or manual).
+    Column("relationship_updated_at", DateTime),
     # Stage 4 writes the LLM-derived partial reachability score + JSON evidence.
     # Stage 6 combines this with deterministic checks to produce the final
     # cold_reachability_score in partner_score_summaries.

@@ -386,6 +386,10 @@ def main() -> int:
                     # (hard block) in the routing decision.
                     partners.c.email.label("partner_email"),
                     partners.c.do_not_contact,
+                    # Slice 7: relationship suppression inputs.
+                    partners.c.relationship_status,
+                    partners.c.last_contacted_at,
+                    partners.c.last_reply_at,
                     funds.c.name.label("fund_name"),
                     funds.c.domain.label("fund_domain"),
                     funds.c.stated_thesis,
@@ -945,6 +949,9 @@ def main() -> int:
                 pctx_cold_reachability_score=pctx.get("cold_reachability_score"),
                 pctx_partner_email=pctx.get("partner_email"),
                 pctx_do_not_contact=bool(pctx.get("do_not_contact") or False),
+                pctx_relationship_status=pctx.get("relationship_status"),
+                pctx_last_contacted_at=pctx.get("last_contacted_at"),
+                pctx_last_reply_at=pctx.get("last_reply_at"),
                 banned=banned,
                 company_cfg=ws.company,
                 allow_example_domains=policy.allow_example_domains,

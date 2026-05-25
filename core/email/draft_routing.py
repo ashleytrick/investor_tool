@@ -155,14 +155,26 @@ def _collect_blockers(
     pctx_cold_reachability_score: float | None,
     pctx_partner_email: str | None,
     pctx_do_not_contact: bool,
+    pctx_relationship_status: str | None = None,
+    pctx_last_contacted_at=None,
+    pctx_last_reply_at=None,
     banned: list[str],
 ) -> list[str]:
     blockers: list[str] = []
-    # Cold-outreach absolutes: a partner flagged do_not_contact MUST
-    # never make it past the review queue regardless of draft quality.
-    if pctx_do_not_contact:
+    # Slice 7: relationship suppression. The approval gate refuses
+    # cold outreach to partners we're already talking to / who
+    # passed recently / who are flagged do_not_contact. The single
+    # source of truth is core.relationships.suppress_outreach.
+    from core.relationships import suppress_outreach
+    suppression = suppress_outreach(
+        relationship_status=pctx_relationship_status,
+        last_contacted_at=pctx_last_contacted_at,
+        last_reply_at=pctx_last_reply_at,
+        do_not_contact=pctx_do_not_contact,
+    )
+    if suppression.suppressed:
         blockers.append(
-            "partner.do_not_contact is set -- approval blocked",
+            f"relationship suppression: {suppression.reason}",
         )
     # Missing email is a hard blocker for approval. Stage 7 still
     # generates the draft (so the operator sees who needs Apollo
@@ -250,6 +262,9 @@ def decide_draft_routing(
     pctx_cold_reachability_score: float | None,
     pctx_partner_email: str | None = None,
     pctx_do_not_contact: bool = False,
+    pctx_relationship_status: str | None = None,
+    pctx_last_contacted_at=None,
+    pctx_last_reply_at=None,
     banned: list[str],
     company_cfg: dict,
     allow_example_domains: bool,
@@ -285,6 +300,9 @@ def decide_draft_routing(
         pctx_cold_reachability_score=pctx_cold_reachability_score,
         pctx_partner_email=pctx_partner_email,
         pctx_do_not_contact=pctx_do_not_contact,
+        pctx_relationship_status=pctx_relationship_status,
+        pctx_last_contacted_at=pctx_last_contacted_at,
+        pctx_last_reply_at=pctx_last_reply_at,
         banned=banned,
     )
     base_reason = pctx_recommendation_reasoning or ""
