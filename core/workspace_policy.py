@@ -1,4 +1,4 @@
-"""Workspace mode policy (Refactor item 10).
+"""Workspace mode policy (Refactor item 10 / Slice 13).
 
 The pipeline accumulated a growing pile of operator flags --
 `--allow-fixture-mode`, `--allow-example-domains`,
@@ -20,23 +20,28 @@ the policy for the per-decision answer:
         # filter out fixture domains
     if policy.require_attio:
         # treat missing config as fail, not skip
+    if policy.refuses_external_mutation():
+        # dry_run: refuse to call Gmail / Attio mutation APIs
 
-Modes
------
-- "prod": real workspace pushing to real Attio + Gmail. Strict
+Modes (Slice 13 canonical names)
+-------------------------------
+- "production": real workspace pushing to real Attio + Gmail. Strict
   defaults: require all integrations, refuse example domains, refuse
   fixture data, require partner_id integrity, require recommended
-  drafts only for Stage 8.
-- "fixture": shipped test_workspace. Permissive on data shape; refuses
-  to sync to real CRM unless --allow-fixture-mode.
-- "dev" (default for any non-prod, non-fixture mode): permissive on
-  integrations being missing (skip rather than fail), but still rejects
-  example domains unless --allow-example-domains and still treats
-  unknown CSV partner_ids strictly.
+  drafts only for Stage 8. External mutations allowed.
+- "dry_run": real workspace data, integrations are PERMISSIVE on
+  missing config (skip rather than fail) AND external mutations are
+  REFUSED outright -- Gmail draft push + Stage 8 Attio sync log what
+  they would do without calling the API. Reads / local writes (CSV
+  exports, DB updates, run audit rows) proceed normally so the
+  operator can verify a workspace without touching the outside world.
+- "fixture": shipped test_workspace. Permissive on data shape;
+  refuses to sync to real CRM unless --allow-fixture-mode. Same
+  no-external-mutation semantics as dry_run.
 
-Each constructor parameter has a CLI flag counterpart on the stage
-that uses it; this object's job is to apply the mode defaults
-consistently, not to define the flag set.
+Legacy names "prod" + "dev" are accepted in company.yaml with a
+deprecation warning; `core/config_loader.py` normalizes them to the
+canonical forms before they reach this module.
 """
 from __future__ import annotations
 
@@ -65,30 +70,34 @@ class WorkspacePolicy:
         are read with getattr+default so each stage only needs to
         define the flags it actually accepts; missing flags fall
         through to the mode-driven default."""
-        mode = (getattr(ws, "mode", None) or "dev").lower()
-        is_prod = mode == "prod"
+        # Accept legacy names as aliases so call-sites holding an
+        # un-migrated workspace still resolve. The config_loader emits
+        # the deprecation warning at load time; we just normalize.
+        raw = (getattr(ws, "mode", None) or "dry_run").lower()
+        mode = {"prod": "production", "dev": "dry_run"}.get(raw, raw)
+        is_production = mode == "production"
 
         def opt(name: str, default: bool = False) -> bool:
             return bool(getattr(args, name, default))
 
         return cls(
             mode=mode,
-            # Each --require-X flag is opt-in for non-prod; prod-mode
-            # makes it implicit. So a prod workspace cron that omits
-            # the flag still gets the safe behavior.
-            require_attio=opt("require_attio") or is_prod,
-            require_gmail=opt("require_gmail") or is_prod,
-            require_anthropic=opt("require_anthropic") or is_prod,
-            # Stage 8: prod requires ready+qa-pass unless the operator
-            # explicitly opted out via --include-not-ready.
+            # Each --require-X flag is opt-in for non-production;
+            # production mode makes it implicit so a production cron
+            # that omits the flag still gets the safe behavior.
+            require_attio=opt("require_attio") or is_production,
+            require_gmail=opt("require_gmail") or is_production,
+            require_anthropic=opt("require_anthropic") or is_production,
+            # Stage 8: production requires ready+qa-pass unless the
+            # operator explicitly opted out via --include-not-ready.
             require_ready_to_send=(
                 opt("require_ready_to_send")
-                or (is_prod and not opt("include_not_ready"))
+                or (is_production and not opt("include_not_ready"))
             ),
-            # Example-domain permission: prod refuses unless flag set;
-            # fixture/dev mode also defaults to refusing so an operator
-            # who edited a real workspace from a fixture copy doesn't
-            # silently ship .example URLs.
+            # Example-domain permission: production refuses unless
+            # flag set; dry_run / fixture also default to refusing so
+            # an operator who edited a real workspace from a fixture
+            # copy doesn't silently ship .example URLs.
             allow_example_domains=opt("allow_example_domains"),
             # Fixture-data gate: Stage 8 + gmail refuse to write to
             # real systems from a mode=fixture workspace unless
@@ -109,6 +118,19 @@ class WorkspacePolicy:
         """Stage 8 + gmail: should we refuse to write because the
         workspace is mode=fixture and the operator did not opt in?"""
         return self.mode == "fixture" and not self.allow_fixture_data
+
+    def refuses_external_mutation(self) -> bool:
+        """Slice 13: dry_run + fixture must NEVER call an external
+        mutation API (Gmail send, Attio create/update) even when
+        credentials are configured. Only `production` does the real
+        thing.
+
+        Stage 8 and create_gmail_drafts consult this BEFORE touching
+        the network so a misconfigured cron against a dry_run
+        workspace can't accidentally ship live outreach. Local writes
+        (CSV exports, DB updates, run audit rows) are unaffected --
+        only mutation calls to outside systems."""
+        return self.mode != "production"
 
     def integration_skip_or_fail(self, *, system: str) -> str:
         """Return 'fail' when a missing `system` config should be a hard
