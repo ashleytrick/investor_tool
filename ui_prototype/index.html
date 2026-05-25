@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Investor Pipeline Console Prototype</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Investor Pipeline Console</h1>
+      <p>Static prototype using mock data only</p>
+    </div>
+    <button class="command-trigger" id="openCommandPalette">
+      Search partners, runs, review items
+      <span>Ctrl K</span>
+    </button>
+    <div class="top-actions">
+      <button class="icon-button" title="Refresh mock data" aria-label="Refresh mock data">
+        <span aria-hidden="true">R</span>
+      </button>
+      <button class="primary-action" id="openRunbook">Open Runbook</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="workspace-card">
+        <span class="eyebrow">Workspace</span>
+        <strong>northstar_seed</strong>
+        <span>production draft</span>
+      </div>
+      <nav class="nav" aria-label="Prototype sections">
+        <button class="active" data-view="overview">Overview</button>
+        <button data-view="setup">Setup Wizard</button>
+        <button data-view="runbook">Runbook</button>
+        <button data-view="inbox">Review Inbox</button>
+        <button data-view="email">Email Enrichment</button>
+        <button data-view="queue">Review Queue</button>
+        <button data-view="partner">Partner Detail</button>
+        <button data-view="restore">Restore Center</button>
+        <button data-view="dryrun">Dry-Run Preview</button>
+        <button data-view="health">Health</button>
+      </nav>
+    </aside>
+
+    <main>
+      <section id="overview" class="view"></section>
+      <section id="setup" class="view hidden"></section>
+      <section id="runbook" class="view hidden"></section>
+      <section id="inbox" class="view hidden"></section>
+      <section id="email" class="view hidden"></section>
+      <section id="queue" class="view hidden"></section>
+      <section id="partner" class="view hidden"></section>
+      <section id="restore" class="view hidden"></section>
+      <section id="dryrun" class="view hidden"></section>
+      <section id="health" class="view hidden"></section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="commandPalette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="command-modal">
+      <input id="commandSearch" placeholder="Search or jump to..." autocomplete="off">
+      <div id="commandResults" class="command-results"></div>
+    </div>
+  </div>
+
+  <script src="./mock-data.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

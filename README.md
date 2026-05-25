@@ -90,6 +90,9 @@ Workspace setup + day-to-day:
   config + example stubs.
 - `scripts/status.py` — single-pane view: counts per stage, last-run timestamps,
   pending suggestions, recent errors, suggested next command.
+- `ui_prototype/index.html` — static, mock-data operator console prototype for
+  setup, runbook, review queue, Apollo email enrichment, partner detail, dry-run
+  preview, and health workflows. It does not connect to SQLite or external APIs.
 - `scripts/manual_override.py --partner-id X --score|--recommended|--warm-path
   --reason "..."` — flip override flags without raw SQL. `--list` shows what's
   set; `--clear` removes everything for a partner.
