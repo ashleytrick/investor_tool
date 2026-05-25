@@ -63,6 +63,7 @@ from sqlalchemy.engine import Engine
 from core.banner import print_banner
 from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
+from core.runlock import RunLockBusy, workspace_lock
 from core.runs import RunLogger
 from core.stage_result import StageResult
 from core.validate_config import preflight_or_exit, validate_workspace_config
@@ -158,6 +159,22 @@ def stage_run(
     ws = load_workspace(getattr(args, "workspace", None))
     print_banner(ws, stage=stage)
     engine = get_engine(ws.db_url)
+    # Slice 4: workspace run-lock. Refuse to start a stage when
+    # another stage is already running against the same workspace --
+    # prevents SQLite races + corrupted exports. Read-only / status
+    # callers skip via skip_preflight (those use `Workspace` without
+    # opening RunLogger / writing).
+    if not skip_preflight:
+        try:
+            _lock_cm = workspace_lock(ws.path, stage=stage)
+            _lock_cm.__enter__()
+        except RunLockBusy as exc:
+            # Refuse loudly + exit non-zero. Don't open RunLogger --
+            # we never started running.
+            print(f"[{stage}] REFUSED: {exc}")
+            raise SystemExit(int(StageResult.OPERATIONAL_FAILURE))
+    else:
+        _lock_cm = None
     # Launch-blocker fix: preflight runs INSIDE the RunLogger context
     # so a missing API key / config issue lands as a refusal row in
     # `runs` (status.py / audit can see it) rather than being a
@@ -168,33 +185,41 @@ def stage_run(
         # Import lazily so non-LLM stages don't pay the cost.
         from core.llm.client import LLMClient
         llm = LLMClient(workspace=ws)
-    with RunLogger(engine, ws.name, stage) as run:
-        if llm is not None:
-            run.attach_llm_usage(llm.usage)
-        ctx = StageContext(
-            args=args, ws=ws, engine=engine, run=run, llm=llm,
-            stage=stage,
-        )
-        if not skip_preflight:
-            issues = validate_workspace_config(
-                ws,
-                require_anthropic=require_anthropic,
-                require_attio=require_attio,
-                require_examples=require_examples,
+    try:
+        with RunLogger(engine, ws.name, stage) as run:
+            if llm is not None:
+                run.attach_llm_usage(llm.usage)
+            ctx = StageContext(
+                args=args, ws=ws, engine=engine, run=run, llm=llm,
+                stage=stage,
             )
-            if issues:
-                summary = (
-                    f"REFUSED: workspace config has {len(issues)} "
-                    f"issue(s): " + "; ".join(issues)
+            if not skip_preflight:
+                issues = validate_workspace_config(
+                    ws,
+                    require_anthropic=require_anthropic,
+                    require_attio=require_attio,
+                    require_examples=require_examples,
                 )
-                print(f"[{stage}] REFUSED: workspace config has "
-                      f"{len(issues)} issue(s):")
-                for s in issues:
-                    print(f"  - {s}")
-                print(f"[{stage}] edit "
-                      f"clients/{ws.name}/config/*.yaml "
-                      f"(and prompts/examples/) then re-run.")
-                ctx.refuse_unsafe(summary)
-                yield ctx
-                return
-        yield ctx
+                if issues:
+                    summary = (
+                        f"REFUSED: workspace config has {len(issues)} "
+                        f"issue(s): " + "; ".join(issues)
+                    )
+                    print(f"[{stage}] REFUSED: workspace config has "
+                          f"{len(issues)} issue(s):")
+                    for s in issues:
+                        print(f"  - {s}")
+                    print(f"[{stage}] edit "
+                          f"clients/{ws.name}/config/*.yaml "
+                          f"(and prompts/examples/) then re-run.")
+                    ctx.refuse_unsafe(summary)
+                    yield ctx
+                    return
+            yield ctx
+    finally:
+        # Release the workspace lock no matter how the stage exits.
+        if _lock_cm is not None:
+            try:
+                _lock_cm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 - don't mask the real error
+                pass
