@@ -121,20 +121,26 @@ def test_stage8_pushed_at_timestamps_via_driver():
         # Drive Stage 8 with a stubbed AttioClient that fakes upsert/create/
         # update and returns canned record_ids. Just enough to walk through
         # the partner-sync loop so pushed_to_attio_at gets set.
+        # Use a module-level monotonic counter -- the earlier fixture used
+        # id(payload), but CPython id() reuses memory addresses after GC,
+        # so two distinct payloads occasionally collided and the
+        # partners.attio_record_id UNIQUE index rejected the second insert.
         driver = ws_dst / "_drive_stage8.py"
         driver.write_text(
-            "import sys, importlib.util\n"
+            "import sys, importlib.util, itertools\n"
             f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
             "import core.attio_client as ac\n"
             "from core.attio_client import AttioClient\n"
             "_orig_from = AttioClient.from_workspace\n"
+            "_co_counter = itertools.count()\n"
+            "_per_counter = itertools.count()\n"
             "class FakeClient:\n"
             "    def upsert_record(self, obj, slug, payload):\n"
-            "        return {'data': {'id': {'record_id': 'fake_co_' + str(id(payload))}}}\n"
+            "        return {'data': {'id': {'record_id': 'fake_co_' + str(next(_co_counter))}}}\n"
             "    def get_record(self, obj, rid):\n"
             "        return None\n"
             "    def create_record(self, obj, payload):\n"
-            "        return {'data': {'id': {'record_id': 'fake_per_' + str(id(payload))}}}\n"
+            "        return {'data': {'id': {'record_id': 'fake_per_' + str(next(_per_counter))}}}\n"
             "    def update_record(self, obj, rid, payload):\n"
             "        return {'data': {'id': {'record_id': rid}}}\n"
             "    def attribute_slugs(self, obj):\n"

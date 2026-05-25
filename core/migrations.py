@@ -112,39 +112,56 @@ def applied_migration_ids(engine: Engine) -> set[str]:
         }
 
 
-def _workspace_predates_migrations(engine: Engine) -> bool:
-    """A workspace `predates migrations` when schema_migrations doesn't
-    exist AND any user table does. A truly fresh workspace (no user
-    tables yet) is treated as new -- after create_all runs it'll have
-    the latest schema and we just stamp all migrations as applied."""
-    insp = inspect(engine)
-    if insp.has_table("schema_migrations"):
-        return False
-    existing = set(insp.get_table_names())
-    existing.discard("sqlite_sequence")  # SQLite internal
-    return len(existing) > 0
-
-
-def apply_pending_migrations(engine: Engine) -> list[str]:
+def apply_pending_migrations(
+    engine: Engine,
+    *,
+    was_empty_before_create_all: bool | None = None,
+) -> list[str]:
     """Apply every migration in MIGRATIONS that isn't yet in
-    schema_migrations. For brand-new workspaces (no user tables
-    existed before metadata.create_all ran), stamp every migration
-    as already-applied without executing -- the fresh schema IS the
-    latest schema. For existing operator workspaces, run pending
-    migrations in MIGRATIONS order, each in its own transaction.
+    schema_migrations.
+
+    `was_empty_before_create_all` -- callers that own the
+    metadata.create_all() invocation should pass True when the DB
+    had ZERO user tables at engine-open time. That tells us the
+    fresh schema came from create_all, so e.g. a future
+    "drop column X" migration must be STAMPED (not executed) --
+    create_all never gave the brand-new DB column X to drop.
+    Caller-supplied because once create_all has run, this module
+    can't tell brand-new from pre-existing by inspecting the DB.
+
+    When the flag is None (legacy callers), we fall back to a
+    best-effort check: if schema_migrations doesn't exist AND no
+    user tables exist either, treat as fresh; otherwise run.
+
+    For pre-existing operator workspaces, run pending migrations
+    in MIGRATIONS order, each in its own transaction.
 
     Returns the list of migration ids newly applied (or stamped) on
     this call -- empty list when nothing needed doing.
     """
-    is_fresh_or_unstamped = not inspect(engine).has_table("schema_migrations")
-    predates = _workspace_predates_migrations(engine)
+    insp = inspect(engine)
+    stamps_exist = insp.has_table("schema_migrations")
+
+    if was_empty_before_create_all is None:
+        # Legacy / direct callers: best-effort. A workspace with NO
+        # user tables and NO schema_migrations is fresh; anything
+        # else is treated as pre-existing.
+        if not stamps_exist:
+            existing = set(insp.get_table_names())
+            existing.discard("sqlite_sequence")
+            was_empty_before_create_all = not existing
+        else:
+            was_empty_before_create_all = False
+
     # Ensure the schema_migrations table exists.
     _migration_meta.create_all(engine)
 
-    if is_fresh_or_unstamped and not predates:
+    if was_empty_before_create_all and not stamps_exist:
         # Brand-new workspace. metadata.create_all already produced
         # the latest schema; stamp every known migration so future
-        # apply_pending() calls have nothing to do.
+        # apply_pending() calls have nothing to do AND any future
+        # migration whose apply() is destructive (drop column, etc.)
+        # doesn't fire against a schema that never had the target.
         now = datetime.now(timezone.utc)
         with engine.begin() as conn:
             for m in MIGRATIONS:

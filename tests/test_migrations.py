@@ -33,6 +33,44 @@ def test_fresh_workspace_stamps_all_migrations_without_running(tmp_path: Path) -
     assert insp.has_table("schema_migrations")
 
 
+def test_fresh_workspace_does_not_run_migration_body(tmp_path: Path) -> None:
+    """The fresh-workspace shortcut must STAMP without RUNNING. If a
+    real future migration tries to drop a column on a fresh DB
+    (where create_all already gave it the latest schema -- so the
+    column never existed), the migration body would crash. Verify
+    the body never fires by registering a migration that crashes
+    on apply, then opening a fresh engine."""
+    from typing import Any
+    from core.migrations import Migration
+
+    ran: list[str] = []
+
+    def _bomb_if_run(_conn: Any) -> None:
+        ran.append("ran")
+        raise RuntimeError(
+            "fresh workspace should STAMP not RUN; saw apply() fire"
+        )
+
+    fake = Migration(
+        id="m997_must_not_run_on_fresh",
+        description="fixture migration that crashes on apply",
+        apply=_bomb_if_run,
+    )
+    MIGRATIONS.append(fake)
+    try:
+        db_path = tmp_path / "fresh_no_body.db"
+        # get_engine passes was_empty_before_create_all=True for a
+        # truly empty DB -- the migration is stamped, body never runs.
+        engine = get_engine(f"sqlite:///{db_path}")
+        applied = applied_migration_ids(engine)
+        assert "m997_must_not_run_on_fresh" in applied
+        assert ran == [], (
+            "fresh-workspace path executed migration body; the bomb fired"
+        )
+    finally:
+        MIGRATIONS.pop()
+
+
 def test_apply_pending_is_idempotent(tmp_path: Path) -> None:
     """Re-running on the same workspace must not duplicate-apply."""
     db_path = tmp_path / "idem.db"

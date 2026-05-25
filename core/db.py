@@ -721,6 +721,15 @@ def get_engine(db_url: str) -> Engine:
     engine = create_engine(db_url, future=True)
     if engine.dialect.name == "sqlite":
         event.listen(engine, "connect", _enable_sqlite_foreign_keys)
+    # Slice 16: detect freshness BEFORE metadata.create_all runs --
+    # afterwards every workspace has user tables and we can't tell
+    # "brand-new (latest schema, stamp migrations as applied)" from
+    # "pre-existing (run real migrations)". Inspect with a temporary
+    # introspector since `inspect(engine)` reuses state per-engine.
+    from sqlalchemy import inspect as _inspect
+    _existing_tables = set(_inspect(engine).get_table_names())
+    _existing_tables.discard("sqlite_sequence")  # SQLite internal
+    was_empty_before_create_all = not _existing_tables
     metadata.create_all(engine)
     # Defensive: a pre-existing SQLite db may lack columns added in later
     # sessions. metadata.create_all does not ALTER. Sync any drift here.
@@ -735,7 +744,9 @@ def get_engine(db_url: str) -> Engine:
     # case; this picks up renames / drops / backfills / index changes
     # that can't be derived from the SQLAlchemy metadata alone.
     from core.migrations import apply_pending_migrations
-    apply_pending_migrations(engine)
+    apply_pending_migrations(
+        engine, was_empty_before_create_all=was_empty_before_create_all,
+    )
     return engine
 
 
