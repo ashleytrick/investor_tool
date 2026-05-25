@@ -7,21 +7,26 @@ a send pass, non-zero when at least one check fails.
 
 Checks:
 
-  1. mode -- workspace is not in fixture mode
-  2. workspace_config -- required configs present
-  3. stage6_freshness -- Stage 6 completed within STALE_STAGE6_HOURS
-  4. approval_pipeline -- something is in the queue or already approved
-  5. approved_have_emails -- defense-in-depth against gate gaps
-  6. no_dnc_approvals -- defense-in-depth against gate gaps
-  7. approved_gate_clean -- every approved_to_send draft still passes
-     the LIVE approval gate (catches generic/role mailboxes,
-     invalid/risky verification, suppression flipped on after
-     approval, qa_status regressions -- the same checks Slices 7-9
-     added to the approval gate, re-run at "ready to send" time)
-  8. no_duplicate_recipients -- no two approved drafts target the
-     same partner_email
-  9. daily_cap_headroom -- today's approval count is below the cap
-     (informational; sends still legal until cap hits)
+  1.  mode -- workspace is not in fixture mode
+  2.  workspace_config -- required configs present
+  3.  stage6_freshness -- Stage 6 completed within STALE_STAGE6_HOURS
+  4.  approval_pipeline -- something is in the queue or already approved
+  5.  approved_have_emails -- defense-in-depth against gate gaps
+  6.  no_dnc_approvals -- defense-in-depth against gate gaps
+  7.  approved_gate_clean -- every approved_to_send draft still passes
+      the LIVE approval gate (catches generic/role mailboxes,
+      invalid/risky verification, suppression flipped on after
+      approval, qa_status regressions -- the same checks Slices 7-9
+      added to the approval gate, re-run at "ready to send" time)
+  8.  no_duplicate_recipients -- no two approved drafts target the
+      same partner_email
+  9.  daily_cap_headroom -- today's approval count is below the cap
+      (informational; sends still legal until cap hits)
+  10. scheduling_link_reachable -- HEAD-request the configured
+      scheduling link; catches broken / 404 calendar URLs before
+      they ship in every cold email (Slice 15)
+  11. gmail_oauth -- call users.getProfile to confirm the operator's
+      Gmail OAuth token still works without pushing a draft (Slice 15)
 
 Output format:
   [check_ready] {section}: OK / BLOCKED -- {reason}
@@ -312,6 +317,100 @@ def _check_daily_cap_headroom(ws, engine) -> CheckResult:
     )
 
 
+def _check_scheduling_link_reachable(ws) -> CheckResult:
+    """Slice 15: HEAD-request the configured scheduling link with a
+    short timeout. A 404 / DNS failure here = the link in every cold
+    email is broken, which is the worst possible kind of silent
+    failure (the operator only notices via reply absence).
+
+    Soft check: when the link is missing OR uses an example/reserved
+    TLD, we return OK ("nothing to check"). The production guard in
+    `core/production_guards.py` already refuses to ship those.
+    Reachability only matters once the link is a real URL.
+    """
+    co = (ws.company or {}).get("company") or {}
+    link = (co.get("meeting_ask") or {}).get("preferred_scheduling_link") or ""
+    link = link.strip()
+    if not link:
+        return CheckResult(
+            "scheduling_link_reachable", True,
+            "no scheduling link configured (production_guard catches this)",
+        )
+    if not link.startswith(("http://", "https://")):
+        return CheckResult(
+            "scheduling_link_reachable", False,
+            f"scheduling link {link!r} is not HTTP(S); fix in company.yaml",
+        )
+    # Skip example / reserved TLDs -- the production guard refuses
+    # those at send time, so they're not the operator's fault here.
+    for suffix in (".example", ".test", ".invalid", ".localhost"):
+        if suffix in link.lower():
+            return CheckResult(
+                "scheduling_link_reachable", True,
+                f"skipping reachability for reserved-TLD link {link!r} "
+                f"(production_guard refuses this at send time)",
+            )
+    try:
+        import urllib.request
+        req = urllib.request.Request(link, method="HEAD")
+        # 5s is enough for any healthy scheduling service; we'd rather
+        # report "slow / unreachable" than hang the operator.
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = resp.getcode()
+    except Exception as exc:  # noqa: BLE001 -- diverse URL/timeout errors
+        return CheckResult(
+            "scheduling_link_reachable", False,
+            f"HEAD {link} failed: {type(exc).__name__}: {exc}",
+        )
+    if status >= 400:
+        return CheckResult(
+            "scheduling_link_reachable", False,
+            f"HEAD {link} -> {status}; recipients will hit a broken link",
+        )
+    return CheckResult(
+        "scheduling_link_reachable", True,
+        f"HEAD {link} -> {status}",
+    )
+
+
+def _check_gmail_oauth(ws) -> CheckResult:
+    """Slice 15: confirm Gmail OAuth still works WITHOUT pushing a
+    draft. Calls users.getProfile (the cheapest read in the
+    gmail.compose scope). When credentials aren't set up, returns OK
+    with a "not configured" message -- check_ready doesn't require
+    Gmail; only `production` mode does via WorkspacePolicy.
+    """
+    try:
+        from core.gmail_client import (
+            GmailClient, GmailError, GmailNotConfigured,
+        )
+        client = GmailClient.from_workspace(ws)
+    except GmailNotConfigured:
+        return CheckResult(
+            "gmail_oauth", True,
+            "Gmail not linked (skipped); run connect_gmail.py if you "
+            "intend to push drafts",
+        )
+    except ImportError as exc:
+        return CheckResult(
+            "gmail_oauth", False,
+            f"google API libraries missing: {exc}",
+        )
+    try:
+        profile = client.get_profile()
+    except GmailError as exc:
+        return CheckResult(
+            "gmail_oauth", False,
+            f"Gmail OAuth failed: {exc}. Re-run connect_gmail.py to "
+            f"refresh the token.",
+        )
+    email = profile.get("emailAddress", "?")
+    return CheckResult(
+        "gmail_oauth", True,
+        f"Gmail OAuth healthy (account={email})",
+    )
+
+
 def _check_mode(ws) -> CheckResult:
     mode = getattr(ws, "mode", None) or "(unset)"
     if mode == "fixture":
@@ -335,6 +434,9 @@ def _run_all_checks(ws, engine, *, allow_example_domains: bool) -> list[CheckRes
         _check_approved_gate_clean(ws, engine, allow_example_domains),
         _check_no_duplicate_recipients(engine),
         _check_daily_cap_headroom(ws, engine),
+        # Slice 15:
+        _check_scheduling_link_reachable(ws),
+        _check_gmail_oauth(ws),
     ]
 
 
