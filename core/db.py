@@ -315,10 +315,68 @@ email_drafts = Table(
     # Gmail draft id once create_gmail_drafts.py has run; idempotent guard.
     Column("pushed_to_gmail_at", DateTime),
     Column("gmail_draft_id", Text),
+    # Slice 1: approval state-machine pointer. Always seeded as
+    # 'needs_review' on insert -- only a human action moves it to
+    # 'approved_to_send'. Gmail / Attio / CSV-export readers filter
+    # on approval_status='approved_to_send'.
+    # Values: needs_review | approved_to_send | rejected
+    #       | stale_after_approval | sent
+    Column("approval_status", Text, default="needs_review"),
+    # sha256 of the canonical (subject + body) at draft time. When an
+    # approved draft's score / evidence changes after approval, a new
+    # draft is regenerated and the hash differs -- triggers
+    # stale_after_approval automatically. Full append-only history
+    # lives in draft_approvals.
+    Column("draft_hash", Text),
     # Stage 7 does `DELETE FROM email_drafts WHERE partner_id = ?` for every
     # partner in the batch; this index keeps that bounded.
     Index("ix_email_drafts_partner_id", "partner_id"),
     Index("ix_email_drafts_batch_id", "batch_id"),
+    # Approval queue / Gmail send queries filter on approval_status;
+    # keep that fast.
+    Index("ix_email_drafts_approval_status", "approval_status"),
+)
+
+
+# Slice 1: append-only event log of every approval action against a
+# draft. The latest row's event_type matches email_drafts.approval_status
+# (denormalized for fast filtering); this table preserves WHO, WHEN,
+# WHY, and WHAT BODY HASH for audit + dispute / forensics.
+#
+# event_type values mirror the state-machine transitions:
+#   - needs_review        : system, on draft insert
+#   - approved_to_send    : human, via approve_draft CLI / UI
+#   - rejected            : human, via reject_draft CLI / UI
+#   - stale_after_approval: system, when a material change invalidates
+#                            a prior approval (score / evidence / body
+#                            regeneration -> draft_hash mismatch)
+#   - sent                : system, after Gmail / Attio confirms send
+draft_approvals = Table(
+    "draft_approvals", metadata,
+    Column("event_id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "draft_id", Integer,
+        ForeignKey("email_drafts.draft_id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    # Denormalized so review queue can filter on partner without a join.
+    Column("partner_id", Text, nullable=False),
+    Column("event_type", Text, nullable=False),
+    # 'system' for auto-generated events; an operator identifier
+    # (resolved from $USER / $USERNAME / explicit --approved-by) for
+    # human actions.
+    Column("actor", Text, nullable=False),
+    Column("at", DateTime, nullable=False),
+    # Snapshot of the (subject + body) hash at the moment of the
+    # event. Lets us prove "this exact body was approved" even after
+    # later edits.
+    Column("draft_hash", Text),
+    # Optional operator note (approval reasoning, rejection reason,
+    # stale trigger detail).
+    Column("notes", Text),
+    Index("ix_draft_approvals_draft_id", "draft_id"),
+    Index("ix_draft_approvals_partner_id", "partner_id"),
+    Index("ix_draft_approvals_event_type", "event_type"),
 )
 
 followup_drafts = Table(
