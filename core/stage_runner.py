@@ -60,6 +60,7 @@ from typing import Any, Iterator, Optional
 
 from sqlalchemy.engine import Engine
 
+from core.backups import backup_before_stage
 from core.banner import print_banner
 from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
@@ -175,6 +176,14 @@ def stage_run(
             raise SystemExit(int(StageResult.OPERATIONAL_FAILURE))
     else:
         _lock_cm = None
+    # Slice 5: pre-stage SQLite backup for destructive stages. The
+    # whitelist lives in core.backups.stages_needing_backup; a
+    # backup failure prints a WARN and continues (backups are
+    # insurance, never a blocker).
+    if not skip_preflight:
+        backup_before_stage(
+            ws.path, stage=stage, db_path=ws.db_path,
+        )
     # Launch-blocker fix: preflight runs INSIDE the RunLogger context
     # so a missing API key / config issue lands as a refusal row in
     # `runs` (status.py / audit can see it) rather than being a
