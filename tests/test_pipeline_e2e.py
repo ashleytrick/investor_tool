@@ -205,6 +205,124 @@ def test_ready_to_send_ceiling_blocks_without_approval():
 
 
 
+def test_attribution_promotion_and_bulk_reattribute_flow():
+    """Slice 12 honest E2E: provisional row created by Stage 3, promoted
+    via promote_provisional.py, and merged via bulk_reattribute.py.
+
+    Drives the operator side of the new --allow-provisional flow.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        ws = str(ws_dst)
+
+        _run("01_aggregate_sources.py", "--workspace", ws, cwd=REPO_ROOT)
+        _run("02_enrich_funds.py", "--workspace", ws, "--fixtures", cwd=REPO_ROOT)
+        _run(
+            "03_mine_activity.py", "--workspace", ws,
+            "--fixtures", "--allow-provisional", cwd=REPO_ROOT,
+        )
+
+        c = sqlite3.connect(db)
+        provisional_funds = c.execute(
+            "select fund_id, name from funds where is_provisional=1"
+        ).fetchall()
+        c.close()
+        assert provisional_funds, (
+            "Stage 3 --allow-provisional should have created provisional "
+            "fund rows for fixture lead investors not in funds_seed.csv"
+        )
+
+        # --- promote one provisional fund in place ---
+        prov_fund_id, prov_name = provisional_funds[0]
+        _run(
+            "promote_provisional.py", "--workspace", ws,
+            "--fund-id", prov_fund_id,
+            "--new-name", f"{prov_name} (verified)",
+            "--new-domain", "verified.example",
+            cwd=REPO_ROOT,
+        )
+
+        c = sqlite3.connect(db)
+        row = c.execute(
+            "select is_provisional, name, domain from funds where fund_id=?",
+            (prov_fund_id,),
+        ).fetchone()
+        c.close()
+        assert row[0] == 0, "is_provisional should have been cleared"
+        assert row[1] == f"{prov_name} (verified)"
+        assert row[2] == "verified.example"
+
+        # Re-running on the now-real fund must REFUSE (exit 2).
+        res = _run(
+            "promote_provisional.py", "--workspace", ws,
+            "--fund-id", prov_fund_id, cwd=REPO_ROOT, check=False,
+        )
+        assert res.returncode == 2, (
+            f"promoting an already-real fund should refuse, got "
+            f"{res.returncode}\n{res.stdout}{res.stderr}"
+        )
+        assert "already non-provisional" in res.stdout
+
+        # --- bulk-reattribute a different provisional fund into a real one ---
+        if len(provisional_funds) >= 2:
+            src_id = provisional_funds[1][0]
+            c = sqlite3.connect(db)
+            dst_id = c.execute(
+                "select fund_id from funds where is_provisional=0 "
+                "and fund_id != ? limit 1", (prov_fund_id,),
+            ).fetchone()[0]
+            before = c.execute(
+                "select count(*) from deal_attributions where lead_fund_id=?",
+                (src_id,),
+            ).fetchone()[0]
+            c.close()
+            assert before >= 1, (
+                "the second provisional fund should have at least one deal"
+            )
+
+            # Dry-run reports the count without writing.
+            res = _run(
+                "bulk_reattribute.py", "--workspace", ws,
+                "--from-fund-id", src_id, "--to-fund-id", dst_id,
+                "--dry-run", cwd=REPO_ROOT,
+            )
+            assert "DRY RUN" in res.stdout
+            assert f"{before} deal" in res.stdout
+
+            c = sqlite3.connect(db)
+            still_on_src = c.execute(
+                "select count(*) from deal_attributions where lead_fund_id=?",
+                (src_id,),
+            ).fetchone()[0]
+            c.close()
+            assert still_on_src == before, "dry-run must not write"
+
+            # Real run.
+            _run(
+                "bulk_reattribute.py", "--workspace", ws,
+                "--from-fund-id", src_id, "--to-fund-id", dst_id,
+                cwd=REPO_ROOT,
+            )
+            c = sqlite3.connect(db)
+            still_on_src = c.execute(
+                "select count(*) from deal_attributions where lead_fund_id=?",
+                (src_id,),
+            ).fetchone()[0]
+            moved = c.execute(
+                "select count(*) from deal_attributions where lead_fund_id=? "
+                "and match_status='confirmed' and matched_by='manual'",
+                (dst_id,),
+            ).fetchone()[0]
+            c.close()
+            assert still_on_src == 0
+            assert moved >= before
+
+
 def test_db_integrity_invariants():
     """DB-level guarantees that are easy to assert and easy to regress:
       - FK enforcement is ON (orphan inserts rejected).
