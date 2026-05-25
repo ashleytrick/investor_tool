@@ -48,13 +48,12 @@ from core.approval.persistence import mark_stale
 from core.approval.state_machine import (
     STATE_APPROVED_TO_SEND, TRIGGER_EMAIL_CHANGED,
 )
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
+from core.config_loader import add_workspace_arg
 from core.csv_ingest import (
     CsvIngestSchema, ingest_csv, in_set, looks_like_email, require_field,
 )
-from core.db import email_drafts, get_engine, partners
-from core.runs import RunLogger
+from core.db import email_drafts, partners
+from core.operator_command import operator_command_run
 
 STAGE = "import_partner_emails_apollo"
 
@@ -80,36 +79,34 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
 
-    with engine.begin() as conn:
-        known_pids = {
-            r.partner_id for r in conn.execute(
-                select(partners.c.partner_id),
-            )
-        }
-        existing_email_by_pid = {
-            r.partner_id: (r.email or "").strip().lower()
-            for r in conn.execute(
-                select(partners.c.partner_id, partners.c.email),
-            )
-        }
+        with engine.begin() as conn:
+            known_pids = {
+                r.partner_id for r in conn.execute(
+                    select(partners.c.partner_id),
+                )
+            }
+            existing_email_by_pid = {
+                r.partner_id: (r.email or "").strip().lower()
+                for r in conn.execute(
+                    select(partners.c.partner_id, partners.c.email),
+                )
+            }
 
-    schema = CsvIngestSchema(
-        required_headers={"partner_id", "email"},
-        row_validators=(
-            require_field("partner_id"),
-            require_field("email"),
-            in_set("partner_id", known_pids, error_type="unknown_partner"),
-            looks_like_email("email"),
-        ),
-    )
-    path = pathlib.Path(args.from_csv)
-    result = ingest_csv(path, schema)
+        schema = CsvIngestSchema(
+            required_headers={"partner_id", "email"},
+            row_validators=(
+                require_field("partner_id"),
+                require_field("email"),
+                in_set("partner_id", known_pids, error_type="unknown_partner"),
+                looks_like_email("email"),
+            ),
+        )
+        path = pathlib.Path(args.from_csv)
+        result = ingest_csv(path, schema)
 
-    with RunLogger(engine, ws.name, STAGE) as run:
         if not path.exists() or result.missing_headers:
             msg = (
                 f"file not found: {path}" if not path.exists()
@@ -117,9 +114,8 @@ def main() -> int:
                      f"{result.missing_headers}"
             )
             print(f"[apollo_import] REFUSED: {msg}")
-            run.note(msg)
-            run.failed = 1
-            return 2
+            ctx.usage_error(msg)
+            return ctx.exit_code
 
         for err in result.row_errors:
             run.log_error(err.record_id, err.error_type,
@@ -188,8 +184,8 @@ def main() -> int:
         )
         # Non-zero exit when conflicts or row errors landed so cron /
         # wrappers notice; pure no-op runs (every row already matched)
-        # exit clean.
-        return 2 if (conflicts or result.row_errors) else 0
+        # exit clean. ctx.exit_code maps run.failed (>0) -> 2.
+        return ctx.exit_code
 
 
 def _overwrite_email_and_stale_approvals(

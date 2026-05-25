@@ -22,9 +22,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sqlalchemy import select
 
 from core.approval.persistence import reject
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
-from core.db import email_drafts, get_engine
+from core.config_loader import add_workspace_arg
+from core.db import email_drafts
+from core.operator_command import operator_command_run
+
+STAGE = "reject_draft"
 
 
 def _resolve_actor(cli_value: str | None) -> str:
@@ -52,39 +54,46 @@ def main() -> int:
         help="Override the operator id.",
     )
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage="reject_draft")
     actor = _resolve_actor(args.rejected_by)
 
-    with engine.begin() as conn:
-        row = conn.execute(
-            select(
-                email_drafts.c.partner_id,
-                email_drafts.c.approval_status,
-            ).where(email_drafts.c.draft_id == args.draft_id)
-        ).first()
-    if row is None:
-        print(f"[reject] draft_id={args.draft_id} not found")
-        return 1
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
 
-    try:
-        reject(
-            engine,
-            draft_id=args.draft_id,
-            partner_id=row.partner_id,
-            actor=actor,
-            notes=args.reason,
+        with engine.begin() as conn:
+            row = conn.execute(
+                select(
+                    email_drafts.c.partner_id,
+                    email_drafts.c.approval_status,
+                ).where(email_drafts.c.draft_id == args.draft_id)
+            ).first()
+        if row is None:
+            print(f"[reject] draft_id={args.draft_id} not found")
+            ctx.usage_error(f"draft_id={args.draft_id} not found")
+            return ctx.exit_code
+
+        try:
+            reject(
+                engine,
+                draft_id=args.draft_id,
+                partner_id=row.partner_id,
+                actor=actor,
+                notes=args.reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[reject] REFUSED: {exc}")
+            ctx.refuse(f"reject raised: {exc}")
+            return ctx.exit_code
+
+        print(
+            f"[reject] draft_id={args.draft_id} partner={row.partner_id} "
+            f"-> rejected by {actor!r}: {args.reason!r}"
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[reject] REFUSED: {exc}")
-        return 2
-
-    print(
-        f"[reject] draft_id={args.draft_id} partner={row.partner_id} "
-        f"-> rejected by {actor!r}: {args.reason!r}"
-    )
+        run.note(
+            f"rejected draft_id={args.draft_id} partner={row.partner_id} "
+            f"by {actor}: {args.reason}"
+        )
+        run.processed = 1
+        run.succeeded = 1
     return 0
 
 

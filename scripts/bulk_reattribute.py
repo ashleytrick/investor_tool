@@ -41,10 +41,8 @@ from core.attribution.promotion import (
     PromotionError,
     bulk_reattribute_deals,
 )
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
-from core.db import get_engine
-from core.runs import RunLogger
+from core.config_loader import add_workspace_arg
+from core.operator_command import operator_command_run
 
 STAGE = "bulk_reattribute"
 
@@ -79,13 +77,10 @@ def main() -> int:
     parser.add_argument("--actor", default=None,
                         help="Operator id (defaults to $USER).")
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
     actor = args.actor or os.environ.get("USER") or "unknown"
 
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
         try:
             result = bulk_reattribute_deals(
                 engine,
@@ -97,12 +92,12 @@ def main() -> int:
             )
         except PromotionError as exc:
             print(f"[bulk_reattribute] REFUSED: {exc}")
-            run.failed = 1
+            ctx.refuse(str(exc))
             run.log_error(
                 f"{args.from_fund_id}->{args.to_fund_id}",
                 "reattribute_refused", str(exc),
             )
-            return 2
+            return ctx.exit_code
 
         prefix = "DRY RUN " if result.dry_run else ""
         print(
@@ -127,7 +122,7 @@ def main() -> int:
             )
         run.processed = result.deals_moved
         run.succeeded = result.deals_moved
-    return 0
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

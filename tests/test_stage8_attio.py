@@ -55,14 +55,17 @@ def test_verify_attio_schema_fails_without_key_when_attio_configured():
         ws = str(ws_dst)
         env = {**os.environ, "ATTIO_API_KEY": ""}
 
-        # Default: refuse.
+        # Default: refuse. Preflight maps a missing required API key
+        # to REFUSED_UNSAFE (=3) consistently across stages -- the
+        # stage body never runs after the refusal lands in `runs`.
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "00_verify_attio_schema.py"),
              "--workspace", ws],
             capture_output=True, text=True, env=env, timeout=60,
         )
-        assert res.returncode == 2, (
-            f"expected exit 2 on missing key, got {res.returncode}\n"
+        assert res.returncode == 3, (
+            f"expected exit 3 (REFUSED_UNSAFE) on missing key, got "
+            f"{res.returncode}\n"
             f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
         )
         assert "REFUSED" in res.stdout

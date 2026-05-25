@@ -47,7 +47,7 @@ from core.attribution.promotion import (
 from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import funds, get_engine, partners
-from core.runs import RunLogger
+from core.operator_command import operator_command_run
 
 STAGE = "promote_provisional"
 
@@ -94,13 +94,14 @@ def main() -> int:
     parser.add_argument("--actor", default=None,
                         help="Operator id (defaults to $USER).")
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
     actor = args.actor or os.environ.get("USER") or "unknown"
 
+    # --list is read-only -- skip the lock + backup overhead so an
+    # operator who wants to inspect can do so even mid-pipeline.
     if args.list:
+        ws = load_workspace(args.workspace)
+        engine = get_engine(ws.db_url)
+        print_banner(ws, stage=STAGE)
         return _list_provisional(engine)
 
     if args.fund_id and (args.new_title or args.new_linkedin):
@@ -110,7 +111,8 @@ def main() -> int:
         print("[promote_provisional] --new-domain is fund-only")
         return 1
 
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
         try:
             if args.fund_id:
                 result = promote_provisional_fund(
@@ -145,13 +147,12 @@ def main() -> int:
                 )
             run.succeeded = 1
             run.processed = 1
-            return 0
         except PromotionError as exc:
             print(f"[promote_provisional] REFUSED: {exc}")
-            run.failed = 1
+            ctx.refuse(str(exc))
             run.log_error(args.fund_id or args.partner_id or "?",
                           "promotion_refused", str(exc))
-            return 2
+    return ctx.exit_code
 
 
 if __name__ == "__main__":

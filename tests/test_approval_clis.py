@@ -66,10 +66,24 @@ def test_approve_draft_moves_to_approved_to_send():
         db = ws_dst / "data" / "pipeline.db"
         draft_id, pid = _draft_id_for_a_partner(db)
 
+        # Approval gate (Finding 2) requires a partner email + valid
+        # verification status. Set both so this test exercises the
+        # happy-path approval rather than the gate refusal (which has
+        # its own coverage in test_approval_gate.py).
+        c = sqlite3.connect(db)
+        c.execute(
+            "update partners set email='operator@example.com', "
+            "email_verification_status='valid' where partner_id=?",
+            (pid,),
+        )
+        c.commit()
+        c.close()
+
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
              "--workspace", ws, "--draft-id", str(draft_id),
-             "--notes", "test approval"],
+             "--notes", "test approval",
+             "--allow-example-domains"],
             capture_output=True, text=True,
             env={**os.environ, "USER": "test_approver"}, timeout=60,
         )

@@ -168,6 +168,8 @@ def main() -> int:
             ),
         )[: args.top]
 
+        from core.approval.gate import can_approve_draft
+
         for rec in approved_drafts:
             with run.attempt():
                 partner = partner_rows.get(rec.partner_id)
@@ -177,10 +179,28 @@ def main() -> int:
                         "approved draft references unknown partner",
                     )
                     continue
+                # Finding 3 (re-check): an approved_to_send row from
+                # a prior approval is not enough -- partner state may
+                # have moved (email cleared, DNC flipped, verification
+                # regressed) between approval and Gmail push. Re-run
+                # the canonical gate so we never push to a draft whose
+                # blockers have come back.
+                gate = can_approve_draft(
+                    ws, engine, rec.draft_id,
+                    allow_example_domains=policy.allow_example_domains,
+                )
+                if not gate.ok:
+                    msg = (
+                        "approval is stale -- live blockers: "
+                        + "; ".join(gate.blockers)
+                    )
+                    run.fail(rec.partner_id, "stale_approval", msg)
+                    print(f"[gmail_drafts] {rec.partner_id}: STALE -- {msg}")
+                    continue
                 if not partner.email:
-                    # An approved draft should always have an email
-                    # (Slice 1's approval blocker prevents otherwise).
-                    # Defense in depth: surface as fail, not silent skip.
+                    # Belt-and-suspenders -- the gate above should
+                    # have caught this. Surface as fail not skip so
+                    # the operator notices the inconsistency.
                     run.fail(
                         rec.partner_id, "missing_email_post_approval",
                         f"draft_id={rec.draft_id} approved but partner "

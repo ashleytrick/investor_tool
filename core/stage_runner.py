@@ -222,8 +222,15 @@ def stage_run(
                           f"clients/{ws.name}/config/*.yaml "
                           f"(and prompts/examples/) then re-run.")
                     ctx.refuse_unsafe(summary)
-                    yield ctx
-                    return
+                    # Issue #1: don't yield. The stage body must NOT
+                    # execute after preflight refusal -- yielding lets
+                    # the caller's `with stage_run(...)` body run to
+                    # completion against a half-initialized workspace.
+                    # SystemExit triggers RunLogger.__exit__ (commits the
+                    # refusal row) + the outer `finally` (releases lock),
+                    # then propagates so the script exits with the
+                    # REFUSED_UNSAFE code.
+                    raise SystemExit(ctx.exit_code)
             yield ctx
     finally:
         # Release the workspace lock no matter how the stage exits.

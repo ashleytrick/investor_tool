@@ -5,16 +5,23 @@ and prints OK / BLOCKED per check + a one-line summary at the end.
 Designed for cron-friendly use: exits 0 when nothing is blocking
 a send pass, non-zero when at least one check fails.
 
-Checks (rough first cut, Slice 3):
+Checks:
 
-  1. Workspace config valid (calls validate_workspace_config)
-  2. Pipeline stages have run recently (Stage 6 completed within
-     STALE_STAGE6_HOURS; Stage 7 has a batch_qa_report)
-  3. Approval queue is non-empty OR there are approved drafts (i.e.
-     the operator has something to do or has done it)
-  4. Approved drafts have valid partner emails
-  5. No do_not_contact partners have approved drafts
-  6. Workspace mode + integration availability sanity check
+  1. mode -- workspace is not in fixture mode
+  2. workspace_config -- required configs present
+  3. stage6_freshness -- Stage 6 completed within STALE_STAGE6_HOURS
+  4. approval_pipeline -- something is in the queue or already approved
+  5. approved_have_emails -- defense-in-depth against gate gaps
+  6. no_dnc_approvals -- defense-in-depth against gate gaps
+  7. approved_gate_clean -- every approved_to_send draft still passes
+     the LIVE approval gate (catches generic/role mailboxes,
+     invalid/risky verification, suppression flipped on after
+     approval, qa_status regressions -- the same checks Slices 7-9
+     added to the approval gate, re-run at "ready to send" time)
+  8. no_duplicate_recipients -- no two approved drafts target the
+     same partner_email
+  9. daily_cap_headroom -- today's approval count is below the cap
+     (informational; sends still legal until cap hits)
 
 Output format:
   [check_ready] {section}: OK / BLOCKED -- {reason}
@@ -23,10 +30,6 @@ Output format:
 
 Exit code 0 = safe to proceed; 1 = blocked; 2 = error running the
 check itself.
-
-Future slices will expand the surface (deliverability, relationship
-suppression, scheduling-link reachability) but the API stays the
-same: each check returns CheckResult(name, ok, message).
 """
 from __future__ import annotations
 
@@ -40,12 +43,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import desc, select
 
+from core.approval.gate import can_approve_draft
 from core.approval.persistence import approved_for_send, pending_review
 from core.approval.state_machine import STATE_APPROVED_TO_SEND
 from core.banner import print_banner
 from core.config_loader import add_workspace_arg, load_workspace
 from core.db import (
     email_drafts, get_engine, partners, runs,
+)
+from core.deliverability import (
+    configured_daily_cap, enforce_daily_approval_cap,
 )
 from core.validate_config import validate_workspace_config
 
@@ -199,6 +206,105 @@ def _check_no_dnc_approvals(engine) -> CheckResult:
     )
 
 
+def _check_approved_gate_clean(ws, engine, allow_example_domains: bool) -> CheckResult:
+    """Re-run the canonical approval gate over every approved_to_send
+    draft. This catches Slices 7-9 conditions that can regress AFTER
+    the operator approved (DNC flipped on, verification went invalid,
+    partner email cleared, qa_status revised by a Stage 7 re-run).
+
+    The gate is the single source of truth -- using it here keeps
+    check_ready in sync as the gate grows.
+    """
+    approved = approved_for_send(engine)
+    if not approved:
+        return CheckResult(
+            "approved_gate_clean", True, "no approved drafts to re-check",
+        )
+    stale: list[tuple[int, tuple[str, ...]]] = []
+    for d in approved:
+        gate = can_approve_draft(
+            ws, engine, d.draft_id,
+            allow_example_domains=allow_example_domains,
+        )
+        if not gate.ok:
+            stale.append((d.draft_id, gate.blockers))
+    if not stale:
+        return CheckResult(
+            "approved_gate_clean", True,
+            f"all {len(approved)} approved drafts still pass the gate",
+        )
+    sample = "; ".join(
+        f"draft_id={did}: {', '.join(blockers[:2])}"
+        + ("..." if len(blockers) > 2 else "")
+        for did, blockers in stale[:3]
+    )
+    return CheckResult(
+        "approved_gate_clean", False,
+        f"{len(stale)} approved draft(s) now have live blockers; "
+        f"re-approve or reject. Sample: {sample}",
+    )
+
+
+def _check_no_duplicate_recipients(engine) -> CheckResult:
+    """Two approved drafts pointing at the same partner_email would
+    produce two sends to the same person -- noisy + likely to bounce
+    the second."""
+    approved = approved_for_send(engine)
+    if not approved:
+        return CheckResult(
+            "no_duplicate_recipients", True, "no approved drafts to check",
+        )
+    with engine.begin() as conn:
+        email_by_pid = {
+            r.partner_id: (r.email or "").strip().lower()
+            for r in conn.execute(
+                select(partners.c.partner_id, partners.c.email),
+            )
+        }
+    seen: dict[str, list[int]] = {}
+    for d in approved:
+        email = email_by_pid.get(d.partner_id) or ""
+        if not email:
+            continue  # covered by approved_have_emails
+        seen.setdefault(email, []).append(d.draft_id)
+    dupes = {e: ids for e, ids in seen.items() if len(ids) > 1}
+    if not dupes:
+        return CheckResult(
+            "no_duplicate_recipients", True,
+            f"{len(seen)} unique recipient(s) across approved drafts",
+        )
+    sample = ", ".join(
+        f"{email!r} -> draft_ids={ids}"
+        for email, ids in list(dupes.items())[:3]
+    )
+    return CheckResult(
+        "no_duplicate_recipients", False,
+        f"{len(dupes)} email(s) appear on >1 approved draft: {sample}",
+    )
+
+
+def _check_daily_cap_headroom(ws, engine) -> CheckResult:
+    """Informational: how close are we to today's approval cap? Caller
+    can refuse based on this OR proceed -- the cap exists to throttle
+    cold sends, not to block them entirely.
+
+    Finding 6: cap reads from company.yaml's
+    `deliverability.daily_approval_cap` via configured_daily_cap()."""
+    cap = configured_daily_cap(ws)
+    blocked, count = enforce_daily_approval_cap(engine, cap=cap)
+    if blocked:
+        return CheckResult(
+            "daily_cap_headroom", False,
+            f"{count} approvals today / cap {cap} -- new approvals "
+            f"refused until UTC rollover unless --override-cap. "
+            f"Existing approved drafts can still send.",
+        )
+    return CheckResult(
+        "daily_cap_headroom", True,
+        f"{count} approvals today (cap {cap})",
+    )
+
+
 def _check_mode(ws) -> CheckResult:
     mode = getattr(ws, "mode", None) or "(unset)"
     if mode == "fixture":
@@ -211,7 +317,7 @@ def _check_mode(ws) -> CheckResult:
     return CheckResult("mode", True, f"mode={mode}")
 
 
-def _run_all_checks(ws, engine) -> list[CheckResult]:
+def _run_all_checks(ws, engine, *, allow_example_domains: bool) -> list[CheckResult]:
     return [
         _check_mode(ws),
         _check_config(ws),
@@ -219,6 +325,9 @@ def _run_all_checks(ws, engine) -> list[CheckResult]:
         _check_approval_pipeline(engine),
         _check_approved_have_emails(engine),
         _check_no_dnc_approvals(engine),
+        _check_approved_gate_clean(ws, engine, allow_example_domains),
+        _check_no_duplicate_recipients(engine),
+        _check_daily_cap_headroom(ws, engine),
     ]
 
 
@@ -231,13 +340,20 @@ def main() -> int:
         "--quiet", action="store_true",
         help="Only print BLOCKED lines + the summary.",
     )
+    parser.add_argument(
+        "--allow-example-domains", action="store_true",
+        help="Accept .example fixture data through the approval gate "
+             "re-check. Useful for fixture smoke tests.",
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
     print_banner(ws, stage="check_ready")
 
-    results = _run_all_checks(ws, engine)
+    results = _run_all_checks(
+        ws, engine, allow_example_domains=args.allow_example_domains,
+    )
     blocked = [r for r in results if not r.ok]
     passed = [r for r in results if r.ok]
     for r in results:

@@ -176,15 +176,18 @@ def test_import_overwrite_replaces_and_invalidates_approvals():
             "where is_recommended=1 limit 1"
         ).fetchone()
         c.execute(
-            "update partners set email='old@incumbent.example' "
-            "where partner_id = ?", (pid,),
+            "update partners set email='old@incumbent.example', "
+            "email_verification_status='valid' where partner_id = ?",
+            (pid,),
         )
         c.commit()
         c.close()
-        # Approve the draft.
+        # Approve the draft. --allow-example-domains so the approval
+        # gate (Finding 2) accepts the fixture's .example data.
         subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
-             "--workspace", ws, "--draft-id", str(draft_id)],
+             "--workspace", ws, "--draft-id", str(draft_id),
+             "--allow-example-domains"],
             check=True, capture_output=True,
             env={**os.environ, "USER": "tester"}, timeout=60,
         )
