@@ -194,50 +194,43 @@ def _fetch_live_partner_content(
         stype = row.get("source_type") or "blog"
         by_partner[pid].append((stype, url))
 
+    # Shared fetch + snapshot helper (core/source_fetch.py, Refactor
+    # item 5). One call per URL captures transport errors, non-200
+    # statuses, and empty-body 200s as failure snapshots; we still
+    # log + bump run.failed via the existing audit pattern so cron /
+    # wrappers see partial-fetch failures.
+    from core.source_fetch import fetch_and_record_sync
+
     for pid, items in by_partner.items():
         sources: list[dict] = []
         for stype, url in items:
-            try:
-                res = asyncio.run(client.fetch(url))
-            except Exception as exc:  # noqa: BLE001 - log + audit, move on
-                print(f"[stage 4] {pid} fetch {url} failed: {exc}")
-                # Batch 36 (#8/#12): record in run_errors AND snapshot
-                # so the audit captures the failed attempt.
-                run.log_error(
-                    f"{pid}:{url}", "fetch_failed", str(exc),
+            outcome = fetch_and_record_sync(
+                engine, client, url, stage=STAGE,
+            )
+            if outcome.error or not outcome.ok:
+                print(
+                    f"[stage 4] {pid} {url} -> {outcome.error}; skipping"
                 )
-                upsert_snapshot_failure(
-                    engine, url, http_status=-1, final_url=None,
-                    note=str(exc),
+                run.log_error(
+                    f"{pid}:{url}",
+                    "fetch_failed" if outcome.status < 0 else "http_error",
+                    outcome.error or f"HTTP {outcome.status}",
                 )
                 run.failed += 1
                 continue
-            if res.status != 200 or not res.text:
-                print(f"[stage 4] {pid} {url} -> HTTP {res.status}; skipping")
-                run.log_error(
-                    f"{pid}:{url}", "http_error",
-                    f"HTTP {res.status} (final_url={res.final_url!r})",
-                )
-                upsert_snapshot_failure(
-                    engine, url, http_status=res.status,
-                    final_url=res.final_url,
-                    note=f"HTTP {res.status}",
-                )
-                run.failed += 1
-                continue
-            text = HTMLParser(res.text).text(separator=" ", strip=True)
+            text = HTMLParser(outcome.text).text(separator=" ", strip=True)
             if not text:
                 run.log_error(
                     f"{pid}:{url}", "empty_body",
                     f"HTTP 200 but extracted text was empty "
-                    f"(final_url={res.final_url!r})",
+                    f"(final_url={outcome.final_url!r})",
                 )
                 run.failed += 1
                 continue
             sources.append({
                 "source_type": stype,
                 "source_url": url,
-                "final_url": res.final_url,
+                "final_url": outcome.final_url,
                 "quote_date": None,
                 "text": text,
             })
