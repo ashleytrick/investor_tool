@@ -164,3 +164,58 @@ def test_refactor_batch_a_stage_runner_basic():
         assert "synthetic safety gate fired" in (rows[2][2] or "")
         assert rows[3][1] == 1       # refuse_unsafe: forced to 1
         assert "explicit unsafe" in (rows[3][2] or "")
+
+
+def test_preflight_failure_lands_in_runs_not_silent_sys_exit():
+    """Launch-blocker fix: a workspace with a config issue used to cause
+    stage_run() to call preflight_or_exit() -> sys.exit(2) BEFORE the
+    RunLogger context opened, so the refusal was invisible in `runs`.
+
+    Now preflight runs INSIDE the RunLogger context; ctx.refuse_unsafe
+    is called with the issue list and the run row commits with
+    records_failed >= 1 and error_summary populated. status.py /
+    audit then sees the refusal.
+    """
+    import argparse
+    import shutil
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from core.stage_runner import stage_run
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        # Corrupt the workspace config so preflight refuses. Remove
+        # axes.yaml -- that triggers the "config/axes.yaml missing"
+        # issue in validate_workspace_config.
+        (ws_dst / "config" / "axes.yaml").unlink()
+
+        args = argparse.Namespace(workspace=str(ws_dst))
+        with stage_run(
+            args, stage="test_preflight_refusal", require_llm=False,
+        ) as ctx:
+            # Body runs against a refused ctx; the test exits early
+            # the way real scripts will via `return ctx.exit_code`.
+            assert ctx.exit_code == 3  # REFUSED_UNSAFE
+
+        # Run row landed with the refusal note.
+        c = sqlite3.connect(db)
+        row = c.execute(
+            "select records_failed, error_summary from runs "
+            "where stage='test_preflight_refusal' order by run_id desc limit 1"
+        ).fetchone()
+        c.close()
+        assert row is not None, (
+            "preflight refusal must produce a runs row -- the prior "
+            "shape sys.exit'd before RunLogger opened"
+        )
+        records_failed, error_summary = row
+        assert records_failed >= 1
+        assert error_summary and "REFUSED" in error_summary
+        assert "axes.yaml" in error_summary

@@ -65,7 +65,7 @@ from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
 from core.runs import RunLogger
 from core.stage_result import StageResult
-from core.validate_config import preflight_or_exit
+from core.validate_config import preflight_or_exit, validate_workspace_config
 
 
 @dataclass
@@ -156,15 +156,13 @@ def stage_run(
         should always leave this False.
     """
     ws = load_workspace(getattr(args, "workspace", None))
-    if not skip_preflight:
-        preflight_or_exit(
-            ws, stage=stage,
-            require_anthropic=require_anthropic,
-            require_attio=require_attio,
-            require_examples=require_examples,
-        )
     print_banner(ws, stage=stage)
     engine = get_engine(ws.db_url)
+    # Launch-blocker fix: preflight runs INSIDE the RunLogger context
+    # so a missing API key / config issue lands as a refusal row in
+    # `runs` (status.py / audit can see it) rather than being a
+    # silent sys.exit(2) before any row was created. The previous
+    # shape ran preflight_or_exit() before RunLogger opened.
     llm = None
     if require_llm:
         # Import lazily so non-LLM stages don't pay the cost.
@@ -177,4 +175,26 @@ def stage_run(
             args=args, ws=ws, engine=engine, run=run, llm=llm,
             stage=stage,
         )
+        if not skip_preflight:
+            issues = validate_workspace_config(
+                ws,
+                require_anthropic=require_anthropic,
+                require_attio=require_attio,
+                require_examples=require_examples,
+            )
+            if issues:
+                summary = (
+                    f"REFUSED: workspace config has {len(issues)} "
+                    f"issue(s): " + "; ".join(issues)
+                )
+                print(f"[{stage}] REFUSED: workspace config has "
+                      f"{len(issues)} issue(s):")
+                for s in issues:
+                    print(f"  - {s}")
+                print(f"[{stage}] edit "
+                      f"clients/{ws.name}/config/*.yaml "
+                      f"(and prompts/examples/) then re-run.")
+                ctx.refuse_unsafe(summary)
+                yield ctx
+                return
         yield ctx
