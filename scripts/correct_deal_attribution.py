@@ -42,7 +42,7 @@ from core.db import (
     deal_attribution_overrides, deal_attributions, funds, get_engine,
     partners,
 )
-from core.runs import RunLogger
+from core.operator_command import operator_command_run
 
 STAGE = "correct_deal_attribution"
 
@@ -74,13 +74,13 @@ def main() -> int:
         help="Operator identifier (defaults to $USER).",
     )
     args = parser.parse_args()
-
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
     operator = args.created_by or os.environ.get("USER") or "unknown"
 
+    # --list is read-only -- skip the lock + backup overhead.
     if args.list:
+        ws = load_workspace(args.workspace)
+        engine = get_engine(ws.db_url)
+        print_banner(ws, stage=STAGE)
         with engine.begin() as conn:
             rows = list(conn.execute(
                 select(deal_attribution_overrides)
@@ -99,7 +99,8 @@ def main() -> int:
     if not args.source_url:
         parser.error("--source-url is required unless --list")
 
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
         if args.clear:
             with engine.begin() as conn:
                 deleted = conn.execute(

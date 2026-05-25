@@ -43,10 +43,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.banner import print_banner
-from core.config_loader import add_workspace_arg, load_workspace
-from core.db import get_engine, partner_score_summaries, partners
-from core.runs import RunLogger
+from core.config_loader import add_workspace_arg
+from core.db import partner_score_summaries, partners
+from core.operator_command import operator_command_run
 
 STAGE = "manual_override"
 
@@ -113,11 +112,8 @@ def main() -> int:
             "--clear-score / --clear-rec / --clear-warm require --clear"
         )
 
-    ws = load_workspace(args.workspace)
-    engine = get_engine(ws.db_url)
-    print_banner(ws, stage=STAGE)
-
-    with RunLogger(engine, ws.name, STAGE) as run:
+    with operator_command_run(args, stage=STAGE) as ctx:
+        engine, run = ctx.engine, ctx.run
         if args.list:
             # Findings 50, 55: show the FROZEN values + freshness so the
             # operator can see WHAT they pinned and how stale it is.
