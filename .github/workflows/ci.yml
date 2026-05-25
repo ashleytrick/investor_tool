@@ -8,7 +8,10 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Full suite takes ~6.5 minutes locally; 15 gives headroom for
+    # GHA cold starts + the e2e tests that subprocess-spawn the
+    # pipeline. Bumped from 5 (which cancelled every recent run).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
