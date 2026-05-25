@@ -36,7 +36,18 @@ from core.llm.client import MODEL_BATCH
 from schemas.fund_enrichment import FundEnrichment
 
 STAGE = "02_enrich_funds"
-LIVE_PATHS = ["", "portfolio", "team", "thesis", "about", "news"]
+# Required pages: failing to fetch any of these means the fund row
+# can't be enriched meaningfully -- the homepage is the canonical
+# source for fund identity, thesis, and team lookup. A transport /
+# 5xx failure on a REQUIRED path becomes a per-fund run.fail in
+# gather_live_pages's caller.
+LIVE_PATHS_REQUIRED: tuple[str, ...] = ("",)
+# Optional pages: useful context when they fetch, but a missing
+# /portfolio or /news is normal and shouldn't bump run.failed.
+LIVE_PATHS_OPTIONAL: tuple[str, ...] = (
+    "portfolio", "team", "thesis", "about", "news",
+)
+LIVE_PATHS = list(LIVE_PATHS_REQUIRED + LIVE_PATHS_OPTIONAL)
 PROMPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "enrich_fund.txt"
 
 
@@ -69,36 +80,52 @@ def gather_fixture_pages(fund: dict, ws) -> dict[str, str]:
 
 async def gather_live_pages(
     fund: dict,
-) -> tuple[dict[str, dict], list[tuple[str, str]]]:
-    """Fetch standard fund pages. Returns ({url: {html, final_url}}, failures)
-    where failures is a list of (url, reason) tuples for the operator
-    audit trail.
+) -> tuple[dict[str, dict], list[tuple[str, str]], list[tuple[str, str]]]:
+    """Fetch standard fund pages. Returns
+    (pages_by_url, required_failures, optional_failures) where the
+    failure lists are (url, reason) tuples for the operator audit trail.
 
-    Batch 36 (#13): result dict now carries final_url alongside the
-    HTML so store_snapshots can persist the post-redirect URL into
-    source_snapshots.final_url. Previously the post-redirect URL was
-    discarded.
+    Required failures (transport / 5xx on a REQUIRED path) signal that
+    the fund can't be enriched at all -- Stage 2's caller counts each
+    as a per-fund run.fail so cron / wrappers notice. Optional
+    failures (transport / 5xx on a NICE-TO-HAVE path) are logged for
+    audit but don't bump run.failed; a missing /portfolio is normal.
 
-    Non-200 responses are still ignored (a missing /portfolio is normal),
+    Batch 36 (#13): result dict carries final_url alongside the HTML so
+    store_snapshots can persist the post-redirect URL into
+    source_snapshots.final_url.
+
+    Non-200 4xx responses are still ignored (a missing /portfolio is
+    normal and Attio-like sites often 404 paths that don't exist),
     but transport-layer errors and 5xx responses are surfaced to the
     caller so they can land in run_errors.
     """
     client = HttpClient()
     pages: dict[str, dict] = {}
-    failures: list[tuple[str, str]] = []
+    required_failures: list[tuple[str, str]] = []
+    optional_failures: list[tuple[str, str]] = []
     for path in LIVE_PATHS:
+        is_required = path in LIVE_PATHS_REQUIRED
         url = _page_url(fund["domain"], path)
         try:
             res = await client.fetch(url)
-        except Exception as exc:  # noqa: BLE001 - audited via `failures`
-            failures.append((url, f"{type(exc).__name__}: {exc}"))
+        except Exception as exc:  # noqa: BLE001 - audited via failures
+            bucket = required_failures if is_required else optional_failures
+            bucket.append((url, f"{type(exc).__name__}: {exc}"))
             continue
         if res.status == 200 and res.text.strip():
             pages[url] = {"html": res.text, "final_url": res.final_url}
-        elif res.status >= 500:
-            # Server errors are interesting; 404 is not.
-            failures.append((url, f"HTTP {res.status}"))
-    return pages, failures
+            continue
+        if res.status >= 500:
+            bucket = required_failures if is_required else optional_failures
+            bucket.append((url, f"HTTP {res.status}"))
+            continue
+        # 4xx on a REQUIRED path is also a hard fund-level problem:
+        # we asked for the homepage and got "not here". Optional 4xx
+        # stays silent.
+        if is_required and res.status >= 400:
+            required_failures.append((url, f"HTTP {res.status}"))
+    return pages, required_failures, optional_failures
 
 
 def deterministic_enrichment(pages: dict) -> dict:
@@ -263,14 +290,31 @@ def main() -> int:
                 try:
                     if args.fixtures:
                         pages = gather_fixture_pages(fund, ws)
-                        fetch_failures: list[tuple[str, str]] = []
+                        required_failures: list[tuple[str, str]] = []
+                        optional_failures: list[tuple[str, str]] = []
                     else:
-                        pages, fetch_failures = asyncio.run(gather_live_pages(fund))
-                    # Surface per-URL fetch failures in run_errors so an operator
-                    # auditing a degraded enrichment can see WHY pages were missing.
-                    for url, reason in fetch_failures:
+                        pages, required_failures, optional_failures = (
+                            asyncio.run(gather_live_pages(fund))
+                        )
+                    # Launch-blocker fix: a homepage (REQUIRED path)
+                    # fetch failure was previously logged but didn't
+                    # bump run.failed, so a fund whose homepage 5xx'd
+                    # while a couple optional paths fetched could exit
+                    # 0 -- a "degraded cleanly" failure mode. Required-
+                    # path failures now bump run.failed via run.fail()
+                    # so cron / wrappers see exit 2 when enrichment
+                    # has degraded broadly. Optional failures still
+                    # log for audit but don't bump the counter (a
+                    # missing /portfolio is normal site shape).
+                    for url, reason in required_failures:
+                        run.fail(
+                            f"{fund['fund_id']}:{url}",
+                            "required_fetch_failed", reason,
+                        )
+                    for url, reason in optional_failures:
                         run.log_error(
-                            f"{fund['fund_id']}:{url}", "fetch_failed", reason
+                            f"{fund['fund_id']}:{url}",
+                            "optional_fetch_failed", reason,
                         )
                     if not pages:
                         # A fund with zero fetched pages has nothing for
