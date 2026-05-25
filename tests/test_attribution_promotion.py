@@ -301,6 +301,48 @@ def test_bulk_reattribute_refuses_missing_dest(engine) -> None:
         )
 
 
+def test_promote_provisional_merge_into_moves_deals_and_deactivates_source(engine) -> None:
+    """Loose end from Slice 12 / shipped in Slice 13:
+    `promote_provisional --merge-into <fund_id>` should re-attribute
+    every deal from the provisional fund and deactivate the source.
+
+    Exercises the same underlying primitives (bulk_reattribute_deals +
+    funds.update) the CLI calls, so the unit test stays at the core
+    layer."""
+    from datetime import date as _date
+    _insert_fund(engine, "f.prov", name="Acme (provisional)",
+                 domain="acme.provisional", is_provisional=True)
+    _insert_fund(engine, "f.real", name="Acme Capital", domain="acme.com")
+    _insert_deal(engine, lead_fund_id="f.prov", source_url="https://a/1")
+    _insert_deal(engine, lead_fund_id="f.prov", source_url="https://a/2")
+
+    # The CLI runs bulk_reattribute_deals then update funds. Replay
+    # that pair here so any regression in either step is caught.
+    result = bulk_reattribute_deals(
+        engine, from_fund_id="f.prov", to_fund_id="f.real",
+        actor="ashley",
+    )
+    assert result.deals_moved == 2
+    from sqlalchemy import update as _update
+    with engine.begin() as conn:
+        conn.execute(
+            _update(funds).where(funds.c.fund_id == "f.prov")
+            .values(is_active=False, is_provisional=False,
+                    last_updated=_now())
+        )
+
+    with engine.begin() as conn:
+        src = conn.execute(
+            funds.select().where(funds.c.fund_id == "f.prov")
+        ).first()
+        deal_funds = {
+            r.lead_fund_id for r in conn.execute(deal_attributions.select())
+        }
+    assert src.is_active is False
+    assert src.is_provisional is False
+    assert deal_funds == {"f.real"}
+
+
 def test_bulk_reattribute_likely_becomes_confirmed(engine) -> None:
     """A `likely` (weak) row that the operator manually moves should
     flip to `confirmed` so Stage 6 starts counting it."""

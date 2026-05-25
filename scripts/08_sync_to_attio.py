@@ -194,6 +194,21 @@ def main() -> int:
             run.note(msg)
             run.failed = max(run.failed, 1)
             return ctx.exit_code
+
+        # Slice 13: dry_run mode never calls the Attio mutation API.
+        # Reads/local writes proceed normally but the actual network
+        # writes are refused with a clean skip so an operator can
+        # validate a workspace without touching the CRM.
+        if policy.refuses_external_mutation() and policy.mode == "dry_run":
+            msg = (
+                "SKIP: workspace mode=dry_run; Attio writes refused. "
+                "Set mode: production in company.yaml when ready to "
+                "ship to the real CRM."
+            )
+            print(f"[stage 8] {msg}")
+            run.note(msg)
+            run.skipped = 1
+            return ctx.exit_code
         cfg = ws.attio or {}
         attio_cfg = cfg.get("attio") or cfg
 

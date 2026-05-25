@@ -87,6 +87,23 @@ def main() -> int:
             f"fictional partners. Pass --allow-fixture-mode to override."
         )
         return 2
+
+    # Slice 13: dry_run mode never pushes drafts to the real Gmail
+    # API. The operator can still see what WOULD be queued by reading
+    # send_queue.csv or running export_send_queue; this script just
+    # short-circuits the network call.
+    if policy.refuses_external_mutation() and policy.mode == "dry_run":
+        with RunLogger(engine, ws.name, STAGE) as run:
+            msg = (
+                "SKIP: workspace mode=dry_run; Gmail draft push "
+                "refused. Switch to mode: production when ready to "
+                "actually create drafts."
+            )
+            print(f"[gmail_drafts] {msg}")
+            run.note(msg)
+            run.skipped = 1
+        return 0
+
     founder_email = (ws.company.get("company") or {}).get("founder_email")
 
     # Batch 35: open RunLogger BEFORE the GmailNotConfigured branch so

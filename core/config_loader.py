@@ -111,21 +111,53 @@ class Workspace:
         self.sources = _load_yaml(self.config_dir / "sources.yaml")
         self.attio = _load_yaml(self.config_dir / "attio.yaml")
 
-        # Batch 30 (#528): explicit environment type. Operators declare
-        # whether a workspace is fixture/dev/prod by adding `mode: ...`
-        # to company.yaml. Defaults to "dev" so existing workspaces
-        # remain unaffected. The fixture clients/test_workspace declares
-        # mode=fixture so Stage 8 / Gmail draft creation can refuse to
-        # touch it without an explicit override.
+        # Explicit environment type. Operators declare whether a
+        # workspace is fixture / dry_run / production by adding
+        # `mode: ...` to company.yaml. Defaults to "dry_run" so
+        # workspaces without an explicit mode never accidentally
+        # touch real external systems.
+        #
+        # Slice 13 canonical names:
+        #   fixture     -- shipped test_workspace; .example data only,
+        #                  external syncs refuse outright.
+        #   dry_run     -- real workspace data; reads OK, external
+        #                  mutations refused regardless of credentials.
+        #                  (Replaces the old "dev" mode -- still
+        #                  permissive on missing integrations.)
+        #   production  -- real workspace, real outreach, integrations
+        #                  REQUIRED (missing = hard fail).
+        #
+        # Legacy names "prod" + "dev" are accepted as aliases with a
+        # one-line deprecation warning so existing workspaces don't
+        # break mid-refactor. Migrate company.yaml mode: at your
+        # convenience.
         raw_mode = (
             (self.company or {}).get("mode")
             or (self.company or {}).get("workspace", {}).get("mode")
-            or "dev"
+            or "dry_run"
         )
-        if raw_mode not in ("fixture", "dev", "prod"):
+        if raw_mode == "prod":
+            import sys as _sys
+            print(
+                f"[config_loader] WARN: mode='prod' in "
+                f"{self.config_dir / 'company.yaml'} is deprecated; "
+                f"rename to 'production'.",
+                file=_sys.stderr,
+            )
+            raw_mode = "production"
+        elif raw_mode == "dev":
+            import sys as _sys
+            print(
+                f"[config_loader] WARN: mode='dev' in "
+                f"{self.config_dir / 'company.yaml'} is deprecated; "
+                f"rename to 'dry_run'.",
+                file=_sys.stderr,
+            )
+            raw_mode = "dry_run"
+        if raw_mode not in ("fixture", "dry_run", "production"):
             raise SystemExit(
                 f"company.yaml mode={raw_mode!r} must be one of "
-                f"'fixture', 'dev', or 'prod'."
+                f"'fixture', 'dry_run', or 'production'."
             )
         self.mode: str = raw_mode
 
