@@ -50,40 +50,22 @@ STAGE = "08_sync_to_attio"
 
 # Attribute keys that Attio represents as single-select values (must be sent
 # as [{"option": {"title": "..."}}]). Everything else uses [{"value": ...}].
-SELECT_SLUGS: set[str] = {
-    "stage_focus", "score_confidence", "email_strategy_used",
-    "email_alternate_strategy", "template_smell", "outreach_status",
-    "meeting_outcome", "reply_type",
-}
+# Payload assembly moved to core/attio/payload.py (Refactor 7/15).
+# SELECT_SLUGS / wrap_value / build_payload re-exported for any external
+# importer; build_fund_payload / build_partner_payload are new helpers
+# the orchestrator below uses.
+from core.attio.payload import (  # noqa: E402
+    SELECT_SLUGS,
+    _wrap_value,
+    build_fund_payload,
+    build_partner_payload,
+    build_payload,
+    wrap_value,
+)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _wrap_value(value, api_slug: str):
-    """Convert a raw db value to the Attio v2 value-list shape."""
-    if value is None or value == "":
-        return None
-    if api_slug in SELECT_SLUGS:
-        return [{"option": {"title": str(value)}}]
-    if isinstance(value, bool):
-        return [{"value": value}]
-    if isinstance(value, (int, float)):
-        return [{"value": value}]
-    if hasattr(value, "isoformat"):
-        return [{"value": value.isoformat()}]
-    return [{"value": str(value)}]
-
-
-def build_payload(attr_map: dict[str, str], source: dict) -> dict:
-    """For each (db_key, api_slug) pair, pull source[db_key] and wrap."""
-    payload: dict = {}
-    for db_key, api_slug in attr_map.items():
-        wrapped = _wrap_value(source.get(db_key), api_slug)
-        if wrapped is not None:
-            payload[api_slug] = wrapped
-    return payload
 
 
 def log_sync(engine, *, object_type, local_id, attio_record_id, operation,
@@ -301,14 +283,12 @@ def main() -> int:
                     )
                     continue
                 source = dict(f._mapping)
-                # `domains` on Attio takes a list of {domain: "..."} objects.
-                base_payload = {
-                    "name": [{"value": f.name}],
-                    "domains": [{"domain": f.domain}] if f.domain else None,
-                }
-                base_payload = {k: v for k, v in base_payload.items() if v is not None}
-                custom_payload = build_payload(fund_attr_map, source)
-                payload = {**base_payload, **custom_payload}
+                payload = build_fund_payload(
+                    fund_name=f.name,
+                    fund_domain=f.domain,
+                    fund_source=source,
+                    attr_map=fund_attr_map,
+                )
                 try:
                     # Batch 38 (#52): record the payload to attio_sync_log
                     # BEFORE the API call so the operator can replay / debug.
@@ -453,21 +433,17 @@ def main() -> int:
                         "followup_email_draft": followups_by_partner.get(p.partner_id),
                         "deck_request_response": deck_by_partner.get(p.partner_id),
                     })
-                    custom_payload = build_payload(partner_attr_map, source)
-
                     fund_attio_id = (
                         fund_attio_ids.get(p.fund_id)
                         or _lookup_fund_attio_id(engine, p.fund_id)
                     )
-                    base_payload = {
-                        "name": [{"value": p.partner_name}],
-                    }
-                    if fund_attio_id:
-                        base_payload["company"] = [{
-                            "target_object": fund_object,
-                            "target_record_id": fund_attio_id,
-                        }]
-                    payload = {**base_payload, **custom_payload}
+                    payload = build_partner_payload(
+                        partner_name=p.partner_name,
+                        partner_source=source,
+                        attr_map=partner_attr_map,
+                        fund_object=fund_object,
+                        fund_attio_id=fund_attio_id,
+                    )
 
                     # Match cascade for an existing Attio record:
                     #   0. partners.attio_record_id (from a prior sync) -> GET it
