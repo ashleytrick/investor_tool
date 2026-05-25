@@ -366,8 +366,20 @@ partner_score_summaries = Table(
     Column("recommended_to_send", Boolean),
     Column("recommendation_reasoning", Text),
     Column("scored_at", DateTime),
+    # Slice 10: round-building model adds an investor role + a
+    # confidence band so batch selection can balance roles instead
+    # of pure top-N. Set by core/scoring/round_building.py.
+    # investor_role values:
+    #   potential_lead | strong_co_investor | strategic_specialist
+    #   | credible_signal_investor | wildcard_high_conviction_fit
+    #   | low_priority
+    Column("investor_role", Text),
+    # confidence_band values:
+    #   high | medium | low | insufficient_evidence
+    Column("confidence_band", Text),
     # Stage 7 orders by send_now_priority DESC LIMIT N every run.
     Index("ix_pss_send_now_priority", "send_now_priority"),
+    Index("ix_pss_investor_role", "investor_role"),
 )
 
 email_drafts = Table(

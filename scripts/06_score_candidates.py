@@ -485,6 +485,32 @@ def main() -> int:
                     if recommended:
                         recommended_count += 1
 
+                    # Slice 10: round-building classification.
+                    # Counts q3 + non-NULL axis scores from the
+                    # candidate's per-axis dict so the classifier sees
+                    # the same evidence Stage 6 already gathered.
+                    q3_count = sum(
+                        1 for s in p_signals if int(s.get("quality") or 0) >= 3
+                    )
+                    scored_axes = sum(
+                        1 for ax_data in cs.axis_scores.values()
+                        if ax_data.score is not None
+                    )
+                    from core.scoring.round_building import classify
+                    rb = classify(
+                        composite_fit_score=composite,
+                        round_fit_score=rf.round_fit_score,
+                        lead_likelihood_score=ll.lead_likelihood_score,
+                        spiky_belief_score=spiky,
+                        axis_max_score=axis_max,
+                        scored_axes_count=scored_axes,
+                        verified_q3_signal_count=q3_count,
+                        deal_attribution_count=len(
+                            partner_deals.get(p.partner_id, []),
+                        ),
+                        has_disqualifier=rf.disqualifier_present,
+                    )
+
                     # ---- build values dict; preserve overridden fields/flags ----
                     new_values = {
                         "partner_id": p.partner_id,
@@ -507,6 +533,8 @@ def main() -> int:
                         "lead_likelihood_score": ll.lead_likelihood_score,
                         "lead_likelihood_signals": ll.lead_likelihood_signals,
                         "send_now_priority": send_now,
+                        "investor_role": rb.investor_role,
+                        "confidence_band": rb.confidence_band,
                         "employment_status": p.employment_status,
                         "recommended_to_send": recommended,
                         "recommendation_reasoning": rec_reason,
