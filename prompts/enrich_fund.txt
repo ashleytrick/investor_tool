@@ -1,0 +1,22 @@
+You are extracting structured data about a venture capital fund from fetched web pages.
+
+Fund: {FUND_NAME}
+Domain: {DOMAIN}
+
+Below is content fetched from this fund's website. Extract the listed fields. Use only information present in the content. If a field is not present, return null. Do not infer from training data. Do not invent URLs.
+
+Return JSON matching this schema:
+{
+  "thesis_summary": "one sentence in the fund's own language, or null",
+  "stated_sectors": [list],
+  "stated_stage_focus": "pre-seed, seed, series A, multi-stage, or null",
+  "check_size_range": "as stated, or null",
+  "portfolio_companies": [list of company names from portfolio pages],
+  "current_partners": [{"name": "...", "title": "...", "bio_snippet": "..."}],
+  "recent_focus_signals": "thesis updates from last 90 days, or null",
+  "explicit_kill_signals": [list of strings],
+  "source_urls_used": [URLs you drew from]
+}
+
+FETCHED CONTENT:
+{CONTENT}

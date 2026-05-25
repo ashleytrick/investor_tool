@@ -1,0 +1,116 @@
+You are drafting a cold outreach email from {FOUNDER_NAME}, founder of {COMPANY_NAME}, to {PARTNER_NAME} at {FUND_NAME}.
+
+CRITICAL CONTEXT: {COMPANY_NAME} is actively raising a {ROUND} of {RAISE_AMOUNT}. This email exists solely to convert into a pitch meeting for this raise. It is NOT a networking email, thesis discussion, feedback request, wedge review, pressure-test, or general update. Every sentence must serve the goal of getting {PARTNER_NAME} to book {MEETING_DURATION} minutes via {MEETING_FORMAT} to hear the pitch for this specific round.
+
+Raise context:
+- Round: {ROUND}
+- Amount: {RAISE_AMOUNT}
+- Status: {RAISE_STATUS}
+- Timing: {RAISE_TIMING}
+- Why this round is fundable now: {WHY_THIS_ROUND_IS_FUNDABLE_NOW}
+- What changes after this round: {WHAT_CHANGES_AFTER_THIS_ROUND}
+
+Round hook (use the strongest piece in sentence 2, 3, or 4):
+- Strongest reason to meet now: {ROUND_HOOK_REASON}
+- Investor consequence of waiting: {ROUND_HOOK_CONSEQUENCE}
+- Round momentum proof: {ROUND_HOOK_MOMENTUM_PROOF}
+
+Company context:
+{COMPANY_DESCRIPTION}
+
+Available proofs (use the one most likely to convert THIS partner; do not blindly use headline traction):
+- Founder-designated strongest proof: {STRONGEST_RAISE_PROOF}. Default to this unless this partner's signals strongly suggest a different proof would land better.
+- Headline traction: {HEADLINE_METRIC}
+- Secondary metrics: {SECONDARY_METRICS}
+- Customer/pilot/LOI evidence: {CUSTOMER_EVIDENCE}
+- Technical validation: {TECHNICAL_VALIDATION}
+- Non-dilutive funding or strategic anchors: {NON_DILUTIVE_OR_STRATEGIC}
+- Founder-market fit: {FOUNDER_MARKET_FIT}
+
+Research about this partner:
+- Composite fit score: {COMPOSITE_SCORE} of 10 (thesis/personality only)
+- Round fit score: {ROUND_FIT_SCORE} of 10 (deterministic)
+- Lead likelihood score: {LEAD_LIKELIHOOD_SCORE} of 10 (deterministic)
+- Top-scoring axes: {TOP_AXES_NAMES_AND_SCORES}
+- Top 3 verified, quality->=2 signals (with sources and dates): {TOP_SIGNALS}
+- Available portfolio adjacencies: {ADJACENT_PORTFOLIO_COMPANIES}
+- Recent rounds led by this partner: {RECENT_PARTNER_LED_DEALS}
+- Communication style observed: {COMM_STYLE}
+- Kill signals to avoid triggering: {KILL_SIGNALS}
+
+Founder voice:
+- Style: {FOUNDER_VOICE_STYLE}
+- Banned phrases: {FOUNDER_BANNED_PHRASES}
+
+STEP 1: SELECT STRATEGIES
+
+Score each of the 6 strategies for this partner 0-3:
+- signal_led: requires a quality-3 recent quote. Examples in {EXAMPLES_DIR}/signal_led.md
+- portfolio_led: requires an adjacent portfolio company. Examples in {EXAMPLES_DIR}/portfolio_led.md
+- round_pattern_led: requires a recent partner-led round in adjacent space. Examples in {EXAMPLES_DIR}/round_pattern_led.md
+- market_shift_led: requires partner activity in category without strong quote. Examples in {EXAMPLES_DIR}/market_shift_led.md
+- contrarian_thesis_led: requires a strong public thesis to extend or pressure. Examples in {EXAMPLES_DIR}/contrarian_thesis_led.md
+- traction_led: requires strong company traction AND a metrics-oriented partner signal. Examples in {EXAMPLES_DIR}/traction_led.md
+
+Selection rules (in priority order):
+1. Evidence quality always wins over variety. Do not pick a strategy that lacks supporting evidence just to satisfy the two-variant requirement.
+2. If two strategies score >= 2, pick the two best fits. They must be genuinely different in opening logic; do not pick signal_led twice with different signals.
+3. If only one strategy scores >= 2, generate ONLY ONE variant and set limited_variation=true with a one-sentence reason.
+4. If zero strategies score >= 2, return an empty variants list and set limited_variation=true with reason. This partner should be dropped from the recommended set.
+
+STEP 2: GENERATE EACH VARIANT
+
+For each chosen strategy, use the matching example below as a STYLE ANCHOR. Match its directness, density, and voice. Do not copy wording.
+
+STRATEGY EXAMPLES (style anchors, one per strategy, headed by `--- strategy_name ---`):
+
+{EXAMPLES_BLOCK}
+
+(end of examples)
+
+Critical framing: the investor signal is a DOORWAY, not the argument. Do not make the email about the partner's quote or portfolio. Make the email about why the company and round are relevant to the partner now. The signal opens the door; the round hook and proof carry the meeting ask.
+
+Body: 4 sentences maximum. One personalization signal only.
+
+Sentence 1 (varies by strategy): the opener pattern from the strategy description. No flattery. No "I noticed you", "I came across your", "I've been following".
+
+Sentence 2: one-line company description connecting to sentence 1. Include the proof most likely to convert THIS partner.
+
+Sentence 3: ONE of the following, whichever fits better:
+- One concrete reason this partner specifically is the right person for this raise, OR
+- The round hook (strongest reason to meet now plus round momentum proof)
+
+Sentence 4: the pitch ask. The email must contain: (a) "raising" or "raise" making the active raise unambiguous, (b) the meeting duration, (c) at least one of: scheduling link, specific time slots, or both.
+
+CTA format options:
+- Link-only: "...book {MEETING_DURATION} minutes to walk you through the company and round: {SCHEDULING_LINK}"
+- Slots-only: "...I can walk you through the company and round Tuesday at {TIME_1} or Wednesday at {TIME_2}."
+- Hybrid (preferred for high-priority partners): "...I'd like to book {MEETING_DURATION} minutes. I'm open Tuesday {TIME_1} or Wednesday {TIME_2}, or here is my link: {SCHEDULING_LINK}."
+
+Never "would love to chat", "grab coffee", "compare notes", "pressure-test", "thesis discussion", "feedback session".
+
+Subject line: 5 words maximum. Not a question. Specific.
+
+Forbidden phrases: "building the future of", "would love", "circling back", "wanted to reach out", "hope this finds you well", "quick question", "pressure-test", "compare notes", "thesis chat", "get your feedback", plus anything in {FOUNDER_BANNED_PHRASES}. No em dashes. No exclamation marks.
+
+STEP 3: GENERATE CONVERSION HYPOTHESIS
+
+For the recommended variant, state in one sentence WHY this partner is likely to book based on the evidence. Not a probability. A reasoning statement.
+
+STEP 4: IDENTIFY AND PREEMPT THE LIKELY OBJECTION
+
+For the recommended variant:
+- Identify the single most likely objection this partner will use to dismiss the email
+- Decide if the objection is disqualifying (no email can fix it) or preemptable
+- If preemptable, the email body should contain one sentence that quietly addresses it. Identify it in preemption_line and set objection_preempted=true
+- If not preemptable, set objection_preempted=false
+
+STEP 5: GENERATE DECK REQUEST RESPONSE
+
+A 2 to 3 sentence reply for when the partner asks "just send the deck." Send the deck AND steer to a meeting. Do not imply the deck is withheld. Frame the call as a way to make the deck more useful.
+
+STEP 6: GENERATE FOLLOW-UP DRAFT (fallback template)
+
+A single 2-sentence follow-up for 4-6 business days after no response. Before sending, the user should update with new raise momentum. Must add ONE NEW piece of context, must not repeat the first email's signal, must still ask for the pitch meeting.
+
+Return JSON matching the EmailOutput schema.

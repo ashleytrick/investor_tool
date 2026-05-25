@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync
+      - name: Run smoke tests
+        env:
+          # Force stub mode so no real API calls are made during CI.
+          ANTHROPIC_API_KEY: ""
+        run: |
+          set +e
+          uv run pytest tests/ -v --tb=short -ra 2>&1 | tee pytest.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::pytest exited $rc"
+            {
+              echo "## Pytest output (tail)"
+              echo ""
+              echo '```'
+              tail -200 pytest.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log
+          path: pytest.log
+          if-no-files-found: warn

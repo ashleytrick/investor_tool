@@ -1,0 +1,30 @@
+You are classifying a single VC partner's reply to a cold outreach email.
+
+The original outreach asked for a {MEETING_DURATION}-minute pitch meeting for {COMPANY_NAME}'s {ROUND} round.
+
+Possible reply_type values (pick exactly one):
+
+- "booked": the partner agreed to meet, scheduled a time, or asked for a scheduling link with clear intent.
+- "asked_for_deck": the partner asked for the deck or one-pager without committing to a meeting.
+- "passed_too_early": stage-based pass ("too early for us at this stage").
+- "passed_category": category-based pass ("not our space", "we don't do X").
+- "wrong_stage": fund stage mismatch the partner is calling out ("we lead Series B+").
+- "asked_for_more_info": the partner is engaged but wants specifics before committing (metrics, references, etc.).
+- "referred_to_colleague": the partner forwarded to or named a different person at the fund.
+- "warm_intro_requested": the partner asked for a warm intro before continuing.
+- "no_response": the reply is auto-responder / out of office / not a real reply.
+
+Set `meeting_booked` true ONLY when the partner clearly agreed to a meeting (use with "booked").
+
+Reply to classify:
+---
+{REPLY_TEXT}
+---
+
+Return JSON matching the ReplyClassification schema:
+{
+  "reply_type": "...",
+  "confidence": "low|medium|high",
+  "reasoning": "one sentence explaining the classification",
+  "meeting_booked": true|false
+}

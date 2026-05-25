@@ -1,0 +1,34 @@
+[
+  {
+    "partner_id": "northbeam.example_priya_anand",
+    "outreach_status": "meeting_booked",
+    "reply_type": "booked",
+    "meeting_booked": true,
+    "meeting_outcome": "advanced"
+  },
+  {
+    "partner_id": "northbeam.example_marcus_lindqvist",
+    "outreach_status": "replied",
+    "reply_type": "asked_for_more_info",
+    "meeting_booked": false
+  },
+  {
+    "partner_id": "tidewater.example_dana_cole",
+    "outreach_status": "meeting_booked",
+    "reply_type": "booked",
+    "meeting_booked": true,
+    "meeting_outcome": "pitched"
+  },
+  {
+    "partner_id": "tidewater.example_renee_park",
+    "outreach_status": "sent",
+    "reply_type": "no_response",
+    "meeting_booked": false
+  },
+  {
+    "partner_id": "foundrynorth.example_kwame_boateng",
+    "outreach_status": "replied",
+    "reply_type": "passed_category",
+    "meeting_booked": false
+  }
+]

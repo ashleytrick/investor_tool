@@ -1,0 +1,35 @@
+You are extracting two types of evidence about a specific VC partner from content they authored or that features them. The company {COMPANY_NAME} is actively raising a {ROUND} of {AMOUNT}, so the goal is to assess thesis fit and cold reachability.
+
+Partner: {PARTNER_NAME}
+Fund: {FUND_NAME}
+
+Target axes for {COMPANY_NAME}:
+{AXES_BLOCK}
+
+PART 1: THESIS SIGNALS
+
+For each axis above, search the content for statements by this partner that signal fit or anti-fit on that specific axis.
+
+Strict requirements:
+- Quote the partner's exact words. Do not paraphrase.
+- If you cannot quote exactly, skip the signal.
+- Provide the exact source URL where the quote appears.
+- Provide the date if available.
+- Mark which axis or axes the signal speaks to.
+
+Signals do not need to use the company's exact vocabulary. Score for adjacent beliefs, investment behavior, and repeated reasoning patterns, not keyword overlap.
+
+If no thesis signals found, return signals=[].
+
+PART 2: COLD REACHABILITY SIGNALS
+
+Independent of thesis fit. Does this partner take cold inbound? Positive: public writing/podcast in last 12 months, explicit cold-inbound statements, deals visibly sourced from cold. Negative: explicit anti-cold statements, board-heavy late-stage with no recent leads, follow-on-only, no public presence in 12 months.
+
+Produce `cold_reachability_partial_score` 0 to 10 with one-sentence reasoning. (The final reachability score will be computed in Stage 6 by combining this with deterministic checks.)
+
+DO NOT score round_fit or lead_likelihood. Those are deterministic and computed elsewhere.
+
+Return JSON matching the PartnerSignalsOutput schema. Do not invent evidence.
+
+CONTENT:
+{CONTENT}

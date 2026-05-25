@@ -26,9 +26,16 @@ USER_AGENTS = [
 
 @dataclass
 class FetchResult:
+    # Batch 29 (#325): `url` is the URL the caller REQUESTED.
+    # `final_url` is the URL after any redirects -- different when the
+    # site does a 301 to a canonical host or a tracking-stripped path.
+    # Callers that persist provenance (source_snapshots, verification)
+    # should record final_url so re-fetching matches what the operator
+    # actually saw.
     url: str
     status: int
     text: str
+    final_url: str = ""
 
 
 @dataclass
@@ -56,11 +63,20 @@ class HttpClient:
     )
     async def fetch(self, url: str) -> FetchResult:
         """Fetch a URL respecting the per-domain rate limit. Raises on network
-        failure after retries; HTTP error statuses are returned, not raised."""
+        failure after retries; HTTP error statuses are returned, not raised.
+
+        Batch 29 (#325): records final_url after redirect resolution so
+        callers can persist the canonical URL alongside the snapshot.
+        """
         domain = urlparse(url).netloc
         async with self._limiter(domain):
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=True
             ) as client:
                 resp = await client.get(url, headers={"User-Agent": self._next_ua()})
-                return FetchResult(url=url, status=resp.status_code, text=resp.text)
+                # httpx.Response.url is the FINAL URL after redirects.
+                final = str(resp.url) if resp.url is not None else url
+                return FetchResult(
+                    url=url, status=resp.status_code, text=resp.text,
+                    final_url=final,
+                )

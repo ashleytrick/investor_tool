@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from core.config_loader import Workspace
-from core.llm.limiter import get_limiter
+from core.llm.limiter import get_sync_limiter
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -104,14 +104,15 @@ class LLMClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, max=16))
     def _raw_call(self, prompt: str, model: str, max_tokens: int) -> str:
-        """Single Anthropic call. tenacity retries transient network failures."""
+        """Single Anthropic call. tenacity retries transient network failures.
+
+        Acquires the process-wide sync rate limiter for the 'anthropic'
+        provider before each call so concurrent workspace runs in the same
+        process share one bucket (Acceptance Criterion 17).
+        """
         import anthropic
 
-        # Process-wide limiter is async; this client path is sync, so we touch
-        # the limiter's capacity bookkeeping without an event loop. The async
-        # stages (http_client) use it natively; here we keep it as a guard.
-        _ = get_limiter("anthropic")
-
+        get_sync_limiter("anthropic").acquire()
         client = anthropic.Anthropic(api_key=self._api_key)
         resp = client.messages.create(
             model=model,
@@ -128,9 +129,15 @@ def _extract_json(text: str) -> dict:
     """Pull a JSON object out of model text, tolerating code fences."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.split("```", 2)[1]
-        if cleaned.lstrip().lower().startswith("json"):
-            cleaned = cleaned.lstrip()[4:]
+        # A well-formed fence has at least an opening and closing ```; a
+        # malformed single-fence response (model truncated mid-output) used
+        # to IndexError here. Fall through to the substring scan instead so
+        # we still try to recover a JSON object.
+        parts = cleaned.split("```", 2)
+        if len(parts) >= 2:
+            cleaned = parts[1]
+            if cleaned.lstrip().lower().startswith("json"):
+                cleaned = cleaned.lstrip()[4:]
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end < start:

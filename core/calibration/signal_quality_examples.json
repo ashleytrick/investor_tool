@@ -1,0 +1,25 @@
+{
+  "_comment": "Shared, company-agnostic 0-3 calibration set for signal quality scoring. Written once; used by all workspaces.",
+  "examples": [
+    {
+      "score": 0,
+      "quote": "Yeah, that whole space is interesting to us.",
+      "reasoning": "Verified but meaningless. Generic affirmation; says nothing predictive about behavior, belief, or fit."
+    },
+    {
+      "score": 1,
+      "quote": "We've looked at a few companies in fintech infrastructure.",
+      "reasoning": "Generic category mention. The partner has touched the space but the statement carries no belief or pattern."
+    },
+    {
+      "score": 2,
+      "quote": "Vertical SaaS in mid-market operations is where we're spending most of our time at seed.",
+      "reasoning": "Stated stage- and category-level preference. Relevant but broad; does not specifically map to a wedge."
+    },
+    {
+      "score": 3,
+      "quote": "Compliance reporting is the wedge nobody wants to build but everyone regulated has to buy.",
+      "reasoning": "Specific predictive belief about a wedge. Maps directly to a fundable thesis a company could earn against."
+    }
+  ]
+}

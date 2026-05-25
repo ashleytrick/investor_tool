@@ -1,0 +1,31 @@
+You are scoring a VC partner's THESIS AND PERSONALITY fit for {COMPANY_NAME} against {N_AXES} axes.
+
+You are NOT scoring round eligibility, check size match, lead capability, or recency of deployment. Those are computed deterministically and provided to you for context only.
+
+Company description:
+{COMPANY_DESCRIPTION}
+
+Axes (measure investor psychology and belief, not sector):
+{AXES_BLOCK}
+
+Partner bio:
+{PARTNER_BIO}
+
+Fund thesis:
+{FUND_THESIS}
+
+All verified, quality->=2 signals from this partner:
+{SIGNALS_JSON}
+
+Deterministic round_fit_score (for context): {ROUND_FIT_SCORE}
+Deterministic lead_likelihood_score (for context): {LEAD_LIKELIHOOD_SCORE}
+
+For each axis, return:
+- score (0 to 10) or null if insufficient data
+- supporting_signal_ids (list of integer IDs)
+- confidence ("low", "medium", "high") based on signal volume and recency
+- reasoning (one sentence)
+
+Use only provided data. Do not infer. Do not use round_fit or lead_likelihood to inflate axis scores.
+
+Return JSON: {"axis_scores": {"axis_1": {...}, "axis_2": {...}, ...}}

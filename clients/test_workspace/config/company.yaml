@@ -1,5 +1,10 @@
 # PLACEHOLDER fixture data for the Session 1 vertical slice.
 # Fictional company. Replace with real data before any real run.
+
+# Batch 30 (#528): mark this workspace as a fixture so Stage 8 +
+# Gmail draft creation refuse to touch it without --allow-fixture.
+mode: fixture
+
 company:
   name: "Tendril"
   founder_name: "Dana Okafor"
@@ -22,6 +27,13 @@ company:
     max: 1500000
   target_geographies:
     - "United States"
+  target_sectors:
+    - "fintech"
+    - "infrastructure"
+    - "regulated markets"
+    - "compliance"
+    - "payments"
+    - "reconciliation"
   adjacent_companies:
     - "Vanta"
     - "Sardine"
