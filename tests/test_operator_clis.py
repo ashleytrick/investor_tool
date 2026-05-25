@@ -710,7 +710,8 @@ def test_batch26_do_not_contact_and_new_clis():
         res = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "set_do_not_contact.py"),
              "--workspace", ws, "--partner-id", pid,
-             "--reason", "conflict of interest"],
+             "--reason", "conflict of interest",
+             "--set-by", "alice"],
             capture_output=True, text=True, env=env, timeout=30,
         )
         assert res.returncode == 0
@@ -721,12 +722,23 @@ def test_batch26_do_not_contact_and_new_clis():
             "select recommended_to_send, kill_signal_summary "
             "from partner_score_summaries where partner_id=?", (pid,),
         ).fetchone()
+        # Slice 15: DNC metadata columns populated by the CLI.
+        meta = c.execute(
+            "select do_not_contact_set_at, do_not_contact_set_by, "
+            "do_not_contact_source from partners where partner_id=?",
+            (pid,),
+        ).fetchone()
         c.close()
         assert rec == 0, "do_not_contact partner must not be recommended"
         assert "do_not_contact" in (summary or ""), (
             f"kill_signal_summary should mention do_not_contact; "
             f"got {summary!r}"
         )
+        # set_at is an ISO timestamp string from SQLite; just confirm
+        # it was populated (not NULL) along with operator + source.
+        assert meta[0] is not None, "do_not_contact_set_at must be set"
+        assert meta[1] == "alice"
+        assert meta[2] == "manual"
 
         # Clear the flag, re-run, expect recommendation restored (if it
         # was the only blocker -- the fixture partners are otherwise
@@ -737,6 +749,16 @@ def test_batch26_do_not_contact_and_new_clis():
             capture_output=True, text=True, env=env, timeout=30,
         )
         assert res.returncode == 0
+        # Clearing wipes the audit metadata so a future audit can
+        # distinguish "currently clear" from "currently set".
+        c = sqlite3.connect(db)
+        cleared = c.execute(
+            "select do_not_contact_set_at, do_not_contact_set_by, "
+            "do_not_contact_source from partners where partner_id=?",
+            (pid,),
+        ).fetchone()
+        c.close()
+        assert cleared == (None, None, None)
         _run("06_score_candidates.py", "--workspace", ws, cwd=REPO_ROOT)
 
         c = sqlite3.connect(db)

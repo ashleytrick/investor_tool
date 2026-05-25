@@ -118,6 +118,13 @@ partners = Table(
     # is "use the warm channel"; do_not_contact is "use no channel".
     Column("do_not_contact", Boolean, default=False),
     Column("do_not_contact_reason", Text),
+    # Slice 15: DNC audit metadata. WHEN the flag was set, BY whom,
+    # and WHERE the decision came from so the operator can trace why
+    # a partner is suppressed long after the original action.
+    # Values for do_not_contact_source: manual | attio | gmail | csv
+    Column("do_not_contact_set_at", DateTime),
+    Column("do_not_contact_set_by", Text),
+    Column("do_not_contact_source", Text),
     # Batch 32 (#741): TRUE when Stage 3 created the row from an
     # announcement that named the partner, BEFORE Stage 2 enrichment
     # confirms them on the team page. Stage 6 should treat

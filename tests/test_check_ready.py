@@ -168,6 +168,63 @@ def test_blocks_when_approved_draft_fails_live_gate():
         assert "invalid" in res.stdout
 
 
+def test_scheduling_link_reachable_skips_example_tld():
+    """Slice 15: the reachability check returns OK without HTTP for
+    .example / .test / .invalid / .localhost links -- the production
+    guard already refuses those at send time, so they're noise here."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        # The fixture already uses cal.example.
+        res = _check(ws)
+        assert "scheduling_link_reachable: OK" in res.stdout, res.stdout
+
+
+def test_scheduling_link_reachable_flags_broken_link():
+    """When the scheduling link points at a non-existent host, the
+    check fires BLOCKED. Use an RFC 6761 unreachable-by-design
+    127.x address so no DNS lookup will succeed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        # Swap the scheduling link for an unreachable URL on a port
+        # nothing listens to, with a short timeout.
+        cfg_path = ws_dst / "config" / "company.yaml"
+        cfg = cfg_path.read_text(encoding="utf-8")
+        cfg = cfg.replace(
+            'preferred_scheduling_link: "https://cal.example/dana-tendril"',
+            'preferred_scheduling_link: "http://127.0.0.1:1/no-such-endpoint"',
+        )
+        assert "127.0.0.1:1" in cfg, "scheduling-link substitution failed"
+        cfg_path.write_text(cfg, encoding="utf-8")
+
+        res = _check(ws)
+        # Fixture mode also blocks, but the scheduling check should
+        # specifically appear in the BLOCKED list.
+        assert "scheduling_link_reachable: BLOCKED" in res.stdout, res.stdout
+
+
+def test_gmail_oauth_check_skips_when_not_linked():
+    """When the workspace has no .gmail_credentials.json, the check
+    returns OK (not configured -- nothing to verify); operators who
+    don't push to Gmail aren't blocked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        res = _check(ws)
+        assert "gmail_oauth: OK" in res.stdout, res.stdout
+        assert "not linked" in res.stdout
+
+
 def test_blocks_when_two_approved_drafts_share_recipient():
     """Finding 3: a duplicate partner_email across approved drafts is
     surfaced so the operator catches data drift before sending the

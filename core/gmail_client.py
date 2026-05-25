@@ -76,6 +76,22 @@ class GmailClient:
         self._service = build("gmail", "v1", credentials=creds)
         return self._service
 
+    def get_profile(self) -> dict:
+        """Slice 15 Gmail discoverability check.
+
+        Calls `users.getProfile` -- the cheapest read-only Gmail API
+        call available with the `gmail.compose` scope. Used by
+        `scripts/check_ready.py` to confirm the OAuth token is still
+        valid + the account is reachable BEFORE the operator gets
+        all the way to draft-push time. Returns the raw dict
+        (`emailAddress`, `messagesTotal`, `threadsTotal`,
+        `historyId`); raises GmailError on any API failure.
+        """
+        try:
+            return self.service.users().getProfile(userId="me").execute()
+        except Exception as exc:  # noqa: BLE001 - diverse google errors
+            raise GmailError(f"get_profile failed: {exc}") from exc
+
     def create_draft(
         self, *, to_email: str, subject: str, body: str,
         from_email: Optional[str] = None,
