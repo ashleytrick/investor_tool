@@ -114,8 +114,10 @@ def test_full_pipeline_end_to_end():
                 assert row["partner_id"]
                 assert row["outreach_email_draft"]
                 assert row["email_subject_line"]
-                # Brief Rule 16 / Criterion 15: ready_to_send when recommended.
-                assert row["outreach_status"] in ("ready_to_send", "draft")
+                # Slice 1 cold-outreach model: every draft starts in
+                # needs_review or qa_failed (when blockers are
+                # present). Nothing auto-approves.
+                assert row["outreach_status"] in ("needs_review", "qa_failed")
 
         # --- idempotency: re-run Stages 2-7, counts should not grow ---
         _run("02_enrich_funds.py", "--workspace", ws, "--fixtures", cwd=REPO_ROOT)

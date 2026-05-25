@@ -1,24 +1,38 @@
-"""Stage 7 draft-routing decision (Refactor item 14).
+"""Stage 7 draft-routing decision (Slice 1 rewrite for cold-outreach
+approval workflow).
 
-Pure function that takes a partner's recommended draft + the Stage 6
-context + workspace config and returns:
+Stage 7 never auto-approves. Every draft starts in `needs_review`.
+This module computes the operator-visible review-queue picture for a
+draft: what blockers (if any) prevent approval, and the human-
+readable reasoning the operator reads in the CSV / UI.
 
-  - outreach_status :  "warm_path_needed" | "draft" | "ready_to_send"
-  - qa_fails       :  list of human-readable failure reasons (empty
-                      when the draft passes everything)
-  - reasoning      :  the final recommendation_reasoning string to
-                      write into the CSV
-  - downgraded     :  True iff a Stage-6-recommended partner got
-                      bumped to outreach_status="draft" by Stage 7's
-                      QA layer (operator-visible counter)
+Returns a DraftRoutingDecision with:
 
-This used to be ~120 lines of inline checks inside Stage 7's CSV-row
-build loop. Moving it out makes the routing decision testable from a
-small synthetic context dict, and the per-criterion failure messages
-become unit-coverable.
+  - approval_status_hint : "needs_review" | "qa_failed"
+        Stage 7 always seeds the DB row as `needs_review` (the
+        approval state machine has only one valid initial state).
+        qa_failed is used in the CSV / UI to surface "this draft
+        has hard-gate failures and SHOULD NOT be approved as-is".
+        The DB row stays in needs_review; the operator sees the
+        block in their review tools and either fixes it before
+        approving or rejects.
 
-The function deliberately doesn't import Stage 7. It composes
-existing helpers:
+  - blockers : tuple[str, ...]
+        Operator-actionable reasons the draft can't yet be approved.
+        Examples: 'missing partner email', 'template_smell=high',
+        'body contains hallucinated scheduling URL', 'do_not_contact
+        is set'.  Empty tuple means no known blockers.
+
+  - reasoning : str
+        Free-text rendered into the review CSV / UI explaining
+        Stage 7's recommendation context + any blockers.
+
+Slice 1: warm-path output is GONE. The pipeline no longer drafts
+intro-request emails or treats warm_path_available as a
+distinguishing branch. Every partner gets a cold draft seeded as
+needs_review; a human decides.
+
+The function composes existing helpers:
   - core.email.batch_qa.check_hard_gates() : per-draft body gates
   - core.production_guards.production_gate_for_ready_to_send() :
     fixture-data / production-readiness checks
@@ -27,6 +41,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.approval.state_machine import (
+    STATE_NEEDS_REVIEW,
+)
 from core.email.batch_qa import check_hard_gates
 from core.production_guards import production_gate_for_ready_to_send
 
@@ -40,18 +57,53 @@ SCHEDULING_LINK_HOSTS: tuple[str, ...] = (
     "meetings.hubspot.com/", "cal.example/",
 )
 
-# Outreach status values used downstream (Stage 8 reads these).
-STATUS_WARM_PATH = "warm_path_needed"
-STATUS_DRAFT = "draft"
-STATUS_READY = "ready_to_send"
+# Approval status hints surfaced in the CSV / UI. The DB pointer
+# always lands as STATE_NEEDS_REVIEW (state-machine invariant); these
+# strings annotate the operator's view of WHY a draft is in review.
+HINT_NEEDS_REVIEW: str = STATE_NEEDS_REVIEW  # = "needs_review"
+HINT_QA_FAILED: str = "qa_failed"
+HINT_MISSING_EMAIL: str = "missing_email"
+HINT_DO_NOT_CONTACT: str = "do_not_contact"
+
+# Back-compat: legacy Stage 7 + tests imported these names. Map them
+# to the new vocabulary so external readers don't crash during the
+# transition. STATUS_WARM_PATH points to needs_review because warm-
+# path is gone -- the partner just needs review like every other.
+STATUS_DRAFT = HINT_NEEDS_REVIEW
+STATUS_READY = HINT_NEEDS_REVIEW
+STATUS_WARM_PATH = HINT_NEEDS_REVIEW
 
 
 @dataclass(frozen=True)
 class DraftRoutingDecision:
-    outreach_status: str
-    qa_fails: tuple[str, ...]
+    """Operator-visible review picture for one draft.
+
+    `approval_status_hint` is purely a CSV/UI label. The DB row's
+    approval_status is always seeded as needs_review (see
+    core/approval/state_machine.py); a human is the only path to
+    approved_to_send.
+    """
+    approval_status_hint: str
+    blockers: tuple[str, ...]
     reasoning: str
-    downgraded: bool
+
+    @property
+    def qa_fails(self) -> tuple[str, ...]:
+        """Back-compat alias for code reading the prior shape."""
+        return self.blockers
+
+    @property
+    def outreach_status(self) -> str:
+        """Back-compat alias used by the older CSV-write path.
+        Resolves to the approval hint so downstream readers don't
+        crash during the transition window."""
+        return self.approval_status_hint
+
+    @property
+    def downgraded(self) -> bool:
+        """Stage 6 recommended the partner but Stage 7 found
+        blockers -- operator-visible counter."""
+        return self.approval_status_hint == HINT_QA_FAILED
 
 
 def _company_primary_domain(company_cfg: dict) -> str | None:
@@ -91,7 +143,7 @@ def _company_primary_domain(company_cfg: dict) -> str | None:
     return None
 
 
-def _collect_qa_fails(
+def _collect_blockers(
     *,
     rec_subject: str | None,
     rec_body: str | None,
@@ -101,15 +153,32 @@ def _collect_qa_fails(
     allow_example_domains: bool,
     pctx_recommended_to_send: bool,
     pctx_cold_reachability_score: float | None,
+    pctx_partner_email: str | None,
+    pctx_do_not_contact: bool,
     banned: list[str],
 ) -> list[str]:
-    qa_fails: list[str] = list(check_hard_gates(
+    blockers: list[str] = []
+    # Cold-outreach absolutes: a partner flagged do_not_contact MUST
+    # never make it past the review queue regardless of draft quality.
+    if pctx_do_not_contact:
+        blockers.append(
+            "partner.do_not_contact is set -- approval blocked",
+        )
+    # Missing email is a hard blocker for approval. Stage 7 still
+    # generates the draft (so the operator sees who needs Apollo
+    # enrichment) but the draft can't be approved without an email.
+    if not (pctx_partner_email or "").strip():
+        blockers.append(
+            "partner email is unknown -- Apollo upload required "
+            "before approval"
+        )
+    blockers.extend(check_hard_gates(
         {"subject": rec_subject, "body": rec_body}, banned,
     ))
     if rec_template_smell == "high":
-        qa_fails.append("template_smell=high")
+        blockers.append("template_smell=high")
     if in_sim_failure_pair:
-        qa_fails.append("body similarity > 0.82 with another draft")
+        blockers.append("body similarity > 0.82 with another draft")
     # Batch 9: production guards.
     prod_fails = production_gate_for_ready_to_send(
         subject=rec_subject,
@@ -123,7 +192,7 @@ def _collect_qa_fails(
         partner_email=None,
         allow_example_domains=allow_example_domains,
     )
-    qa_fails.extend(prod_fails)
+    blockers.extend(prod_fails)
     # Batch 37 (#44): scheduling-link hallucination check.
     configured_link = (
         (company_cfg.get("company") or {})
@@ -136,22 +205,22 @@ def _collect_qa_fails(
         if host in body_lower and (
             not configured_link or host not in configured_link
         ):
-            qa_fails.append(
+            blockers.append(
                 f"body contains scheduling link host {host!r} but "
                 f"workspace configured "
                 f"{(configured_link or '<none>')!r} -- LLM may have "
                 f"hallucinated a scheduling URL"
             )
             break
-    # Batch 37 (#42): defense in depth -- a recommended partner with
-    # no reachability score should never land as ready_to_send.
+    # Batch 37 (#42): defense in depth -- a Stage-6-recommended
+    # partner with no reachability score should not be approvable.
     if (
         pctx_recommended_to_send
         and pctx_cold_reachability_score is None
     ):
-        qa_fails.append(
-            "cold_reachability_score is unknown; Stage 7 refuses "
-            "to mark ready_to_send without it"
+        blockers.append(
+            "cold_reachability_score is unknown; approval refused "
+            "until Stage 4 produces a reachability partial"
         )
     # Batch 37 (#35): founder-email-domain alignment soft check.
     founder_email = (
@@ -161,12 +230,12 @@ def _collect_qa_fails(
     if founder_email and primary_domain and "@" in founder_email:
         fe_domain = founder_email.split("@", 1)[1].lower().strip()
         if fe_domain != primary_domain:
-            qa_fails.append(
+            blockers.append(
                 f"founder email domain {fe_domain!r} does not "
                 f"match company primary domain {primary_domain!r}; "
                 f"verify the sender is intentional"
             )
-    return qa_fails
+    return blockers
 
 
 def decide_draft_routing(
@@ -177,21 +246,35 @@ def decide_draft_routing(
     in_sim_failure_pair: bool,
     pctx_recommendation_reasoning: str | None,
     pctx_recommended_to_send: bool,
-    pctx_warm_path_available: bool | None,
+    pctx_warm_path_available: bool | None = None,  # ignored; back-compat
     pctx_cold_reachability_score: float | None,
+    pctx_partner_email: str | None = None,
+    pctx_do_not_contact: bool = False,
     banned: list[str],
     company_cfg: dict,
     allow_example_domains: bool,
 ) -> DraftRoutingDecision:
-    """Compute outreach_status + reasoning for one partner's draft.
+    """Compute the review-queue picture for one partner's draft.
 
-    The decision order is:
-      1. warm_path_available=True  -> warm_path_needed (cold draft suppressed)
-      2. recommended_to_send + qa_fails -> draft (downgraded; reasoning lists fails)
-      3. recommended_to_send + no fails -> ready_to_send
-      4. otherwise -> draft (Stage 6 already said not-recommended)
+    Slice 1 cold-outreach model:
+
+      - Stage 7 NEVER auto-approves. Every draft is seeded as
+        needs_review in the DB; the CSV / UI label reflects whether
+        the operator should expect to approve it cleanly
+        (needs_review) or fix something first (qa_failed).
+      - warm_path branch removed. `pctx_warm_path_available` is
+        accepted but ignored for back-compat with older callers.
+      - Missing partner email + do_not_contact are explicit blockers
+        rather than a separate route. The draft still lands in the
+        review queue with the blocker visible so the operator knows
+        what to fix (Apollo upload / clear DNC).
+
+    Returns DraftRoutingDecision(approval_status_hint, blockers,
+    reasoning). The DB row's actual approval_status pointer always
+    seeds as STATE_NEEDS_REVIEW -- this function only computes the
+    operator-visible LABEL.
     """
-    qa_fails = _collect_qa_fails(
+    blockers = _collect_blockers(
         rec_subject=rec_subject,
         rec_body=rec_body,
         rec_template_smell=rec_template_smell,
@@ -200,40 +283,34 @@ def decide_draft_routing(
         allow_example_domains=allow_example_domains,
         pctx_recommended_to_send=pctx_recommended_to_send,
         pctx_cold_reachability_score=pctx_cold_reachability_score,
+        pctx_partner_email=pctx_partner_email,
+        pctx_do_not_contact=pctx_do_not_contact,
         banned=banned,
     )
     base_reason = pctx_recommendation_reasoning or ""
 
-    if pctx_warm_path_available:
+    if blockers:
+        # The operator sees the qa_failed label + the per-blocker list
+        # so they can fix the issues before approving. The DB row is
+        # still seeded as needs_review by Stage 7's seed_draft call.
         return DraftRoutingDecision(
-            outreach_status=STATUS_WARM_PATH,
-            qa_fails=tuple(qa_fails),
+            approval_status_hint=HINT_QA_FAILED,
+            blockers=tuple(blockers),
             reasoning=(
-                f"warm_path_available=TRUE; cold draft suppressed. "
-                f"{base_reason}"
-            ).strip(),
-            downgraded=False,
-        )
-    if pctx_recommended_to_send and qa_fails:
-        return DraftRoutingDecision(
-            outreach_status=STATUS_DRAFT,
-            qa_fails=tuple(qa_fails),
-            reasoning=(
-                f"DOWNGRADED by Stage 7 QA: {'; '.join(qa_fails)}. "
+                f"BLOCKERS preventing approval: {'; '.join(blockers)}. "
                 f"(Stage 6 said: {base_reason or '-'})"
             ),
-            downgraded=True,
         )
-    if pctx_recommended_to_send:
-        return DraftRoutingDecision(
-            outreach_status=STATUS_READY,
-            qa_fails=(),
-            reasoning=base_reason,
-            downgraded=False,
-        )
+
     return DraftRoutingDecision(
-        outreach_status=STATUS_DRAFT,
-        qa_fails=tuple(qa_fails),
-        reasoning=base_reason,
-        downgraded=False,
+        approval_status_hint=HINT_NEEDS_REVIEW,
+        blockers=(),
+        reasoning=(
+            base_reason
+            if pctx_recommended_to_send
+            else (
+                f"Stage 6 did not recommend this partner: "
+                f"{base_reason or '(no reason)'}"
+            )
+        ),
     )

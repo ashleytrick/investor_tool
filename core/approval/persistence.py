@@ -73,8 +73,48 @@ def latest_state(engine: Any, draft_id: int) -> str | None:
     return row.approval_status
 
 
+def _seed_draft_using_conn(
+    conn: Any,
+    *,
+    draft_id: int,
+    partner_id: str,
+    draft_hash: str,
+    actor: str,
+    notes: str | None,
+) -> None:
+    """Inner: seed using an already-open connection. Used by callers
+    that are inside an outer transaction (Stage 7) so SQLite doesn't
+    deadlock on a nested engine.begin()."""
+    assert_can_transition(None, STATE_NEEDS_REVIEW, source="system")
+    existing = conn.execute(
+        select(draft_approvals.c.event_id).where(
+            draft_approvals.c.draft_id == draft_id,
+        ).limit(1)
+    ).first()
+    if existing is not None:
+        return
+    now = _now()
+    conn.execute(draft_approvals.insert().values(
+        draft_id=draft_id,
+        partner_id=partner_id,
+        event_type=STATE_NEEDS_REVIEW,
+        actor=actor,
+        at=now,
+        draft_hash=draft_hash,
+        notes=notes,
+    ))
+    conn.execute(
+        update(email_drafts)
+        .where(email_drafts.c.draft_id == draft_id)
+        .values(
+            approval_status=STATE_NEEDS_REVIEW,
+            draft_hash=draft_hash,
+        )
+    )
+
+
 def seed_draft(
-    engine: Any,
+    engine_or_conn: Any,
     *,
     draft_id: int,
     partner_id: str,
@@ -86,34 +126,29 @@ def seed_draft(
     this immediately after inserting an email_drafts row. Idempotent:
     if the draft already has a needs_review event, this is a no-op
     (lets Stage 7's re-runs land cleanly without duplicate events).
+
+    Accepts either an Engine (opens its own transaction) or an
+    existing Connection (reuses the caller's transaction -- required
+    when the caller is already inside engine.begin() to avoid SQLite
+    deadlocking on nested write transactions).
     """
-    assert_can_transition(None, STATE_NEEDS_REVIEW, source="system")
-    with engine.begin() as conn:
-        # Idempotence: only seed if there are no events for this draft yet.
-        existing = conn.execute(
-            select(draft_approvals.c.event_id).where(
-                draft_approvals.c.draft_id == draft_id,
-            ).limit(1)
-        ).first()
-        if existing is not None:
-            return
-        now = _now()
-        conn.execute(draft_approvals.insert().values(
-            draft_id=draft_id,
-            partner_id=partner_id,
-            event_type=STATE_NEEDS_REVIEW,
-            actor=actor,
-            at=now,
-            draft_hash=draft_hash,
-            notes=notes,
-        ))
-        conn.execute(
-            update(email_drafts)
-            .where(email_drafts.c.draft_id == draft_id)
-            .values(
-                approval_status=STATE_NEEDS_REVIEW,
-                draft_hash=draft_hash,
-            )
+    # Duck-type: a Connection has .execute and no .begin(); an Engine
+    # has both. The simplest correct check is `hasattr(x, 'begin')`
+    # AND `callable(x.begin)` AND `not x.in_transaction()`. Use a
+    # cheaper check that works for both SQLAlchemy 1.4 + 2.0: try
+    # treating it as a connection first.
+    if hasattr(engine_or_conn, "execute") and not hasattr(
+        engine_or_conn, "connect",
+    ):
+        _seed_draft_using_conn(
+            engine_or_conn, draft_id=draft_id, partner_id=partner_id,
+            draft_hash=draft_hash, actor=actor, notes=notes,
+        )
+        return
+    with engine_or_conn.begin() as conn:
+        _seed_draft_using_conn(
+            conn, draft_id=draft_id, partner_id=partner_id,
+            draft_hash=draft_hash, actor=actor, notes=notes,
         )
 
 

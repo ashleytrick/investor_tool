@@ -292,9 +292,16 @@ def test_stage7_downgrades_example_domains_to_draft_by_default():
         with csv_path.open(encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         statuses = {r["outreach_status"] for r in rows}
-        assert "ready_to_send" not in statuses, (
-            f"ready_to_send must be blocked when .example domains in use; "
+        # Slice 1 cold-outreach model: nothing auto-approves. A
+        # workspace with .example domains gets `qa_failed` on every
+        # row (production guard blocker).
+        assert "needs_review" not in statuses, (
+            f"needs_review must be blocked when .example domains in use; "
             f"got statuses={statuses}"
+        )
+        assert statuses == {"qa_failed"}, (
+            f"every row should be qa_failed by the prod guard; "
+            f"got {statuses}"
         )
         # At least one row should carry the prod-guard reasoning.
         prod_guard_rows = [
@@ -307,9 +314,9 @@ def test_stage7_downgrades_example_domains_to_draft_by_default():
             f"reasonings={[r['recommendation_reasoning'] for r in rows]}"
         )
 
-        # With --allow-example-domains, ready_to_send returns.
-        # Re-run pipeline (Stage 6 invalidates from prior run; this just
-        # re-runs Stage 7 to overwrite the CSV).
+        # With --allow-example-domains, the prod-guard blocker lifts
+        # and rows land in needs_review (Slice 1: never auto-
+        # ready_to_send; a HUMAN still has to approve before send).
         _run(
             "07_generate_emails.py", "--workspace", ws, "--top", "5",
             "--allow-example-domains", cwd=REPO_ROOT,
@@ -317,9 +324,27 @@ def test_stage7_downgrades_example_domains_to_draft_by_default():
         with csv_path.open(encoding="utf-8") as f:
             rows2 = list(csv.DictReader(f))
         statuses2 = {r["outreach_status"] for r in rows2}
-        assert "ready_to_send" in statuses2, (
-            f"--allow-example-domains should restore ready_to_send; "
-            f"got statuses={statuses2}"
+        # With --allow-example-domains the .example blocker is gone,
+        # but fixture partners still have no `email` column set, so
+        # rows remain qa_failed on the missing-email blocker (Slice 1).
+        # What we ARE asserting: the .example reasoning is no longer
+        # cited; the only blocker left should be missing email.
+        example_rows = [
+            r for r in rows2
+            if "example/reserved" in (r.get("recommendation_reasoning") or "")
+        ]
+        assert not example_rows, (
+            f"--allow-example-domains should drop the .example blocker "
+            f"from reasoning; still saw: "
+            f"{[r['recommendation_reasoning'] for r in example_rows]}"
+        )
+        missing_email_rows = [
+            r for r in rows2
+            if "partner email is unknown" in (r.get("recommendation_reasoning") or "")
+        ]
+        assert missing_email_rows, (
+            f"fixture partners have no email -- expected missing-email "
+            f"blocker; got reasonings={[r['recommendation_reasoning'] for r in rows2]}"
         )
 
 
@@ -548,10 +573,9 @@ def test_batch43_review_queue_csv_golden_columns():
         assert cols == CSV_COLUMNS, (
             f"CSV column drift!\nactual:   {cols}\nexpected: {CSV_COLUMNS}"
         )
-        # Every row has an outreach_status from the known set.
-        valid_statuses = {
-            "ready_to_send", "draft", "warm_path_needed",
-        }
+        # Every row has an outreach_status from the Slice 1 cold-
+        # outreach approval vocabulary.
+        valid_statuses = {"needs_review", "qa_failed"}
         for r in rows:
             assert r["outreach_status"] in valid_statuses, (
                 f"unexpected outreach_status {r['outreach_status']!r}"

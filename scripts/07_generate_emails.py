@@ -381,6 +381,11 @@ def main() -> int:
                     partners.c.linkedin_url,
                     partners.c.warm_path_available,
                     partners.c.bio,
+                    # Slice 1: cold-outreach approval needs partner email
+                    # (block approval when missing) and do_not_contact
+                    # (hard block) in the routing decision.
+                    partners.c.email.label("partner_email"),
+                    partners.c.do_not_contact,
                     funds.c.name.label("fund_name"),
                     funds.c.domain.label("fund_domain"),
                     funds.c.stated_thesis,
@@ -769,6 +774,12 @@ def main() -> int:
                 # preservation guarantee is actually airtight.
                 if pid in partner_ids_with_failed_rec:
                     continue
+                # Slice 1: every new draft starts in the approval state
+                # machine as `needs_review`. Stage 7 produces drafts but
+                # only a HUMAN can move them to approved_to_send.
+                from core.approval.persistence import (
+                    compute_draft_hash, seed_draft,
+                )
                 for v in output.variants:
                     is_rec = (v.strategy == output.recommended_variant_strategy)
                     smell_info = qa_by_key.get((pid, v.strategy), {})
@@ -776,11 +787,12 @@ def main() -> int:
                         {"subject": v.subject, "body": v.body}, banned
                     )
                     qa_status = "pass" if not hard_fails and smell_info.get("template_smell") != "high" else "fail"
+                    draft_hash_value = compute_draft_hash(v.subject, v.body)
                     # Batch 23 (#471/#472): leave written_to_csv_at NULL
                     # here. It's set AFTER write_review_queue() returns
                     # successfully, so a CSV failure no longer claims the
                     # rows landed in the CSV.
-                    conn.execute(email_drafts.insert().values(
+                    result = conn.execute(email_drafts.insert().values(
                         partner_id=pid,
                         batch_id=batch_id,
                         strategy=v.strategy,
@@ -796,7 +808,25 @@ def main() -> int:
                         is_recommended=is_rec,
                         generated_at=_now(),
                         written_to_csv_at=None,
+                        approval_status="needs_review",
+                        draft_hash=draft_hash_value,
                     ))
+                    new_draft_id = int(result.inserted_primary_key[0])
+                    # Write the initial needs_review event in
+                    # draft_approvals so the audit trail is intact even
+                    # if the operator never touches the draft. seed_draft
+                    # is idempotent so concurrent runs don't duplicate.
+                    # Pass `conn` (not engine) so the event INSERT lands
+                    # inside the same transaction -- SQLite deadlocks on
+                    # nested engine.begin() blocks.
+                    seed_draft(
+                        conn,
+                        draft_id=new_draft_id,
+                        partner_id=pid,
+                        draft_hash=draft_hash_value,
+                        actor="system",
+                        notes=f"stage_7 generated; qa_status={qa_status}",
+                    )
                 # Batch 23 (#473/#474): tag followup + deck with batch_id
                 # so they can be reconciled to email_drafts.batch_id later.
                 conn.execute(followup_drafts.insert().values(
@@ -910,8 +940,11 @@ def main() -> int:
                 in_sim_failure_pair=pid in sim_failed_partners,
                 pctx_recommendation_reasoning=pctx["recommendation_reasoning"],
                 pctx_recommended_to_send=bool(pctx["recommended_to_send"]),
-                pctx_warm_path_available=pctx.get("warm_path_available"),
+                # Slice 1: warm-path kwarg accepted but ignored.
+                pctx_warm_path_available=None,
                 pctx_cold_reachability_score=pctx.get("cold_reachability_score"),
+                pctx_partner_email=pctx.get("partner_email"),
+                pctx_do_not_contact=bool(pctx.get("do_not_contact") or False),
                 banned=banned,
                 company_cfg=ws.company,
                 allow_example_domains=policy.allow_example_domains,
@@ -927,11 +960,12 @@ def main() -> int:
         # Batch 23 (#471/#472): stamp written_to_csv_at on the recommended
         # email_drafts rows AFTER the CSV write returned successfully.
         # If write_review_queue() had raised, none of these rows would
-        # claim they were written.
+        # claim they were written. Slice 1: every row in the review CSV
+        # gets stamped -- the operator-visible status is needs_review
+        # or qa_failed; either way the row landed in the CSV.
         rec_partner_ids = [
             r["partner_id"] for r in csv_rows
-            if r.get("outreach_status") == "ready_to_send"
-            or r.get("outreach_status") == "draft"
+            if r.get("outreach_status") in ("needs_review", "qa_failed")
         ]
         if rec_partner_ids:
             now = _now()
@@ -946,14 +980,19 @@ def main() -> int:
                     .values(written_to_csv_at=now)
                 )
 
-        ready = sum(1 for r in csv_rows if r["outreach_status"] == "ready_to_send")
-        warm_routed = sum(
-            1 for r in csv_rows if r["outreach_status"] == "warm_path_needed"
+        # Slice 1: 'ready' now means 'in needs_review' -- nothing is
+        # auto-ready_to_send. Approval is a separate human step.
+        ready = sum(
+            1 for r in csv_rows
+            if r["outreach_status"] == "needs_review"
+        )
+        qa_failed = sum(
+            1 for r in csv_rows if r["outreach_status"] == "qa_failed"
         )
         print(
             f"[stage 7] {len(csv_rows)} CSV row(s) -> {out_path} "
-            f"(ready_to_send={ready}, warm_path_needed={warm_routed}, "
-            f"draft={len(csv_rows) - ready - warm_routed})"
+            f"(needs_review={ready}, qa_failed={qa_failed}). "
+            f"NEXT: review + approve via scripts/list_pending_review.py"
         )
         if downgraded_count:
             # Finding 1: a Stage-6 recommended partner whose generated draft
