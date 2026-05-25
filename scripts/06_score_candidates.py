@@ -503,25 +503,23 @@ def main() -> int:
                         existing.manual_override_reason if existing else None
                     )
                     # Persistence owned by core/scoring/persistence.py
-                    # (Refactor 7/13).
-                    from core.scoring.persistence import (
-                        log_force_refresh_diff, persist_partner_score,
-                    )
+                    # (Refactor 7/13). Launch-blocker fix: audit rows
+                    # and score persistence land atomically in one
+                    # transaction so a persist failure can't leave the
+                    # force_refresh_log claiming an override was broken
+                    # while the new score never wrote.
+                    from core.scoring.persistence import persist_partner_score
+                    audit = None
                     if args.force_rescore and existing and (
                         existing_score_override or existing_rec_override
                     ):
-                        log_force_refresh_diff(
-                            engine,
-                            partner_id=p.partner_id,
-                            existing=existing,
-                            new_values=new_values,
-                            reason=args.reason,
-                        )
+                        audit = {"existing": existing, "reason": args.reason}
                     persist_partner_score(
                         engine,
                         partner_id=p.partner_id,
                         summary_values=new_values,
                         axis_scores=cs.axis_scores,
+                        force_refresh_audit=audit,
                     )
 
                     print(

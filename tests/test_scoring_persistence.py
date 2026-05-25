@@ -234,3 +234,85 @@ def test_force_refresh_no_diffs_no_logs(engine) -> None:
         reason="recheck",
     )
     assert written == 0
+
+
+def test_atomic_audit_writes_after_persist_succeeds(engine) -> None:
+    """Launch-blocker fix: passing force_refresh_audit to
+    persist_partner_score writes the audit rows in the SAME
+    transaction as the persistence, so a persist failure rolls back
+    the audit."""
+    persist_partner_score(
+        engine, partner_id="p1",
+        summary_values=_values(send_now_priority=10.0),
+        axis_scores={},
+    )
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(partner_score_summaries).where(
+                partner_score_summaries.c.partner_id == "p1"
+            )
+        ).first()
+    new_vals = _values(send_now_priority=42.0, scored_at=_now())
+    written = persist_partner_score(
+        engine, partner_id="p1", summary_values=new_vals,
+        axis_scores={},
+        force_refresh_audit={"existing": existing, "reason": "override"},
+    )
+    assert written == 1
+    with engine.begin() as conn:
+        score_now = conn.execute(
+            select(partner_score_summaries.c.send_now_priority)
+        ).scalar()
+        audit_rows = list(conn.execute(
+            select(force_refresh_log.c.field_name)
+        ))
+    assert score_now == 42.0
+    assert audit_rows == [("send_now_priority",)]
+
+
+def test_atomic_audit_rolls_back_when_persist_fails(engine) -> None:
+    """If the per-axis insert raises mid-transaction, NO audit row
+    should land -- the previous separate-transaction shape would have
+    written the audit BEFORE the persist crashed, claiming an
+    override was broken even though no new score landed."""
+    persist_partner_score(
+        engine, partner_id="p1", summary_values=_values(), axis_scores={},
+    )
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(partner_score_summaries).where(
+                partner_score_summaries.c.partner_id == "p1"
+            )
+        ).first()
+
+    class _Unserializable:
+        pass
+
+    class _BadAxis:
+        score = 5.0
+        confidence = "medium"
+        # json.dumps will raise on a class instance with no method.
+        supporting_signal_ids = _Unserializable()
+
+    try:
+        persist_partner_score(
+            engine, partner_id="p1",
+            summary_values=_values(send_now_priority=99.0),
+            axis_scores={"axis_a": _BadAxis()},
+            force_refresh_audit={
+                "existing": existing, "reason": "should rollback",
+            },
+        )
+    except Exception:
+        pass  # expected
+    with engine.begin() as conn:
+        score_now = conn.execute(
+            select(partner_score_summaries.c.send_now_priority)
+        ).scalar()
+        audit_rows = list(conn.execute(
+            select(force_refresh_log.c.field_name)
+        ))
+    # Score still at the prior value; no audit row landed despite
+    # send_now_priority "changing" in new_values.
+    assert score_now != 99.0
+    assert audit_rows == []
