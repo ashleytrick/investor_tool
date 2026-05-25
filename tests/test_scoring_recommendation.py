@@ -129,10 +129,13 @@ def test_low_reachability_blocks() -> None:
     assert "cold_reachability_score" in reason
 
 
-def test_warm_path_blocks_to_force_warm_route() -> None:
-    ok, reason = evaluate_recommended(**_green(warm_path_available=True))
-    assert ok is False
-    assert "warm_path_available=TRUE" in reason
+def test_warm_path_does_not_demote_recommendation() -> None:
+    """PR #10 review: warm_path_available used to add a 'prefer warm
+    route' gate fail. Product line is now 'no warm intros, ever' --
+    a partner with a warm path is still a valid cold-outreach
+    candidate. The kwarg is accepted for back-compat but IGNORED."""
+    ok, _reason = evaluate_recommended(**_green(warm_path_available=True))
+    assert ok is True
 
 
 # ----- outcome suppression (Batch 19) -----

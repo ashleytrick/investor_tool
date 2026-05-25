@@ -36,7 +36,12 @@ def evaluate_recommended(
     employment_status: str | None,
     major_kill: bool,
     cold_reachability_score: float | None,
-    warm_path_available: bool | None,
+    # PR #10 review: warm_path_available is accepted for back-compat
+    # with existing callers but IGNORED. Product requirement is "no
+    # warm intros, ever" -- a partner with a warm path should still
+    # be evaluated for cold outreach on the same criteria as anyone
+    # else. Removed from the gate fails list below.
+    warm_path_available: bool | None = None,
     today: date,
     # Batch 19 (#1101-#1103, #1125): suppress when an active outreach
     # cycle already exists for this partner. The outcomes table is the
@@ -150,8 +155,8 @@ def evaluate_recommended(
             f"cold_reachability_score ({cold_reachability_score:.1f}) "
             f"< {COLD_REACHABILITY_MIN}"
         )
-    if warm_path_available is True:
-        fails.append("warm_path_available=TRUE -- prefer warm route")
+    # PR #10 review: warm-path no longer demotes. Product line: no
+    # warm intros, ever -- cold outreach is the only path.
     ok = not fails
     reasoning = (
         "All Stage 6 criteria met; Stage 7 finalizes (strategy eligibility)."
