@@ -188,6 +188,7 @@ def main() -> int:
                 gate = can_approve_draft(
                     ws, engine, rec.draft_id,
                     allow_example_domains=policy.allow_example_domains,
+                    respect_overrides=True,
                 )
                 if not gate.ok:
                     msg = (

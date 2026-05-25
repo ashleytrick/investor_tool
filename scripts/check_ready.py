@@ -213,7 +213,10 @@ def _check_approved_gate_clean(ws, engine, allow_example_domains: bool) -> Check
     partner email cleared, qa_status revised by a Stage 7 re-run).
 
     The gate is the single source of truth -- using it here keeps
-    check_ready in sync as the gate grows.
+    check_ready in sync as the gate grows. respect_overrides=True so
+    drafts the operator approved with --override-blockers don't get
+    flagged again (the override is structurally persisted on the
+    approval event).
     """
     approved = approved_for_send(engine)
     if not approved:
@@ -221,18 +224,22 @@ def _check_approved_gate_clean(ws, engine, allow_example_domains: bool) -> Check
             "approved_gate_clean", True, "no approved drafts to re-check",
         )
     stale: list[tuple[int, tuple[str, ...]]] = []
+    overridden_count = 0
     for d in approved:
         gate = can_approve_draft(
             ws, engine, d.draft_id,
             allow_example_domains=allow_example_domains,
+            respect_overrides=True,
         )
+        if gate.overridden:
+            overridden_count += 1
         if not gate.ok:
             stale.append((d.draft_id, gate.blockers))
     if not stale:
-        return CheckResult(
-            "approved_gate_clean", True,
-            f"all {len(approved)} approved drafts still pass the gate",
-        )
+        msg = f"all {len(approved)} approved drafts still pass the gate"
+        if overridden_count:
+            msg += f" ({overridden_count} with operator override)"
+        return CheckResult("approved_gate_clean", True, msg)
     sample = "; ".join(
         f"draft_id={did}: {', '.join(blockers[:2])}"
         + ("..." if len(blockers) > 2 else "")

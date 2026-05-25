@@ -27,7 +27,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.approval.gate import can_approve_draft
+from core.approval.gate import can_approve_draft, split_blockers
 from core.approval.persistence import approve
 from core.config_loader import add_workspace_arg
 from core.db import email_drafts
@@ -114,7 +114,9 @@ def main() -> int:
             ws, engine, args.draft_id,
             allow_example_domains=args.allow_example_domains,
         )
+        soft_overrides: list[str] = []
         if not gate.ok:
+            hard, soft = split_blockers(gate.blockers)
             if not args.override_blockers:
                 print(
                     f"[approve] REFUSED: {len(gate.blockers)} blocker(s) "
@@ -131,6 +133,24 @@ def main() -> int:
                     f"approval blockers: {'; '.join(gate.blockers)}",
                 )
                 return ctx.exit_code
+            # PR #7 follow-up review: hard blockers (missing email,
+            # do-not-contact, invalid verification, etc.) can never be
+            # overridden. The operator must fix the underlying state.
+            if hard:
+                print(
+                    f"[approve] REFUSED: {len(hard)} HARD blocker(s) "
+                    f"cannot be bypassed by --override-blockers:"
+                )
+                for b in hard:
+                    print(f"  - {b}")
+                print(
+                    "[approve] resolve these (set partner email, clear "
+                    "DNC, fix verification) before re-attempting approval."
+                )
+                ctx.refuse(
+                    f"hard approval blockers: {'; '.join(hard)}",
+                )
+                return ctx.exit_code
             if not (args.notes or "").strip():
                 print(
                     "[approve] REFUSED: --override-blockers requires "
@@ -139,11 +159,12 @@ def main() -> int:
                 )
                 ctx.refuse("override without --notes")
                 return ctx.exit_code
+            soft_overrides = list(soft)
             print(
-                f"[approve] OVERRIDE: {len(gate.blockers)} blocker(s) "
-                f"acknowledged via --override-blockers:"
+                f"[approve] OVERRIDE: {len(soft_overrides)} soft "
+                f"blocker(s) acknowledged via --override-blockers:"
             )
-            for b in gate.blockers:
+            for b in soft_overrides:
                 print(f"  - {b}")
 
         # Slice 9: daily approval cap. Block when reached unless the
@@ -160,12 +181,13 @@ def main() -> int:
             ctx.refuse(f"daily approval cap reached ({count})")
             return ctx.exit_code
 
-        # Stamp the override into the approval notes so the
-        # draft_approvals event row preserves what the operator
-        # overrode.
+        # Persist the soft overrides structurally on the approval event
+        # so downstream gate re-checks (Gmail / Attio / send-queue) can
+        # honor them. The notes field still gets a human-readable
+        # summary prefix for the audit log.
         approval_notes = args.notes
-        if not gate.ok and args.override_blockers:
-            prefix = f"[OVERRODE BLOCKERS: {'; '.join(gate.blockers)}] "
+        if soft_overrides:
+            prefix = f"[OVERRODE BLOCKERS: {'; '.join(soft_overrides)}] "
             approval_notes = prefix + (approval_notes or "")
 
         try:
@@ -175,6 +197,7 @@ def main() -> int:
                 partner_id=row.partner_id,
                 actor=actor,
                 notes=approval_notes,
+                overridden_blockers=soft_overrides or None,
             )
         except Exception as exc:  # noqa: BLE001 - surface to operator
             print(f"[approve] REFUSED: {exc}")

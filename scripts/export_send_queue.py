@@ -140,6 +140,7 @@ def main() -> int:
         gate = can_approve_draft(
             ws, engine, d.draft_id,
             allow_example_domains=args.allow_example_domains,
+            respect_overrides=True,
         )
         if not gate.ok:
             stale.append((d.draft_id, gate.blockers))

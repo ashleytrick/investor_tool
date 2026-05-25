@@ -486,6 +486,13 @@ draft_approvals = Table(
     # Optional operator note (approval reasoning, rejection reason,
     # stale trigger detail).
     Column("notes", Text),
+    # Override durability (PR #7 follow-up review finding): when an
+    # approval used --override-blockers, the SOFT blockers the operator
+    # acknowledged are persisted here as a JSON list. Downstream gates
+    # (export_send_queue, Gmail, Attio, check_ready) consult this row
+    # so an overridden draft isn't immediately re-flagged as stale.
+    # NULL on non-override approvals.
+    Column("overridden_blockers", Text),
     Index("ix_draft_approvals_draft_id", "draft_id"),
     Index("ix_draft_approvals_partner_id", "partner_id"),
     Index("ix_draft_approvals_event_type", "event_type"),
