@@ -1,16 +1,16 @@
 """Pull recent partner-record modifications from Attio into the local
 `outcomes` table.
 
-Queries Attio's /v2/objects/people/records/query with a last_modified filter,
-maps each returned record_id back to the local partner_id via
-partners.attio_record_id, and appends a row to `outcomes` with the
-outreach_status / reply_type / meeting_* fields. Append-only: each sync
-produces a snapshot; the monthly learning report consumes the most recent
-row per partner.
+Queries Attio's /v2/objects/people/records/query with a last_modified
+filter and hands every returned record to the Attio outcome adapter
+(core/outcomes/attio_adapter.py). Each `OutcomeEvent` then flows
+through the source-neutral persistence layer
+(core/outcomes/persistence.py), which dedups via external_event_id
++ skips state-unchanged events before insert.
 
-If the workspace has no attio.yaml or no ATTIO_API_KEY, exits 0 with a clear
-skip message. Re-runs are safe; the brief schema has no unique constraint on
-outcomes, so multiple syncs build a history of state changes.
+If the workspace has no attio.yaml or no ATTIO_API_KEY, exits 0 with
+a clear skip message. Re-runs are safe; the external_event_id unique
+index guarantees that retries / cron overlaps don't double-insert.
 
 Run: uv run python jobs/attio_outcome_sync.py --workspace clients/{name}
 """
@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -27,7 +27,9 @@ from sqlalchemy import select
 
 from core.attio_client import AttioClient, AttioError, AttioNotConfigured
 from core.config_loader import add_workspace_arg, load_workspace
-from core.db import outcomes, partners
+from core.db import partners
+from core.outcomes.attio_adapter import attio_record_to_event
+from core.outcomes.persistence import persist_outcome_event
 from core.stage_runner import stage_run
 
 STAGE = "attio_outcome_sync"
@@ -35,53 +37,6 @@ STAGE = "attio_outcome_sync"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _scalar(values: dict, slug: str):
-    v = values.get(slug)
-    if not v:
-        return None
-    if isinstance(v, list):
-        return v[0].get("value") if v else None
-    return v
-
-
-def _bool(values: dict, slug: str) -> bool:
-    """Parse a boolean Attio attribute value safely.
-
-    Finding 33: a previous version did `bool(_scalar(...))`, which accepted
-    a string "false" from the API as Truthy. Now we map common falsey
-    strings explicitly and only treat real-bool / explicit truthy strings
-    as True.
-    """
-    v = _scalar(values, slug)
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.strip().lower() in ("true", "1", "yes")
-    return False
-
-
-def _option_title(values: dict, slug: str) -> str | None:
-    v = values.get(slug)
-    if not v:
-        return None
-    try:
-        return v[0]["option"]["title"]
-    except (KeyError, IndexError, TypeError):
-        return None
-
-
-def _date(values: dict, slug: str) -> date | None:
-    raw = _scalar(values, slug)
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(str(raw)).date()
-    except ValueError:
-        return None
 
 
 def main() -> int:
@@ -149,77 +104,26 @@ def main() -> int:
             return ctx.exit_code
         print(f"[outcome_sync] pulled {len(records)} modified record(s) from Attio")
 
+        observed_at = _now()
         for rec in records:
             with run.attempt():
                 rec_id = (rec.get("id") or {}).get("record_id")
                 try:
-                    pid = attio_to_partner.get(rec_id)
-                    if not pid:
+                    event = attio_record_to_event(
+                        rec, attio_to_partner, observed_at,
+                    )
+                    if event is None:
+                        # Record doesn't map to a known local partner
+                        # (the workspace hasn't synced this partner via
+                        # Stage 8 yet, or shape drift on Attio's side).
                         run.skip()
                         continue
-                    values = rec.get("values", {})
-                    # Batch 41 (#56): wire external_event_id. Attio's record
-                    # id alone isn't unique per OUTCOME event (the same
-                    # person record is modified many times). Build a stable
-                    # hash over (record_id + the meaningful state fields)
-                    # so retries / cron overlaps don't double-insert the
-                    # same observed state.
-                    import hashlib as _hash
-                    outreach_status = _option_title(values, "outreach_status")
-                    reply_type = _option_title(values, "reply_type")
-                    meeting_booked = _bool(values, "meeting_booked")
-                    meeting_date = _date(values, "meeting_date")
-                    meeting_outcome = _option_title(values, "meeting_outcome")
-                    event_payload = "|".join((
-                        str(rec_id),
-                        str(outreach_status),
-                        str(reply_type),
-                        str(meeting_booked),
-                        str(meeting_date),
-                        str(meeting_outcome),
-                    ))
-                    ext_event_id = (
-                        "attio:" + _hash.sha1(event_payload.encode()).hexdigest()[:16]
-                    )
-                    row = {
-                        "partner_id": pid,
-                        "outreach_status": outreach_status,
-                        "reply_type": reply_type,
-                        "meeting_booked": meeting_booked,
-                        "meeting_date": meeting_date,
-                        "meeting_outcome": meeting_outcome,
-                        "synced_from_attio_at": _now(),
-                        "source": "attio",
-                        "external_event_id": ext_event_id,
-                    }
-                    # Batch 41 (#57): dedupe against ALL outcomes for this
-                    # partner (not just the latest), using external_event_id
-                    # if the row carries one OR the legacy field-match
-                    # heuristic for older rows that pre-date Batch 41.
-                    with engine.begin() as conn:
-                        by_event = conn.execute(
-                            select(outcomes.c.outcome_id).where(
-                                outcomes.c.external_event_id == ext_event_id,
-                            )
-                        ).first()
-                        if by_event:
-                            run.skip()
-                            continue
-                        latest = conn.execute(
-                            select(outcomes).where(outcomes.c.partner_id == pid)
-                            .order_by(outcomes.c.outcome_id.desc()).limit(1)
-                        ).first()
-                        unchanged = bool(latest) and (
-                            latest.outreach_status == row["outreach_status"]
-                            and latest.reply_type == row["reply_type"]
-                            and bool(latest.meeting_booked) == row["meeting_booked"]
-                            and latest.meeting_date == row["meeting_date"]
-                            and latest.meeting_outcome == row["meeting_outcome"]
-                        )
-                        if unchanged:
-                            run.skip()
-                            continue
-                        conn.execute(outcomes.insert().values(**row))
+                    outcome_id = persist_outcome_event(engine, event)
+                    if outcome_id is None:
+                        # Dedup hit -- either external_event_id already
+                        # exists OR the state matches the latest row.
+                        run.skip()
+                        continue
                 except Exception as exc:  # noqa: BLE001 - logged, continue
                     run.fail(rec_id or "?", type(exc).__name__, str(exc))
 
