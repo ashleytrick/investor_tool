@@ -227,9 +227,62 @@ deal_attributions = Table(
     # match score for the lead fund. Useful for filtering low-confidence
     # attributions out of Stage 6 round_fit later.
     Column("match_confidence", Float),
+    # Slice 6: honest attribution status. Stage 3 sets this when it
+    # persists the row. Stage 6 scoring only counts confirmed +
+    # strong likely toward lead_likelihood; ambiguous goes to the
+    # review queue and contributes nothing to scoring; rejected is
+    # never counted.
+    # Values: confirmed | likely | ambiguous | rejected | unmatched
+    Column("match_status", Text, default="unmatched"),
+    # Slice 6: how the match was made. Drives operator audit + lets
+    # Stage 6 weight matches by reliability (exact > domain >
+    # fund_name fuzzy > partner_name fuzzy > llm-only).
+    # Values: exact | domain | fund_name | partner_name | llm | manual
+    Column("matched_by", Text),
+    # Slice 6: human review trail. NULL when no review happened; set
+    # by scripts/review_attribution.py when an operator confirms /
+    # rejects an ambiguous row.
+    Column("review_status", Text),  # confirmed | rejected | null
+    Column("reviewed_by", Text),
+    Column("reviewed_at", DateTime),
     Column("snapshot_id", Integer, ForeignKey("source_snapshots.snapshot_id")),
     Index("ix_deal_attributions_lead_fund_id", "lead_fund_id"),
     Index("ix_deal_attributions_attributed_partner_id", "attributed_partner_id"),
+    Index("ix_deal_attributions_match_status", "match_status"),
+)
+
+
+# Slice 6: generic review queue. One row per item that needs human
+# attention. `kind` discriminates the item type so a future UI / CLI
+# can hydrate kind-specific context from the JSON blob without
+# proliferating per-kind tables.
+#
+# kind values (extensible):
+#   - ambiguous_attribution : Stage 3 produced an ambiguous fund/
+#     partner match for a deal_attributions row. target_id is the
+#     deal_id (text-encoded).
+#   - pending_approval      : reserved for future use (mirrors the
+#     dedicated draft_approvals chain but lets a single review UI
+#     show both kinds).
+review_items = Table(
+    "review_items", metadata,
+    Column("review_id", Integer, primary_key=True, autoincrement=True),
+    Column("kind", Text, nullable=False),
+    # Foreign-id of the underlying row (deal_id, draft_id, etc.).
+    # Stored as text so future kinds can use different id types.
+    Column("target_id", Text, nullable=False),
+    # JSON-serialized dict with kind-specific context the reviewer
+    # needs to make the decision. E.g. for ambiguous_attribution:
+    # {candidates: [{fund_id, name, score}], raw_lead_investor: ...}
+    Column("context", Text),
+    # pending | resolved | dismissed
+    Column("status", Text, default="pending"),
+    Column("resolved_by", Text),
+    Column("resolved_at", DateTime),
+    Column("resolution_notes", Text),
+    Column("created_at", DateTime),
+    Index("ix_review_items_kind_status", "kind", "status"),
+    Index("ix_review_items_target", "kind", "target_id"),
 )
 
 scores = Table(
