@@ -13,7 +13,7 @@ import pathlib
 import subprocess
 import sys
 
-from fastapi import HTTPException, Header
+from fastapi import Depends, HTTPException, Header
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -295,12 +295,49 @@ def current_user_role(
     (`app_metadata.role` preferred, then the top-level `role`
     claim) or 'admin' for the legacy API_KEY path during cutover.
 
-    The per-tenant Supabase `public.user_roles.role` lookup that
-    upgrades 'authenticated' -> 'admin' / 'moderator' is Phase 5
-    work and goes on top of this dependency.
+    Phase 5 sits on top of this dependency: admin endpoints use
+    `require_admin` which ALSO checks the Supabase
+    `public.user_roles.role` table (cached 5 min in-process) so
+    an operator can grant admin via the dashboard without minting
+    a new JWT with custom `app_metadata`.
     """
     p = current_principal(authorization=authorization)
     return p.get("role") if p else None
+
+
+def require_admin(
+    principal: dict | None = Depends(current_principal),
+) -> dict:
+    """Phase 5: admin-only gate.
+
+    Resolution order:
+      1. Legacy API_KEY auth path -> principal['role'] == 'admin'
+         (set by `_api_key_fallback_principal`). Passes during the
+         cutover window so admin endpoints work BEFORE Supabase
+         user_roles is populated. Operator removes the fallback
+         once real admin users are minted.
+      2. JWT path -> consult Supabase `public.user_roles.role` via
+         `core.supabase_admin.is_admin`. The lookup is cached in-
+         process for 5 minutes per user_id.
+      3. Anything else -> 403.
+
+    Returns the validated principal dict so admin endpoints have
+    `user_id` / `email` to log + display without re-resolving.
+    """
+    if principal is None:
+        # Nobody authed at all -> 401 takes precedence over 403.
+        raise HTTPException(401, "missing bearer token")
+    if principal.get("role") == "admin":
+        return principal
+    # JWT path: check Supabase user_roles. Cached.
+    from core.supabase_admin import is_admin
+    if is_admin(principal.get("user_id")):
+        return principal
+    raise HTTPException(
+        403,
+        "admin role required; ask an existing admin to grant access "
+        "via public.user_roles in the Supabase dashboard",
+    )
 
 
 def _ws_path() -> str:
