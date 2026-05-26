@@ -1191,14 +1191,36 @@ def test_legacy_api_key_accepted_when_fallback_on(
     jwt_client: TestClient, monkeypatch,
 ) -> None:
     """Cutover window: both JWTs AND the legacy key work while
-    AUTH_ALLOW_API_KEY_FALLBACK=true. The frontend can ship JWT
-    support without breaking already-running clients."""
+    AUTH_ALLOW_API_KEY_FALLBACK=true AND API_KEY_FALLBACK_USER_ID
+    binds the shared key to a specific tenant. The frontend can
+    ship JWT support without breaking already-running clients,
+    and legacy traffic gets attributed to the configured uuid."""
     monkeypatch.setenv("AUTH_ALLOW_API_KEY_FALLBACK", "true")
+    monkeypatch.setenv(
+        "API_KEY_FALLBACK_USER_ID",
+        "44444444-4444-4444-4444-444444444444",
+    )
     res = jwt_client.get(
         "/review/pending",
         headers={"Authorization": "Bearer legacy-api-key"},
     )
     assert res.status_code == 200, res.text
+
+
+def test_legacy_api_key_rejected_when_fallback_on_but_no_uid_binding(
+    jwt_client: TestClient, monkeypatch,
+) -> None:
+    """Phase 1.5 tightening: fallback ON but
+    API_KEY_FALLBACK_USER_ID unset -> 401. Refusing is safer than
+    silently mis-attributing legacy traffic to an unknown tenant."""
+    monkeypatch.setenv("AUTH_ALLOW_API_KEY_FALLBACK", "true")
+    monkeypatch.delenv("API_KEY_FALLBACK_USER_ID", raising=False)
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": "Bearer legacy-api-key"},
+    )
+    assert res.status_code == 401
+    assert "API_KEY_FALLBACK_USER_ID" in res.text
 
 
 def test_legacy_api_key_still_works_when_jwt_secret_unset(
@@ -1257,3 +1279,110 @@ def test_current_user_id_is_none_when_no_auth() -> None:
     import web.deps as deps
     assert deps.current_user_id(authorization=None) is None
     assert deps.current_user_id(authorization="Basic foo") is None
+
+
+# ---------- Phase 1.5 Principal extras (email + role) ---------------------
+
+def test_current_principal_extracts_email_and_role_from_jwt(
+    monkeypatch,
+) -> None:
+    """JWT path: email is the top-level claim Supabase sets, role
+    comes from `app_metadata.role`. Both surface in the dict
+    returned by `current_principal`."""
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", _JWT_SECRET)
+    import importlib
+    import web.deps as deps
+    importlib.reload(deps)
+    token = _make_jwt(
+        sub="55555555-5555-5555-5555-555555555555",
+        extra={
+            "email": "ashley@kismet.fund",
+            "app_metadata": {"role": "admin"},
+        },
+    )
+    p = deps.current_principal(authorization=f"Bearer {token}")
+    assert p == {
+        "user_id": "55555555-5555-5555-5555-555555555555",
+        "email": "ashley@kismet.fund",
+        "role": "admin",
+        "source": "jwt",
+    }
+
+
+def test_current_principal_role_fallback_to_top_level_claim(
+    monkeypatch,
+) -> None:
+    """Supabase tokens carry `role: 'authenticated'` at the top
+    level even when `app_metadata.role` is missing. The dependency
+    surfaces that as the role until Phase 5's user_roles lookup
+    upgrades it."""
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", _JWT_SECRET)
+    import importlib
+    import web.deps as deps
+    importlib.reload(deps)
+    # _make_jwt's default extra carries `role: "authenticated"`.
+    token = _make_jwt()
+    p = deps.current_principal(authorization=f"Bearer {token}")
+    assert p is not None
+    assert p["role"] == "authenticated"
+
+
+def test_current_principal_api_key_path_resolves_to_admin(
+    monkeypatch,
+) -> None:
+    """Spec: 'accept the old VITE_API_KEY as admin-equivalent
+    bearer'. The legacy key path resolves to role='admin' so admin
+    endpoints work during cutover without a Supabase admin row."""
+    monkeypatch.setenv("API_KEY", "legacy-shared-key")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", _JWT_SECRET)
+    monkeypatch.setenv("AUTH_ALLOW_API_KEY_FALLBACK", "true")
+    monkeypatch.setenv(
+        "API_KEY_FALLBACK_USER_ID",
+        "66666666-6666-6666-6666-666666666666",
+    )
+    monkeypatch.setenv("API_KEY_FALLBACK_EMAIL", "ops@kismet.fund")
+    import importlib
+    import web.deps as deps
+    importlib.reload(deps)
+    p = deps.current_principal(authorization="Bearer legacy-shared-key")
+    assert p == {
+        "user_id": "66666666-6666-6666-6666-666666666666",
+        "email": "ops@kismet.fund",
+        "role": "admin",
+        "source": "api_key",
+    }
+
+
+def test_current_principal_api_key_path_returns_none_when_uid_unset(
+    monkeypatch,
+) -> None:
+    """Without API_KEY_FALLBACK_USER_ID, the legacy key path
+    returns None from current_principal (and require_auth rejects
+    the request entirely). This is the spec's 'reject rather than
+    silently mis-attribute' guarantee at the dependency layer."""
+    monkeypatch.setenv("API_KEY", "legacy-shared-key")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", _JWT_SECRET)
+    monkeypatch.setenv("AUTH_ALLOW_API_KEY_FALLBACK", "true")
+    monkeypatch.delenv("API_KEY_FALLBACK_USER_ID", raising=False)
+    import importlib
+    import web.deps as deps
+    importlib.reload(deps)
+    p = deps.current_principal(authorization="Bearer legacy-shared-key")
+    assert p is None
+
+
+def test_current_user_email_and_role_thin_wrappers(monkeypatch) -> None:
+    """The dedicated -email / -role dependencies are thin shims
+    around `current_principal`. Smoke them to confirm they return
+    the same values."""
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", _JWT_SECRET)
+    import importlib
+    import web.deps as deps
+    importlib.reload(deps)
+    token = _make_jwt(extra={
+        "email": "founder@example.com",
+        "app_metadata": {"role": "moderator"},
+    })
+    auth = f"Bearer {token}"
+    assert deps.current_user_email(authorization=auth) == "founder@example.com"
+    assert deps.current_user_role(authorization=auth) == "moderator"

@@ -124,12 +124,26 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
         return
 
     # 2) Legacy API_KEY fallback.
-    # - In legacy mode (no JWT secret), this is always on.
-    # - In JWT mode, only when AUTH_ALLOW_API_KEY_FALLBACK is set.
+    # - In legacy mode (no JWT secret), this is always on -- existing
+    #   pre-cutover deployments keep working unchanged.
+    # - In JWT mode, only when AUTH_ALLOW_API_KEY_FALLBACK is set
+    #   AND `API_KEY_FALLBACK_USER_ID` binds the shared key to a
+    #   specific tenant. Without the binding env var, we'd be
+    #   silently mis-attributing legacy traffic to an unknown
+    #   tenant; per the spec we refuse instead.
     fallback_on = (not jwt_mode) or _is_api_key_fallback_enabled()
     if fallback_on:
         expected = os.environ.get("API_KEY") or ""
         if expected and hmac.compare_digest(token, expected):
+            if jwt_mode and not (
+                os.environ.get("API_KEY_FALLBACK_USER_ID") or ""
+            ):
+                raise HTTPException(
+                    401,
+                    "API_KEY accepted but API_KEY_FALLBACK_USER_ID "
+                    "is unset; refusing to attribute legacy traffic "
+                    "to an unknown tenant",
+                )
             return
 
     raise HTTPException(
@@ -138,37 +152,144 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
     )
 
 
-def current_user_id(
+def _api_key_fallback_principal() -> dict | None:
+    """Build the Principal-shaped dict returned to callers when the
+    legacy API_KEY path authenticates.
+
+    The legacy key is shared (not per-user), so we attribute its
+    traffic to a specific UUID via `API_KEY_FALLBACK_USER_ID` env
+    var (typically the operator's own admin uuid). Without that
+    env var, we have no honest user_id to scope queries by --
+    returning a principal with `user_id=None` would invite silent
+    cross-tenant reads, so we return None here and let
+    `require_auth` reject the request with 401.
+
+    Spec: 'For backward-compat during migration, also accept the
+    old VITE_API_KEY as admin-equivalent bearer.' -> role='admin'
+    so admin endpoints work during the cutover window without
+    needing an actual Supabase admin row.
+    """
+    uid = os.environ.get("API_KEY_FALLBACK_USER_ID") or ""
+    if not uid:
+        return None
+    return {
+        "user_id": uid,
+        "email": os.environ.get("API_KEY_FALLBACK_EMAIL") or None,
+        "role": "admin",
+        "source": "api_key",
+    }
+
+
+def _principal_from_claims(claims: dict) -> dict:
+    """Project Supabase JWT claims into the Principal shape callers
+    consume. Pulls `email` directly from the top-level claim
+    Supabase sets, and `role` from `app_metadata.role` (Supabase
+    convention) with a fallback to the JWT's top-level `role`
+    (which Supabase uses for the broad `authenticated` /
+    `service_role` tag, not the app's role enum).
+
+    The per-tenant Supabase `public.user_roles.role` lookup that
+    upgrades 'authenticated' -> 'admin' / 'moderator' belongs to
+    Phase 5; this Phase 1.5 function only surfaces what's already
+    in the JWT.
+    """
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        return {}  # caller treats empty as not-authenticated
+    email = claims.get("email") if isinstance(claims.get("email"), str) else None
+    app_meta = claims.get("app_metadata") or {}
+    role = None
+    if isinstance(app_meta, dict):
+        candidate = app_meta.get("role")
+        if isinstance(candidate, str) and candidate:
+            role = candidate
+    if role is None:
+        candidate = claims.get("role")
+        if isinstance(candidate, str) and candidate:
+            role = candidate
+    return {
+        "user_id": sub,
+        "email": email,
+        "role": role,
+        "source": "jwt",
+    }
+
+
+def current_principal(
     authorization: str | None = Header(default=None),
-) -> str | None:
-    """Return the authenticated principal's user_id for query
-    scoping (Phase 2+ work).
+) -> dict | None:
+    """Return the authenticated principal as a dict:
 
-    Resolution order:
-      1. Supabase JWT `sub` claim (the user's UUID), when verified.
-      2. `API_KEY_FALLBACK_USER_ID` env var, when the legacy
-         API_KEY path authenticated the request -- lets the
-         operator tag pre-cutover traffic to a specific user_id
-         (typically their own admin uuid) for backfill consistency.
-      3. None, when neither path resolves -- callers in Phase 2
-         treat this as "show everything, no scoping" during the
-         single-tenant transition window. After backfill +
-         enforcement, this state becomes a hard 401.
+      {"user_id": <uuid>, "email": <email|None>,
+       "role": <role|None>, "source": "jwt" | "api_key"}
 
-    This dependency does NOT raise -- it's purely informational.
-    `require_auth` is the gate that raises 401; pair both when an
-    endpoint needs to both authenticate AND scope its queries.
+    Source order:
+      1. Supabase JWT (claims via `_verify_supabase_jwt`)
+      2. Legacy API_KEY path -- only if API_KEY matches AND
+         `API_KEY_FALLBACK_USER_ID` is set. Without the env var,
+         legacy-key requests are NOT honored by this dependency
+         (and `require_auth` rejects them with 401 below).
+      3. None when neither path resolves.
+
+    Pure read; does NOT raise. `require_auth` is the gate.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
     token = authorization.split(" ", 1)[1].strip()
-    claims = _verify_supabase_jwt(token)
-    if claims is not None:
-        sub = claims.get("sub")
-        return sub if isinstance(sub, str) and sub else None
-    # API_KEY fallback path -- resolve via env var.
-    fallback_uid = os.environ.get("API_KEY_FALLBACK_USER_ID") or None
-    return fallback_uid
+
+    if _jwt_secret() is not None:
+        claims = _verify_supabase_jwt(token)
+        if claims is not None:
+            principal = _principal_from_claims(claims)
+            return principal or None
+
+    # API_KEY path -- only honored when the env var binds it to a
+    # specific user_id.
+    fallback_on = (
+        _jwt_secret() is None or _is_api_key_fallback_enabled()
+    )
+    if fallback_on:
+        expected = os.environ.get("API_KEY") or ""
+        if expected and hmac.compare_digest(token, expected):
+            return _api_key_fallback_principal()
+
+    return None
+
+
+def current_user_id(
+    authorization: str | None = Header(default=None),
+) -> str | None:
+    """Compatibility shim around `current_principal`. Returns just
+    the user_id string (or None). Endpoints that need email / role
+    use `current_principal` directly.
+    """
+    p = current_principal(authorization=authorization)
+    return p.get("user_id") if p else None
+
+
+def current_user_email(
+    authorization: str | None = Header(default=None),
+) -> str | None:
+    """The authenticated user's email, when the JWT carried one (or
+    `API_KEY_FALLBACK_EMAIL` for the legacy path). None otherwise.
+    """
+    p = current_principal(authorization=authorization)
+    return p.get("email") if p else None
+
+
+def current_user_role(
+    authorization: str | None = Header(default=None),
+) -> str | None:
+    """The authenticated principal's role, sourced from the JWT
+    (`app_metadata.role` preferred, then the top-level `role`
+    claim) or 'admin' for the legacy API_KEY path during cutover.
+
+    The per-tenant Supabase `public.user_roles.role` lookup that
+    upgrades 'authenticated' -> 'admin' / 'moderator' is Phase 5
+    work and goes on top of this dependency.
+    """
+    p = current_principal(authorization=authorization)
+    return p.get("role") if p else None
 
 
 def _ws_path() -> str:
