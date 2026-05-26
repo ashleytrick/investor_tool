@@ -28,6 +28,8 @@ web = [
 # Install with: uv sync --extra api
 api = [
     "fastapi>=0.115",
+    "pypdf>=5.0",
+    "python-pptx>=1.0",
     "uvicorn[standard]>=0.30",
 ]
 
