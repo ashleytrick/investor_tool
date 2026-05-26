@@ -1,0 +1,45 @@
+name: Fly deploy
+
+# Auto-deploys the FastAPI backend to Fly after CI passes on main.
+# Setup (one-time):
+#   1. fly tokens create deploy -a investor-outreach-api-trick
+#   2. Save the token as repo secret FLY_API_TOKEN
+#      (Settings -> Secrets and variables -> Actions -> New repository secret)
+#
+# The deploy is gated on the CI workflow ("CI") completing
+# successfully on the same commit -- a red CI never reaches Fly.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:  # manual "redeploy current main" from the Actions UI
+
+# Serialize deploys so two fast-following merges can't race the Fly
+# image swap. Newer pushes queue; nothing is cancelled mid-deploy.
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Fly
+    runs-on: ubuntu-latest
+    # workflow_dispatch always runs; workflow_run only when CI succeeded.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        # Check out the exact commit CI ran against, not whatever
+        # `main` happens to point at right now -- a follow-on push
+        # arriving while CI was still running shouldn't sneak into
+        # this deploy without its own CI pass.
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: fly deploy
+        run: flyctl deploy --remote-only -a investor-outreach-api-trick
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
