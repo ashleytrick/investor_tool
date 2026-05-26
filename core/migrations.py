@@ -185,6 +185,59 @@ def _m003_backfill_source_ids_extended(conn: Any) -> None:
             )
 
 
+def _m004_backfill_funds_source_ids(conn: Any) -> None:
+    """Slice 18b follow-up (#18, final): backfill funds.source_ids
+    from the legacy `; `-delimited source_urls string. For each fund
+    that has a non-empty source_urls but no source_ids JSON, split on
+    `; `, upsert each URL into the sources registry, write the JSON
+    list of source_id values.
+
+    Safe to run on workspaces that don't have the funds.source_ids
+    column yet (defensive table+column check). Idempotent: skip funds
+    whose source_ids is already set.
+    """
+    import json as _json
+
+    has_table = [
+        row[0] for row in conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='funds'"
+        )
+    ]
+    if not has_table:
+        return
+    cols = {
+        row[1] for row in conn.exec_driver_sql(
+            "PRAGMA table_info(funds)"
+        )
+    }
+    if "source_ids" not in cols or "source_urls" not in cols:
+        return
+    rows = list(conn.exec_driver_sql(
+        "SELECT fund_id, source_urls FROM funds "
+        "WHERE source_urls IS NOT NULL AND source_urls != '' "
+        "  AND (source_ids IS NULL OR source_ids = '')"
+    ))
+    if not rows:
+        return
+    from core.sources import upsert_source
+    for fund_id, urls_blob in rows:
+        urls = [u.strip() for u in str(urls_blob).split(";") if u.strip()]
+        if not urls:
+            continue
+        sids: list[int] = []
+        for url in urls:
+            sid = upsert_source(
+                conn, source_url=url, source_type="fund_team_page",
+            )
+            if sid not in sids:
+                sids.append(sid)
+        conn.exec_driver_sql(
+            "UPDATE funds SET source_ids = ? WHERE fund_id = ?",
+            (_json.dumps(sids), fund_id),
+        )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(
         id="m001_baseline",
@@ -210,6 +263,15 @@ MIGRATIONS: list[Migration] = [
             "deal_attributions, and ambiguous_matches. Idempotent."
         ),
         apply=_m003_backfill_source_ids_extended,
+    ),
+    Migration(
+        id="m004_backfill_funds_source_ids",
+        description=(
+            "Slice 18b follow-up (#18 final) -- backfill "
+            "funds.source_ids JSON list from the legacy "
+            "`; `-delimited source_urls string. Idempotent."
+        ),
+        apply=_m004_backfill_funds_source_ids,
     ),
 ]
 

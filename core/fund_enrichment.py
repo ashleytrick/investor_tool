@@ -47,18 +47,39 @@ _PRESERVE_ON_EMPTY: tuple[
 )
 
 
-def build_fund_update_values(enrichment: Any, now: datetime) -> dict:
+def build_fund_update_values(
+    enrichment: Any, now: datetime, *, conn: Any = None,
+) -> dict:
     """Return a dict of column -> value to apply to the funds row.
 
-    `last_updated` and `source_urls` always land (they reflect "we
-    ran enrichment at time T"). Every other field is preserve-on-
-    empty: only included when the LLM filled it this run, so a
-    sparse re-run can't blank out a richer prior extraction.
+    `last_updated`, `source_urls` (legacy delimited), and -- when
+    `conn` is supplied -- `source_ids` (JSON list of source_id values
+    into the canonical `sources` registry, Slice 18b follow-up #18)
+    always land. Every other field is preserve-on-empty: only included
+    when the LLM filled it this run, so a sparse re-run can't blank
+    out a richer prior extraction.
+
+    `conn` is optional for backward compatibility with callers that
+    pre-date the sources registry. When omitted, `source_ids` is left
+    NULL and m004_backfill_funds_source_ids picks it up on next
+    workspace open.
     """
+    import json as _json
+
     out: dict[str, Any] = {
         "last_updated": now,
         "source_urls": "; ".join(str(u) for u in enrichment.source_urls_used),
     }
+    if conn is not None:
+        from core.sources import upsert_source
+        sids: list[int] = []
+        for url in enrichment.source_urls_used:
+            sid = upsert_source(
+                conn, source_url=str(url), source_type="fund_team_page",
+            )
+            if sid not in sids:
+                sids.append(sid)
+        out["source_ids"] = _json.dumps(sids)
     for attr, col, transform in _PRESERVE_ON_EMPTY:
         value = getattr(enrichment, attr, None)
         if not value:

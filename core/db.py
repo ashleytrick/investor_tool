@@ -114,7 +114,17 @@ funds = Table(
     Column("last_known_activity_date", Date),
     Column("is_active", Boolean),
     Column("kill_signals", Text),
+    # Legacy: `; `-delimited list of source URLs (pre-Slice-18b shape).
+    # Kept for backward-compatibility reads; no current code path
+    # consumes it. New writers populate `source_ids` instead -- a JSON
+    # list of integer source_id values into the canonical `sources`
+    # registry. Operator audit goes via the JOIN.
     Column("source_urls", Text),
+    # Slice 18b follow-up (#18): JSON list of source_id values that
+    # contributed to this fund's enrichment. Populated by
+    # core.fund_enrichment.build_fund_update_values; backfilled from
+    # `source_urls` by m004_backfill_funds_source_ids.
+    Column("source_ids", Text),
     Column("last_updated", DateTime),
     # Batch 32 (#742): TRUE when Stage 3 created the row from an
     # announcement before Stage 2 enriched the fund. Distinguishes

@@ -146,13 +146,19 @@ def main() -> int:
                         partner_upsert_values,
                     )
                     now = _now()
-                    update_values = build_fund_update_values(enrichment, now)
                     # Track which partners are still on the team page this
                     # run so we can demote anyone previously seen but now
                     # missing.
                     discovered_pids: set[str] = set()
 
                     with engine.begin() as conn:
+                        # Slice 18b follow-up (#18): pass `conn` so the
+                        # builder can upsert into the sources registry +
+                        # produce a source_ids JSON list alongside the
+                        # legacy semicolon-delimited source_urls.
+                        update_values = build_fund_update_values(
+                            enrichment, now, conn=conn,
+                        )
                         conn.execute(
                             funds.update()
                             .where(funds.c.fund_id == fund["fund_id"])
