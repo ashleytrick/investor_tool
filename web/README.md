@@ -1,95 +1,155 @@
-# Operator Web UI
+# FastAPI Backend
 
-Streamlit app over the existing CLI pipeline. Lets you browse the
-review queue, set partner emails, approve/reject drafts, run
-`check_ready --for send`, and download the send-queue CSV without
-ever leaving the browser. Every mutating action shells out to the
-matching `scripts/*.py` so the existing lock + audit + backup story
-is unchanged.
+FastAPI backend for the external React/Lovable frontend. It wraps the existing
+CLI pipeline and operator commands, so workspace locks, backups, migrations, run
+logs, and approval gates stay in the same Python code paths used by the CLI.
 
-## Local
+This is the browser API surface. The older static `ui_prototype/` is mock data;
+this backend is the part a real frontend talks to.
+
+## Local Development
 
 ```bash
-uv sync --extra web
-APP_PASSWORD=dev \
+uv sync --extra api
+API_KEY=dev-key \
 INVESTOR_WORKSPACE=clients/test_workspace \
-  uv run --extra web streamlit run web/app.py
+API_ALLOW_EXAMPLE_DOMAINS=true \
+  uv run --extra api uvicorn web.api:app --reload --port 8080
 ```
 
-Then open http://localhost:8501.
+OpenAPI is available at `http://localhost:8080/openapi.json`.
 
-## Deploy to Fly.io (free tier)
+Every non-health endpoint requires:
 
-Fly's free allotment covers 3 shared-CPU-1x VMs + 3GB of persistent
-volume -- enough for one operator UI with the SQLite workspace on
-disk. A credit card is required at signup but you won't be billed
-while you stay under the free limits.
-
-One-time setup:
-
-```bash
-# 1. Install + login.
-curl -L https://fly.io/install.sh | sh
-fly auth signup            # or: fly auth login
-
-# 2. Pick a unique app name. Edit fly.toml line 1:
-#    app = "investor-outreach-ui-<yourname>"
-
-# 3. Provision the app + persistent volume.
-fly launch --no-deploy --copy-config --name <your-app-name>
-fly volumes create investor_workspace --size 3 --region iad
-
-# 4. Set secrets (NOT in fly.toml -- those land in env, secrets stay
-#    encrypted at rest and are injected at runtime).
-fly secrets set APP_PASSWORD='choose-a-strong-password'
-fly secrets set ANTHROPIC_API_KEY='sk-ant-...'    # if Stage 7 used in UI
-fly secrets set ATTIO_API_KEY='...'               # if Stage 8 used in UI
-
-# 5. Deploy.
-fly deploy
+```http
+Authorization: Bearer dev-key
 ```
 
-The app comes up at `https://<your-app-name>.fly.dev`. Hit it, enter
-the password, you're in.
+## Important Safety Defaults
 
-## Seeding a workspace on Fly
+The API does **not** pass fixture/example-domain bypass flags by default. That
+means `.example`, `.test`, `.invalid`, and other fixture data stay blocked in
+client-facing deployments.
 
-The UI expects a workspace at `/data/workspace` (mounted from the
-persistent volume). On first deploy that's empty, so seed it:
+For local fixture demos only, set:
 
 ```bash
-# Push your workspace config from your laptop to the volume.
-fly ssh sftp shell
+API_ALLOW_EXAMPLE_DOMAINS=true
+```
+
+Do not set that variable for a client production/pilot deployment unless you are
+intentionally demoing fixture data.
+
+Workspace modes exposed by the API are:
+
+- `fixture` - fake/sample data; external actions should be blocked.
+- `dry_run` - real workspace setup, external writes still gated off.
+- `production` - real operator workflow after readiness checks pass.
+
+## Core Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /config` | Mode, Gmail status, company-profile completion |
+| `GET /config/company` | Read onboarding company profile |
+| `PUT /config/company` | Write onboarding company profile |
+| `POST /config/mode` | Set `fixture`, `dry_run`, or `production` |
+| `POST /pipeline/score` | Run Stage 6 scoring |
+| `POST /pipeline/generate` | Run Stage 7 draft generation, capped at 10 |
+| `GET /review/pending` | Drafts waiting for review |
+| `POST /drafts/{draft_id}/approve` | Approve a draft through the CLI gate |
+| `POST /drafts/{draft_id}/reject` | Reject a draft |
+| `POST /partners/{partner_id}/email` | Set a partner email |
+| `GET /check_ready?phase=send|gmail|attio|review` | Readiness gate output |
+| `GET /send_queue.csv` | Export approved outreach CSV |
+| `GET /gmail/status` | Gmail token status |
+| `POST /gmail/connect` | Start browser Gmail OAuth |
+| `GET /oauth/gmail/callback` | Google OAuth callback |
+
+## What The API Does Not Yet Do
+
+The current onboarding endpoints run Stage 6 and Stage 7. They do not yet run
+Stages 1-5. For a client pilot, either preload the workspace or run the earlier
+pipeline stages through the CLI before the client uses the browser UI.
+
+## Gmail OAuth
+
+The browser OAuth callback path on current `main` is:
+
+```text
+/oauth/gmail/callback
+```
+
+Create a **Web application** OAuth client in Google Cloud Console and register
+the deployed callback URL, for example:
+
+```text
+https://investor-outreach-api-trick.fly.dev/oauth/gmail/callback
+```
+
+Upload the downloaded OAuth JSON to:
+
+```text
+/data/workspace/.gmail_credentials.json
+```
+
+The API writes the resulting token to:
+
+```text
+/data/workspace/.gmail_token.json
+```
+
+The CLI and API both read the same token file.
+
+## Deploy To Fly
+
+`fly.toml` is configured for the API app:
+
+```text
+investor-outreach-api-trick
+```
+
+Required secrets:
+
+```bash
+fly secrets set API_KEY='choose-a-strong-random-key' -a investor-outreach-api-trick
+fly secrets set CORS_ORIGINS='https://your-frontend-origin' -a investor-outreach-api-trick
+fly secrets set ANTHROPIC_API_KEY='sk-ant-...' -a investor-outreach-api-trick
+```
+
+Optional:
+
+```bash
+fly secrets set ATTIO_API_KEY='...' -a investor-outreach-api-trick
+fly secrets set CORS_ORIGIN_REGEX='https://.*\.lovableproject\.com' -a investor-outreach-api-trick
+```
+
+Do **not** set `API_ALLOW_EXAMPLE_DOMAINS=true` on a client deployment.
+
+Seed a workspace onto the mounted volume:
+
+```bash
+fly ssh sftp shell --app investor-outreach-api-trick
 > put -r clients/<your_workspace> /data/workspace
 > exit
-
-# Or, for the fixture workspace to play around:
-fly ssh console -C 'cp -r /app/clients/test_workspace /data/workspace'
 ```
 
-Then re-load the UI. Use the "Runs" tab to verify the workspace was
-picked up.
-
-## Running pipeline stages from Fly
-
-The web UI covers the operator launch path (review, approve, export,
-check_ready). The earlier pipeline stages (01-07) are still CLI-only
-for now; run them on the Fly machine:
+Or seed the fixture for local/demo testing only:
 
 ```bash
-fly ssh console
-cd /app
-uv run scripts/06_score_candidates.py --workspace /data/workspace
-uv run scripts/07_generate_emails.py --workspace /data/workspace --top 25
-exit
+fly ssh console --app investor-outreach-api-trick \
+  -C 'cp -r /app/clients/test_workspace /data/workspace'
 ```
 
-The refresh in the UI will show the new drafts.
+## Client Pilot Checklist
 
-## Logs + debugging
+Before a client uses the browser UI:
 
-```bash
-fly logs           # follow live
-fly status         # machine state
-fly ssh console    # shell in
-```
+1. Workspace exists at `/data/workspace`.
+2. `company.yaml` is set to `dry_run` for first pilot.
+3. Stages 1-5 have already run, or the workspace is preloaded.
+4. Stage 6 and Stage 7 can run from the API.
+5. `GET /review/pending` returns draft rows.
+6. `check_ready?phase=review` returns usable output.
+7. Gmail OAuth is configured only if draft creation is part of the pilot.
+8. `API_ALLOW_EXAMPLE_DOMAINS` is unset for real client data.
