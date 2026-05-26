@@ -27,26 +27,82 @@ from core.stage_runner import stage_run
 STAGE = "01_aggregate_sources"
 _MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 
+# Header aliases for CSVs that come from third-party tools (OpenVC,
+# Signal NFX, manual spreadsheets, etc.). Headers are matched
+# case-insensitively + whitespace-trimmed; we look at the first
+# matching header per row and stop. The canonical operator-facing
+# shape stays `name` + `domain`; these aliases catch the common
+# real-world headers without forcing a manual rename.
+_NAME_ALIASES: tuple[str, ...] = (
+    "name", "investor name", "investor", "fund name", "fund",
+    "firm name", "firm", "organization", "company name", "company",
+)
+_DOMAIN_ALIASES: tuple[str, ...] = (
+    "domain", "website", "url", "homepage", "site", "web",
+    "investor website", "fund website",
+)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalize_csv_row(row: dict) -> dict | None:
+    """Map a third-party CSV row into the canonical {name, domain}
+    shape using `_NAME_ALIASES` / `_DOMAIN_ALIASES`.
+
+    Returns None when neither field could be filled -- the caller
+    drops these silently (same behavior as the pre-aliasing path
+    when name/domain were missing). normalize_domain() handles full
+    URLs like 'https://www.sicstudio.org/ventures' -> 'sicstudio.org'.
+    """
+    lower = {
+        (k or "").strip().lower(): (v or "").strip()
+        for k, v in row.items()
+        if k is not None
+    }
+    name = ""
+    for alias in _NAME_ALIASES:
+        candidate = lower.get(alias, "")
+        if candidate:
+            name = candidate
+            break
+    raw_domain = ""
+    for alias in _DOMAIN_ALIASES:
+        candidate = lower.get(alias, "")
+        if candidate:
+            raw_domain = candidate
+            break
+    domain = normalize_domain(raw_domain)
+    if name and domain:
+        return {"name": name, "domain": domain}
+    return None
+
+
 def _parse_csv(path: pathlib.Path) -> list[dict]:
-    """Expect at least `name` and `domain` columns."""
-    with path.open("r", encoding="utf-8", newline="") as fh:
+    """Read a CSV file and produce canonical {name, domain} rows."""
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
         return list(_parse_csv_text(fh.read()))
 
 
 def _parse_csv_text(text: str) -> list[dict]:
-    """Parse CSV string with `name` + `domain` columns."""
+    """Parse CSV string into canonical {name, domain} rows.
+
+    Supports the canonical `name`/`domain` headers and a small set
+    of third-party aliases (OpenVC's `Investor name`/`Website`, etc.).
+    See `_NAME_ALIASES` / `_DOMAIN_ALIASES` for the full list. UTF-8
+    BOM is stripped (Windows exports from Excel ship with one).
+    """
     import io
+    # utf-8-sig handles a BOM at the start of file-read paths; the
+    # text path doesn't go through file io so we also strip manually.
+    if text.startswith("﻿"):
+        text = text[1:]
     rows: list[dict] = []
     for row in csv.DictReader(io.StringIO(text)):
-        name = (row.get("name") or "").strip()
-        domain = normalize_domain(row.get("domain") or "")
-        if name and domain:
-            rows.append({"name": name, "domain": domain})
+        normalized = _normalize_csv_row(row)
+        if normalized:
+            rows.append(normalized)
     return rows
 
 
