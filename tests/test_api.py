@@ -330,12 +330,15 @@ def test_cors_regex_matches_ephemeral_preview_origin(
 
 # ---------- OpenAPI spec for Lovable ----------
 
-def test_openapi_spec_lists_all_8_documented_endpoints(client: TestClient) -> None:
+def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None:
     """The frontend generates its types from /openapi.json. Refuse a
-    regression that removes a documented endpoint."""
+    regression that removes a documented endpoint -- the 8 original
+    routes plus the 6 onboarding-wizard routes the Lovable frontend
+    was built against."""
     spec = client.get("/openapi.json").json()
     paths = spec.get("paths", {})
     for required in (
+        # Original surface.
         "/review/pending",
         "/drafts/approved",
         "/drafts/{draft_id}/approve",
@@ -344,8 +347,253 @@ def test_openapi_spec_lists_all_8_documented_endpoints(client: TestClient) -> No
         "/check_ready",
         "/runs",
         "/send_queue.csv",
+        # Onboarding wizard surface.
+        "/config",
+        "/config/mode",
+        "/pipeline/score",
+        "/pipeline/generate",
+        "/gmail/status",
+        "/gmail/connect",
     ):
         assert required in paths, (
             f"OpenAPI spec dropped {required}; "
             f"frontend regen will lose the endpoint"
         )
+
+
+# ---------- onboarding: /config + /config/mode ----------
+
+def test_config_returns_fixture_mode_and_gmail_false(client: TestClient) -> None:
+    res = client.get("/config", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # The shipped test_workspace declares `mode: fixture` in its
+    # company.yaml, and the fixture has no .gmail_credentials.json /
+    # token, so gmail_connected must be false.
+    assert body["mode"] == "fixture"
+    assert body["gmail_connected"] is False
+
+
+def test_set_mode_flips_company_yaml_and_round_trips(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    yaml_path = workspace_with_one_pending_draft / "config" / "company.yaml"
+    before = yaml_path.read_text(encoding="utf-8")
+    assert "mode: fixture" in before
+
+    res = client.post(
+        "/config/mode",
+        headers=_auth_headers(),
+        json={"mode": "production"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["returncode"] == 0
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert "mode: production" in after
+    assert "mode: fixture" not in after
+    # Surrounding YAML / comments must survive the edit.
+    assert "PLACEHOLDER fixture data" in after
+    assert "Tendril" in after  # rest of company.yaml is intact
+
+    # GET /config reflects the new value.
+    snap = client.get("/config", headers=_auth_headers()).json()
+    assert snap["mode"] == "production"
+
+    # And flip back works too.
+    res = client.post(
+        "/config/mode",
+        headers=_auth_headers(),
+        json={"mode": "fixture"},
+    )
+    assert res.status_code == 200
+    assert "mode: fixture" in yaml_path.read_text(encoding="utf-8")
+
+
+def test_set_mode_rejects_unknown_value(client: TestClient) -> None:
+    res = client.post(
+        "/config/mode",
+        headers=_auth_headers(),
+        json={"mode": "live"},
+    )
+    # Literal validation -> 422 from FastAPI.
+    assert res.status_code == 422
+
+
+def test_set_mode_requires_auth(client: TestClient) -> None:
+    res = client.post("/config/mode", json={"mode": "production"})
+    assert res.status_code == 401
+
+
+# ---------- onboarding: /pipeline/score + /pipeline/generate ----------
+#
+# We don't re-exec the real CLIs here -- the existing pipeline tests
+# already cover stages 6 and 7 end-to-end, and re-running them through
+# the API would add ~30s per test for zero coverage gain. Instead we
+# monkeypatch _run_cli to assert the API dispatches the right command
+# with the right flags and shapes the response correctly.
+
+class _FakeRes:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_pipeline_score_shells_out_to_stage_6(
+    client: TestClient, monkeypatch,
+) -> None:
+    calls: list[tuple] = []
+
+    def fake(*args: str, timeout: int = 120):
+        calls.append((args, timeout))
+        return _FakeRes(0, "score ok\n", "")
+
+    import web.api as api_mod
+    monkeypatch.setattr(api_mod, "_run_cli", fake)
+
+    res = client.post("/pipeline/score", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["returncode"] == 0
+    assert "score ok" in body["stdout"]
+    # Routed to the right script with the workspace flag.
+    args, timeout = calls[0]
+    assert args[0] == "06_score_candidates.py"
+    assert "--workspace" in args
+    assert timeout >= 120  # bumped above the default for slow LLM runs
+
+
+def test_pipeline_score_propagates_failure_as_400(
+    client: TestClient, monkeypatch,
+) -> None:
+    import web.api as api_mod
+    monkeypatch.setattr(
+        api_mod, "_run_cli",
+        lambda *a, **k: _FakeRes(2, "partial\n", "boom\n"),
+    )
+    res = client.post("/pipeline/score", headers=_auth_headers())
+    assert res.status_code == 400, res.text
+    detail = res.json()["detail"]
+    assert detail["error"] == "score_candidates failed"
+    assert detail["stdout"] == "partial\n"
+    assert detail["stderr"] == "boom\n"
+    assert detail["returncode"] == 2
+
+
+def test_pipeline_generate_shells_out_to_stage_7_with_calibration_cap(
+    client: TestClient, monkeypatch,
+) -> None:
+    calls: list[tuple] = []
+
+    def fake(*args: str, timeout: int = 120):
+        calls.append(args)
+        return _FakeRes(0, "drafted\n", "")
+
+    import web.api as api_mod
+    monkeypatch.setattr(api_mod, "_run_cli", fake)
+
+    res = client.post("/pipeline/generate", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    args = calls[0]
+    assert args[0] == "07_generate_emails.py"
+    # --top is capped at the Gate 5.5 ceiling so onboarding never
+    # trips the calibration refusal.
+    assert "--top" in args
+    assert args[args.index("--top") + 1] == "10"
+    # --allow-example-domains is required to draft against the test
+    # workspace's .example partner emails; a no-op for real domains.
+    assert "--allow-example-domains" in args
+
+
+# ---------- onboarding: /gmail/status + /gmail/connect ----------
+
+def test_gmail_status_false_when_no_credentials(client: TestClient) -> None:
+    res = client.get("/gmail/status", headers=_auth_headers())
+    assert res.status_code == 200
+    assert res.json() == {"connected": False}
+
+
+def test_gmail_connect_rejects_when_credentials_missing(
+    client: TestClient,
+) -> None:
+    """Without .gmail_credentials.json on disk we can't even start
+    the OAuth flow. Surface as 400 with the GCP-setup hint in the
+    error message so the wizard can route the operator to docs."""
+    res = client.post("/gmail/connect", headers=_auth_headers())
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert "gmail_credentials.json" in detail["error"]
+
+
+def test_gmail_connect_returns_auth_url_when_credentials_exist(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+    monkeypatch,
+) -> None:
+    """When OAuth client JSON is present, /gmail/connect must return a
+    Google authorization URL and stash the flow against its state
+    token. We monkeypatch the helper so the test doesn't need a real
+    GCP credential file."""
+    from core import gmail_oauth as gomod
+
+    captured: dict = {}
+
+    def fake_start_flow(ws, redirect_uri):
+        captured["redirect_uri"] = redirect_uri
+        captured["ws_path"] = str(ws.path)
+        return (
+            "https://accounts.google.com/o/oauth2/auth?fake=1",
+            "state-token-xyz",
+        )
+
+    monkeypatch.setattr(gomod, "start_flow", fake_start_flow)
+
+    res = client.post("/gmail/connect", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["auth_url"].startswith("https://accounts.google.com/")
+    # The redirect URI we hand Google must point back at our callback
+    # route -- otherwise the operator's browser lands somewhere we
+    # can't process the code.
+    assert captured["redirect_uri"].endswith("/oauth/gmail/callback")
+
+
+def test_oauth_callback_persists_token_and_renders_confirmation(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+    monkeypatch,
+) -> None:
+    """End-to-end: simulate Google's redirect by hitting the callback
+    with a known state+code, verify the helper is called with both
+    values, verify the token file lands at the workspace's standard
+    path, and verify the HTML confirms the connected email so the
+    operator sees a success page."""
+    from core import gmail_oauth as gomod
+
+    token_path = workspace_with_one_pending_draft / ".gmail_token.json"
+
+    def fake_complete_flow(state, code, ws):
+        assert state == "state-token-xyz"
+        assert code == "auth-code-abc"
+        # Mirror the real helper -- it writes the token before returning.
+        token_path.write_text("{\"token\": \"fake\"}", encoding="utf-8")
+        return {"emailAddress": "operator@example.com"}
+
+    monkeypatch.setattr(gomod, "complete_flow", fake_complete_flow)
+
+    res = client.get(
+        "/oauth/gmail/callback"
+        "?state=state-token-xyz&code=auth-code-abc",
+    )
+    assert res.status_code == 200, res.text
+    assert "operator@example.com" in res.text
+    assert "Gmail linked" in res.text
+    assert token_path.exists()
+
+
+def test_oauth_callback_rejects_missing_code(client: TestClient) -> None:
+    res = client.get("/oauth/gmail/callback?state=abc")
+    assert res.status_code == 400
+    assert "code or state" in res.text.lower()

@@ -30,13 +30,14 @@ from __future__ import annotations
 import hmac
 import os
 import pathlib
+import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Query
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
@@ -52,6 +53,7 @@ from core.approval.persistence import (  # noqa: E402
     approved_for_send,
     pending_review,
 )
+from core import gmail_oauth  # noqa: E402
 from core.config_loader import load_workspace  # noqa: E402
 from core.db import (  # noqa: E402
     email_drafts,
@@ -111,6 +113,35 @@ class CommandResult(BaseModel):
     ok: bool
     stdout: str
     stderr: str = ""
+    # Exit code of the wrapped script. Defaulted so existing
+    # construction sites (approve / reject / set-email) don't need to
+    # pass it explicitly -- those endpoints only reach the success
+    # branch on returncode == 0 anyway.
+    returncode: int = 0
+
+
+# ---------- onboarding wizard schemas ----------
+
+class ConfigInfo(BaseModel):
+    """Snapshot the onboarding wizard polls. `mode` is the binary
+    fixture/production view; the underlying `dry_run` value (a real
+    workspace whose external syncs are gated off) surfaces as
+    "production" since the wizard's question is "are you on fake data
+    or your own data?", not "are external syncs armed?"."""
+    mode: Literal["fixture", "production"]
+    gmail_connected: bool
+
+
+class SetModeBody(BaseModel):
+    mode: Literal["fixture", "production"]
+
+
+class GmailStatus(BaseModel):
+    connected: bool
+
+
+class GmailConnectResponse(BaseModel):
+    auth_url: str
 
 
 class RunRow(BaseModel):
@@ -511,4 +542,273 @@ def send_queue_csv(_auth: None = Depends(require_auth)) -> FileResponse:
         path=str(csv_path),
         media_type="text/csv",
         filename="send_queue.csv",
+    )
+
+
+# ---------- onboarding wizard ----------
+#
+# These 6 endpoints back the React frontend's /onboarding route. The
+# wizard walks an operator from "fresh checkout" to "drafts ready for
+# review" by flipping company.yaml out of fixture mode, running stages
+# 6 + 7, and linking Gmail -- four things the dashboard could not do
+# without shelling out / editing files on the API host. Conventions
+# match the existing routes: Bearer auth on every endpoint (except the
+# OAuth callback, see below), subprocess failures surface as HTTP 400
+# with detail={error, stdout, stderr, returncode}.
+
+_MODE_LINE = re.compile(r"^(mode:\s*)(\S+)(.*)$", re.MULTILINE)
+
+
+def _read_mode_from_yaml(yaml_path: pathlib.Path) -> str:
+    """Wizard-facing mode value. The on-disk vocabulary is
+    {fixture, dry_run, production} (see core/config_loader.py); the
+    wizard only cares about fixture vs not-fixture, so dry_run maps to
+    production here."""
+    if not yaml_path.exists():
+        raise HTTPException(500, f"company.yaml missing at {yaml_path}")
+    text = yaml_path.read_text(encoding="utf-8")
+    m = _MODE_LINE.search(text)
+    if not m:
+        # config_loader defaults absence to dry_run; surface as production.
+        return "production"
+    value = m.group(2).strip().strip("\"'")
+    return "fixture" if value == "fixture" else "production"
+
+
+def _write_mode_to_yaml(yaml_path: pathlib.Path, new_mode: str) -> None:
+    """Replace (or insert) the top-level `mode:` line in company.yaml
+    in place, preserving comments and surrounding formatting. A regex
+    edit avoids re-rendering the whole document the way PyYAML's
+    round-trip would (PyYAML drops comments; ruamel.yaml is not in our
+    deps). Only one short line ever changes, so a string-level edit is
+    sufficient."""
+    if not yaml_path.exists():
+        raise HTTPException(500, f"company.yaml missing at {yaml_path}")
+    text = yaml_path.read_text(encoding="utf-8")
+    if _MODE_LINE.search(text):
+        new_text = _MODE_LINE.sub(
+            lambda m: f"{m.group(1)}{new_mode}{m.group(3)}",
+            text, count=1,
+        )
+    else:
+        # Insert after the leading run of comment / blank lines so the
+        # mode declaration sits above the actual config block.
+        lines = text.splitlines()
+        insert_at = 0
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped and not stripped.startswith("#"):
+                insert_at = i
+                break
+        new_line = f"mode: {new_mode}"
+        # Pad with a blank line on either side so the inserted line
+        # reads as its own block instead of glomming onto the next key.
+        to_insert = [new_line, ""]
+        if insert_at > 0 and lines[insert_at - 1].strip() != "":
+            to_insert = ["", *to_insert]
+        for offset, line in enumerate(to_insert):
+            lines.insert(insert_at + offset, line)
+        new_text = "\n".join(lines)
+        if text.endswith("\n") and not new_text.endswith("\n"):
+            new_text += "\n"
+    yaml_path.write_text(new_text, encoding="utf-8")
+
+
+@app.get(
+    "/config",
+    response_model=ConfigInfo,
+    summary="Onboarding wizard config snapshot",
+    tags=["onboarding"],
+)
+def get_config(_auth: None = Depends(require_auth)) -> ConfigInfo:
+    _, ws = _engine_and_ws()
+    return ConfigInfo(
+        mode=_read_mode_from_yaml(ws.config_dir / "company.yaml"),
+        gmail_connected=gmail_oauth.is_connected(ws),
+    )
+
+
+@app.post(
+    "/config/mode",
+    response_model=CommandResult,
+    summary="Flip company.yaml `mode:` (fixture <-> production)",
+    tags=["onboarding"],
+)
+def set_mode(
+    body: SetModeBody, _auth: None = Depends(require_auth),
+) -> CommandResult:
+    _, ws = _engine_and_ws()
+    try:
+        _write_mode_to_yaml(ws.config_dir / "company.yaml", body.mode)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report cleanly to the frontend
+        raise HTTPException(
+            400,
+            detail={
+                "error": "failed to update company.yaml",
+                "stdout": "",
+                "stderr": str(exc),
+                "returncode": 1,
+            },
+        )
+    return CommandResult(
+        ok=True, returncode=0,
+        stdout=f"company.yaml mode set to {body.mode}\n",
+        stderr="",
+    )
+
+
+def _shell_pipeline_stage(
+    script: str, *extra_args: str, label: str,
+) -> CommandResult:
+    """Shared wrapper for /pipeline/* endpoints. Uses a 10-min timeout
+    because Stage 6 (LLM-scored axes) and Stage 7 (LLM-drafted emails)
+    both fan out per partner and the request must outlast the slowest
+    fixture run."""
+    res = _run_cli(
+        script, "--workspace", _ws_path(), *extra_args, timeout=600,
+    )
+    if res.returncode != 0:
+        raise HTTPException(
+            400,
+            detail={
+                "error": f"{label} failed",
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+                "returncode": res.returncode,
+            },
+        )
+    return CommandResult(
+        ok=True, returncode=res.returncode,
+        stdout=res.stdout, stderr=res.stderr,
+    )
+
+
+@app.post(
+    "/pipeline/score",
+    response_model=CommandResult,
+    summary="Run Stage 6 (score_candidates) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_score(_auth: None = Depends(require_auth)) -> CommandResult:
+    return _shell_pipeline_stage(
+        "06_score_candidates.py", label="score_candidates",
+    )
+
+
+@app.post(
+    "/pipeline/generate",
+    response_model=CommandResult,
+    summary="Run Stage 7 (generate_emails) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_generate(_auth: None = Depends(require_auth)) -> CommandResult:
+    # Cap at TOP_BEFORE_CALIBRATION_REQUIRED (=10 in scripts/07) so the
+    # wizard's run never trips Gate 5.5's calibration refusal. Real
+    # operators scale higher via the CLI after the calibration cohort
+    # comes back Green. --allow-example-domains is a no-op for real
+    # workspaces and lets the fixture path through.
+    return _shell_pipeline_stage(
+        "07_generate_emails.py",
+        "--top", "10",
+        "--allow-example-domains",
+        label="generate_emails",
+    )
+
+
+@app.get(
+    "/gmail/status",
+    response_model=GmailStatus,
+    summary="Is Gmail OAuth completed for the pinned workspace?",
+    tags=["onboarding"],
+)
+def gmail_status(_auth: None = Depends(require_auth)) -> GmailStatus:
+    _, ws = _engine_and_ws()
+    return GmailStatus(connected=gmail_oauth.is_connected(ws))
+
+
+@app.post(
+    "/gmail/connect",
+    response_model=GmailConnectResponse,
+    summary="Start Gmail OAuth; returns Google's auth URL",
+    tags=["onboarding"],
+)
+def gmail_connect(
+    request: Request, _auth: None = Depends(require_auth),
+) -> GmailConnectResponse:
+    _, ws = _engine_and_ws()
+    redirect_uri = str(request.url_for("gmail_oauth_callback"))
+    try:
+        auth_url, _state = gmail_oauth.start_flow(ws, redirect_uri)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "error": str(exc),
+                "stdout": "",
+                "stderr": "",
+                "returncode": 1,
+            },
+        )
+    return GmailConnectResponse(auth_url=auth_url)
+
+
+@app.get(
+    "/oauth/gmail/callback",
+    include_in_schema=False,
+    name="gmail_oauth_callback",
+)
+def gmail_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> HTMLResponse:
+    """Google redirects the operator's browser here after consent.
+
+    Auth model: NO Bearer header (browsers can't attach custom headers
+    to a cross-origin redirect from accounts.google.com). The `state`
+    parameter -- minted server-side inside an authenticated
+    /gmail/connect call -- works as a single-use bearer because it's
+    cryptographically random and we delete it on first use. This is the
+    standard OAuth CSRF / auth pattern, not a missing auth check.
+    """
+    if error:
+        return HTMLResponse(
+            f"<!doctype html><meta charset='utf-8'>"
+            f"<title>Gmail OAuth failed</title>"
+            f"<h1>Gmail OAuth failed</h1><pre>{error}</pre>",
+            status_code=400,
+        )
+    if not code or not state:
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>Gmail OAuth error</title>"
+            "<h1>Missing code or state on OAuth redirect</h1>",
+            status_code=400,
+        )
+    _, ws = _engine_and_ws()
+    try:
+        profile = gmail_oauth.complete_flow(state, code, ws)
+    except ValueError as exc:
+        return HTMLResponse(
+            f"<!doctype html><meta charset='utf-8'>"
+            f"<title>Gmail OAuth error</title>"
+            f"<h1>OAuth callback rejected</h1><pre>{exc}</pre>",
+            status_code=400,
+        )
+    except Exception as exc:  # noqa: BLE001 - Google SDK throws diverse types
+        return HTMLResponse(
+            f"<!doctype html><meta charset='utf-8'>"
+            f"<title>Gmail OAuth error</title>"
+            f"<h1>Token exchange failed</h1><pre>{exc}</pre>",
+            status_code=400,
+        )
+    email = profile.get("emailAddress", "(unknown)")
+    return HTMLResponse(
+        f"<!doctype html><meta charset='utf-8'>"
+        f"<title>Gmail linked</title>"
+        f"<h1>Gmail linked</h1>"
+        f"<p>Connected as <b>{email}</b>. "
+        f"You can close this tab and return to the dashboard.</p>"
     )
