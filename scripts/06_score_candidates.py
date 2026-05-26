@@ -476,7 +476,11 @@ def main() -> int:
                         employment_status=p.employment_status,
                         major_kill=major_kill,
                         cold_reachability_score=cold_reachability,
-                        warm_path_available=p.warm_path_available,
+                        # PR #10 / Slice 13: kwarg accepted for
+                        # back-compat but ignored by evaluate_recommended.
+                        # "No warm intros, ever" -- warm-path doesn't
+                        # demote.
+                        warm_path_available=None,
                         latest_outcome=latest_outcome_by_partner.get(p.partner_id),
                         latest_outcome_window_days=recent_outreach_window_days,
                         today=today,
