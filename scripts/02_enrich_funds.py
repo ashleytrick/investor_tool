@@ -25,6 +25,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
+from core.approval.persistence import stale_live_approvals_for_partner
+from core.approval.state_machine import TRIGGER_EMPLOYMENT_LEFT_FUND
 from core.config_loader import add_workspace_arg
 from core.db import funds, partners, upsert
 from core.ids import partner_id_for
@@ -150,6 +152,7 @@ def main() -> int:
                     # run so we can demote anyone previously seen but now
                     # missing.
                     discovered_pids: set[str] = set()
+                    vanished: set[str] = set()
 
                     with engine.begin() as conn:
                         # Slice 18b follow-up (#18): pass `conn` so the
@@ -205,6 +208,22 @@ def main() -> int:
                                 f"{len(vanished)} partner(s) to "
                                 f"employment_status=uncertain (no longer on "
                                 f"team page)"
+                            )
+                    for pid in vanished:
+                        staled = stale_live_approvals_for_partner(
+                            engine,
+                            partner_id=pid,
+                            trigger=TRIGGER_EMPLOYMENT_LEFT_FUND,
+                            notes=(
+                                "Stage 2 enrichment no longer found this "
+                                "partner on the fund team page; employment "
+                                "status demoted to uncertain"
+                            ),
+                        )
+                        if staled:
+                            run.note(
+                                f"staled {staled} approved draft(s) for "
+                                f"{pid} after Stage 2 demotion"
                             )
                     print(
                         f"[stage 2] {fund['name']}: {len(pages)} pages "
