@@ -28,14 +28,19 @@ web = [
 # Install with: uv sync --extra api
 api = [
     "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
-    # Build Session 15: deck-first onboarding parses uploaded PDF /
-    # PPTX decks to seed the company profile. pypdf is pure Python +
-    # light; python-pptx covers .pptx (the binary .ppt format
+    # PDF / PPTX parsing for the deck-first onboarding step
+    # (POST /config/company/extract-from-deck). pypdf is pure Python
+    # + light; python-pptx covers .pptx (the binary .ppt format
     # requires libreoffice and is left as a warning case).
-    "pypdf>=4.0",
-    "python-pptx>=0.6",
+    "pypdf>=5.0",
+    "python-pptx>=1.0",
+    # openpyxl is the canonical xlsx reader. Operators uploading
+    # investor lists from OpenVC get .xlsx exports today; the
+    # /pipeline/sources endpoint normalizes them to CSV server-side
+    # before Stage 1 consumes them.
+    "openpyxl>=3.1",
     "python-multipart>=0.0.20",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

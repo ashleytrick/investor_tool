@@ -17,8 +17,8 @@ Streamlit UI uses). The API never lets a client pick a workspace at
 runtime -- multi-tenant is a future concern.
 
 Run locally:
-    API_KEY=dev-key \\
-    INVESTOR_WORKSPACE=clients/test_workspace \\
+    API_KEY=dev-key \
+    INVESTOR_WORKSPACE=clients/test_workspace \
     uv run --extra api uvicorn web.api:app --reload --port 8080
 
 OpenAPI spec is auto-generated at /openapi.json (and used by the
@@ -126,12 +126,8 @@ class CommandResult(BaseModel):
 # ---------- onboarding wizard schemas ----------
 
 class ConfigInfo(BaseModel):
-    """Snapshot the onboarding wizard polls. `mode` is the binary
-    fixture/production view; the underlying `dry_run` value (a real
-    workspace whose external syncs are gated off) surfaces as
-    "production" since the wizard's question is "are you on fake data
-    or your own data?", not "are external syncs armed?"."""
-    mode: Literal["fixture", "production"]
+    """Snapshot the onboarding wizard polls."""
+    mode: Literal["fixture", "dry_run", "production"]
     gmail_connected: bool
     # Build Session 13: the same OAuth token now requests Drive scope
     # so meeting-prep briefs can be auto-pushed to the operator's
@@ -206,7 +202,7 @@ class CompanyProfile(BaseModel):
 
 
 class SetModeBody(BaseModel):
-    mode: Literal["fixture", "production"]
+    mode: Literal["fixture", "dry_run", "production"]
 
 
 class GmailStatus(BaseModel):
@@ -277,6 +273,18 @@ def _engine_and_ws():
 
 def _actor() -> str:
     return os.environ.get("API_OPERATOR", "api-client")
+
+
+def _allow_example_domains_args() -> list[str]:
+    """Expose fixture-domain bypass only when the API operator opts in.
+
+    The CLI flag is useful for local/fixture demos, but the hosted API should
+    not silently weaken production guards for browser clients.
+    """
+    raw = os.environ.get("API_ALLOW_EXAMPLE_DOMAINS", "")
+    if raw.lower() in {"1", "true", "yes", "on"}:
+        return ["--allow-example-domains"]
+    return []
 
 
 def _run_cli(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -394,7 +402,10 @@ def get_pending(_auth: None = Depends(require_auth)) -> list[DraftView]:
     out: list[DraftView] = []
     for d in drafts:
         gate = can_approve_draft(
-            ws, engine, int(d.draft_id), allow_example_domains=True,
+            ws,
+            engine,
+            int(d.draft_id),
+            allow_example_domains=bool(_allow_example_domains_args()),
         )
         out.append(_serialize_draft(
             d,
@@ -444,8 +455,8 @@ def approve_draft(
         "approve_draft.py", "--workspace", _ws_path(),
         "--draft-id", str(draft_id),
         "--notes", body.notes,
-        "--allow-example-domains",
     ]
+    cli.extend(_allow_example_domains_args())
     if body.override_blockers:
         cli.append("--override-blockers")
     res = _run_cli(*cli)
@@ -533,7 +544,7 @@ def check_ready(
 ) -> CheckReadyResult:
     res = _run_cli(
         "check_ready.py", "--workspace", _ws_path(),
-        "--for", phase, "--allow-example-domains",
+        "--for", phase, *_allow_example_domains_args(),
     )
     return CheckReadyResult(
         phase=phase,
@@ -594,7 +605,7 @@ def send_queue_csv(_auth: None = Depends(require_auth)) -> FileResponse:
     approved drafts; stale approvals not skipped)."""
     res = _run_cli(
         "export_send_queue.py", "--workspace", _ws_path(),
-        "--allow-example-domains",
+        *_allow_example_domains_args(),
     )
     if res.returncode != 0:
         raise HTTPException(
@@ -870,19 +881,22 @@ def _write_company_block(
 
 
 def _read_mode_from_yaml(yaml_path: pathlib.Path) -> str:
-    """Wizard-facing mode value. The on-disk vocabulary is
-    {fixture, dry_run, production} (see core/config_loader.py); the
-    wizard only cares about fixture vs not-fixture, so dry_run maps to
-    production here."""
+    """Wizard-facing mode value.
+
+    Preserve the full on-disk vocabulary {fixture, dry_run, production}; the
+    browser UI needs dry_run as a real safe pilot state.
+    """
     if not yaml_path.exists():
         raise HTTPException(500, f"company.yaml missing at {yaml_path}")
     text = yaml_path.read_text(encoding="utf-8")
     m = _MODE_LINE.search(text)
     if not m:
-        # config_loader defaults absence to dry_run; surface as production.
-        return "production"
+        # config_loader defaults absence to dry_run.
+        return "dry_run"
     value = m.group(2).strip().strip("\"'")
-    return "fixture" if value == "fixture" else "production"
+    if value in {"fixture", "dry_run", "production"}:
+        return value
+    return "dry_run"
 
 
 def _write_mode_to_yaml(yaml_path: pathlib.Path, new_mode: str) -> None:
@@ -948,7 +962,7 @@ def get_config(_auth: None = Depends(require_auth)) -> ConfigInfo:
 @app.post(
     "/config/mode",
     response_model=CommandResult,
-    summary="Flip company.yaml `mode:` (fixture <-> production)",
+    summary="Flip company.yaml `mode:` (fixture | dry_run | production)",
     tags=["onboarding"],
 )
 def set_mode(
@@ -1296,15 +1310,287 @@ def pipeline_score(_auth: None = Depends(require_auth)) -> CommandResult:
 )
 def pipeline_generate(_auth: None = Depends(require_auth)) -> CommandResult:
     # Cap at TOP_BEFORE_CALIBRATION_REQUIRED (=10 in scripts/07) so the
-    # wizard's run never trips Gate 5.5's calibration refusal. Real
-    # operators scale higher via the CLI after the calibration cohort
-    # comes back Green. --allow-example-domains is a no-op for real
-    # workspaces and lets the fixture path through.
+    # wizard's run never trips Gate 5.5's calibration refusal. Fixture
+    # domains are allowed only when API_ALLOW_EXAMPLE_DOMAINS is set.
     return _shell_pipeline_stage(
         "07_generate_emails.py",
         "--top", "10",
-        "--allow-example-domains",
+        *_allow_example_domains_args(),
         label="generate_emails",
+    )
+
+
+# ---------- onboarding step 3: investor sources upload ----------
+
+class SourcesUploadResult(BaseModel):
+    """Response from POST /pipeline/sources. The frontend renders
+    `row_count` as 'Loaded N investors' confirmation; `stdout` is
+    optional diagnostic text the wizard can fold-out behind a 'show
+    details' affordance."""
+    ok: bool
+    row_count: int
+    stdout: str = ""
+
+
+# Cap on the multipart upload. Operator-uploaded investor lists are
+# typically a few hundred KB; 25 MB is the safety valve for the case
+# where someone tries to upload an Excel export they accidentally
+# saved as CSV with embedded BLOBs.
+_MAX_SOURCES_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _sanitize_sources_filename(name: str) -> str:
+    """Reduce a user-supplied filename to ASCII-alnum + .csv. Defends
+    against path-traversal (../) and Windows / Unix reserved chars
+    landing in `data/raw/`. Always ends in `.csv` so Stage 1's CSV
+    parser picks it up; falls back to a stable default when the
+    incoming name has no usable characters."""
+    base = pathlib.Path(name or "").name  # strip any directory parts
+    stem = "".join(
+        ch for ch in pathlib.Path(base).stem
+        if ch.isalnum() or ch in ("_", "-")
+    )
+    if not stem:
+        stem = "operator_sources"
+    return f"{stem}.csv"
+
+
+def _xlsx_to_csv_bytes(content: bytes) -> bytes:
+    """Convert an uploaded .xlsx workbook to CSV bytes (UTF-8).
+
+    Reads the first worksheet only -- OpenVC and similar investor
+    exports use a single sheet; multi-sheet workbooks aren't a
+    documented input format. Headers are lowercased on the way out
+    so a sheet whose first row is "Name,Domain" lands as
+    "name,domain" -- which is what `scripts/01_aggregate_sources.py`
+    expects.
+    """
+    import csv  # noqa: PLC0415
+    import io
+    from openpyxl import load_workbook  # noqa: PLC0415
+
+    wb = load_workbook(
+        io.BytesIO(content), read_only=True, data_only=True,
+    )
+    ws = wb.active
+    if ws is None:
+        raise ValueError("xlsx workbook has no active worksheet")
+    out = io.StringIO()
+    writer = csv.writer(out)
+    first_row_written = False
+    for row in ws.iter_rows(values_only=True):
+        # Normalize cells: None -> "", non-strings -> str().
+        cells = ["" if v is None else str(v) for v in row]
+        # Drop trailing all-empty rows (Excel commonly pads with
+        # blank rows). A row of "" is content (preserving blanks
+        # for downstream tools); a row of nothing at all is noise.
+        if not any(c.strip() for c in cells):
+            continue
+        if not first_row_written:
+            # Lowercase the header row so Stage 1's case-sensitive
+            # `name` / `domain` lookup matches "Name" / "Domain" /
+            # "NAME" exports without per-tool aliases.
+            cells = [c.lower().strip() for c in cells]
+            first_row_written = True
+        writer.writerow(cells)
+    return out.getvalue().encode("utf-8")
+
+
+def _count_csv_rows(content: bytes) -> int:
+    """Count data rows (header excluded). Used both to validate the
+    CSV parses + to populate `row_count` in the response."""
+    import csv  # noqa: PLC0415 - stdlib, hot only when this endpoint fires
+    import io
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if len(rows) <= 1:
+        # An empty file or a file with only a header has zero data
+        # rows. The endpoint refuses upstream because Stage 1 can't
+        # do anything with it, but counting is still well-defined.
+        return 0
+    return len(rows) - 1
+
+
+def _link_sources_yaml(yaml_path: pathlib.Path, csv_relative: str,
+                       display_name: str) -> None:
+    """Prepend an entry to `public_lists` in sources.yaml pointing at
+    the uploaded CSV.
+
+    Prepend (not append) so the operator's upload is the first source
+    Stage 1 processes -- ahead of fixture seeds. PyYAML drops
+    comments; that's acceptable since sources.yaml is rarely
+    hand-edited once the wizard is wired up.
+    """
+    import yaml  # noqa: PLC0415
+
+    data: dict = {}
+    if yaml_path.exists():
+        text = yaml_path.read_text(encoding="utf-8")
+        if text.strip():
+            data = yaml.safe_load(text) or {}
+    public_lists = data.get("public_lists") or []
+    # De-dupe: if a list with the same path is already there, leave it
+    # alone (the operator might be re-uploading; idempotent is the
+    # right behavior).
+    if not any(
+        isinstance(item, dict) and item.get("path") == csv_relative
+        for item in public_lists
+    ):
+        public_lists.insert(0, {
+            "name": f"Operator upload ({display_name})",
+            "path": csv_relative,
+            "parser": "csv",
+        })
+        data["public_lists"] = public_lists
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+@app.post(
+    "/pipeline/sources",
+    response_model=SourcesUploadResult,
+    summary="Upload an investor-sources CSV or XLSX; wires it into Stage 1",
+    tags=["onboarding"],
+)
+async def upload_pipeline_sources(
+    file: UploadFile = File(
+        ..., description="CSV or XLSX of investor sources (25 MB max)",
+    ),
+    _auth: None = Depends(require_auth),
+) -> SourcesUploadResult:
+    """Accept the operator's investor-sources file, persist it under
+    `clients/<ws>/data/raw/`, and prepend an entry to
+    `config/sources.yaml` so the next Stage 1 run picks it up.
+
+    Accepts:
+      - `.csv` -- stored as-is.
+      - `.xlsx` -- converted to CSV in-memory via openpyxl. Header
+        row is lowercased on conversion so OpenVC's `Name`/`Domain`
+        columns map to Stage 1's case-sensitive lookup. The
+        sources.yaml entry always points at the resulting `.csv` so
+        Stage 1's parser doesn't need an xlsx code path.
+
+    Non-destructive: this endpoint never invokes a pipeline stage --
+    the wizard's next step is what kicks off Stage 1. Idempotent on
+    filename: re-uploading the same name overwrites the file and
+    leaves sources.yaml unchanged.
+    """
+    name = file.filename or ""
+    lower = name.lower()
+    is_xlsx = lower.endswith(".xlsx")
+    is_csv = lower.endswith(".csv")
+    if not (is_csv or is_xlsx):
+        raise HTTPException(
+            400,
+            detail={
+                "error": (
+                    f"sources upload must be a .csv or .xlsx file; "
+                    f"got {name!r}"
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    content = await file.read()
+    if not content:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "empty file upload",
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    if len(content) > _MAX_SOURCES_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            detail={
+                "error": (
+                    f"sources upload is "
+                    f"{len(content) // (1024 * 1024)} MB; limit is "
+                    f"{_MAX_SOURCES_UPLOAD_BYTES // (1024 * 1024)} MB"
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+
+    # XLSX path: convert to CSV bytes in-memory before counting rows.
+    # From here on the CSV path is the only persistence shape;
+    # sources.yaml always points at `.csv`.
+    if is_xlsx:
+        try:
+            content = _xlsx_to_csv_bytes(content)
+        except Exception as exc:  # noqa: BLE001 - openpyxl raises diverse types
+            raise HTTPException(
+                400,
+                detail={
+                    "error": (
+                        f"could not parse xlsx: {exc}. Re-export as "
+                        f".csv or check the file isn't password-"
+                        f"protected / corrupt."
+                    ),
+                    "stdout": "", "stderr": "", "returncode": 1,
+                },
+            )
+
+    try:
+        row_count = _count_csv_rows(content)
+    except Exception as exc:  # noqa: BLE001 - csv parse failure
+        raise HTTPException(
+            400,
+            detail={
+                "error": f"could not parse CSV: {exc}",
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    if row_count <= 0:
+        raise HTTPException(
+            400,
+            detail={
+                "error": (
+                    "CSV has no data rows (header-only or empty). "
+                    "Re-export with at least one investor row."
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+
+    safe_name = _sanitize_sources_filename(name)
+    _, ws = _engine_and_ws()
+    raw_dir = ws.path / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    csv_dst = raw_dir / safe_name
+    csv_dst.write_bytes(content)
+
+    csv_relative = f"data/raw/{safe_name}"
+    sources_yaml = ws.config_dir / "sources.yaml"
+    try:
+        _link_sources_yaml(sources_yaml, csv_relative, safe_name)
+    except Exception as exc:  # noqa: BLE001 - YAML failure shouldn't drop the upload
+        # The CSV is on disk; only the sources.yaml link failed. The
+        # operator can hand-edit, but the API should report it rather
+        # than silently swallow.
+        raise HTTPException(
+            500,
+            detail={
+                "error": f"sources.yaml update failed: {exc}",
+                "stdout": (
+                    f"CSV saved at {csv_relative} but sources.yaml "
+                    f"was not updated; edit it manually to point at "
+                    f"the upload."
+                ),
+                "stderr": str(exc), "returncode": 1,
+            },
+        )
+
+    stdout = (
+        f"[sources] uploaded {safe_name} ({row_count} rows) -> "
+        f"{csv_relative}; sources.yaml updated."
+    )
+    return SourcesUploadResult(
+        ok=True, row_count=row_count, stdout=stdout,
     )
 
 
