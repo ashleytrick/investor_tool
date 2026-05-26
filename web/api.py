@@ -130,9 +130,30 @@ class ConfigInfo(BaseModel):
     or your own data?", not "are external syncs armed?"."""
     mode: Literal["fixture", "production"]
     gmail_connected: bool
+    # Build Session 13: the same OAuth token now requests Drive scope
+    # so meeting-prep briefs can be auto-pushed to the operator's
+    # Drive. drive_connected is True only when the saved token
+    # actually carries the drive.file scope -- legacy gmail-only
+    # tokens read as gmail_connected=True, drive_connected=False, and
+    # the wizard prompts a re-consent.
+    drive_connected: bool
+    # google_connected = both scopes present. Equivalent to (gmail &&
+    # drive) but exposed as its own field so the wizard's "Connect
+    # Google" button can render a single boolean state.
+    google_connected: bool
     # True when company.name + company.one_liner are both non-empty,
     # i.e. the operator finished Step 1 of the wizard.
     company_configured: bool
+
+
+class GoogleStatus(BaseModel):
+    """Full per-scope OAuth status. Returned by /google/status -- the
+    wizard polls this after the operator finishes consent so it can
+    tell 'Gmail and Drive both granted' from 'Gmail granted but
+    Drive needs a re-consent'."""
+    gmail_connected: bool
+    drive_connected: bool
+    google_connected: bool
 
 
 class CompanyProfile(BaseModel):
@@ -910,9 +931,13 @@ def get_config(_auth: None = Depends(require_auth)) -> ConfigInfo:
     _, ws = _engine_and_ws()
     yaml_path = ws.config_dir / "company.yaml"
     profile = _read_company_block(yaml_path)
+    gmail_ok = gmail_oauth.is_connected(ws)
+    drive_ok = gmail_oauth.drive_connected(ws)
     return ConfigInfo(
         mode=_read_mode_from_yaml(yaml_path),
-        gmail_connected=gmail_oauth.is_connected(ws),
+        gmail_connected=gmail_ok,
+        drive_connected=drive_ok,
+        google_connected=gmail_ok and drive_ok,
         company_configured=bool(profile.name) and bool(profile.one_liner),
     )
 
@@ -1061,6 +1086,30 @@ def pipeline_generate(_auth: None = Depends(require_auth)) -> CommandResult:
 def gmail_status(_auth: None = Depends(require_auth)) -> GmailStatus:
     _, ws = _engine_and_ws()
     return GmailStatus(connected=gmail_oauth.is_connected(ws))
+
+
+@app.get(
+    "/google/status",
+    response_model=GoogleStatus,
+    summary="Per-scope OAuth status (Gmail + Drive)",
+    tags=["onboarding"],
+)
+def google_status(_auth: None = Depends(require_auth)) -> GoogleStatus:
+    """Build Session 13: the wizard renames the connect button to
+    'Connect Google' because the OAuth flow now grants both Gmail
+    (gmail.compose) and Drive (drive.file) scopes. This endpoint
+    surfaces per-scope state so the wizard can distinguish 'fully
+    connected' from 'Gmail granted, Drive needs re-consent' (the
+    case where an operator linked Gmail before drive.file was added
+    to SCOPES)."""
+    _, ws = _engine_and_ws()
+    gmail_ok = gmail_oauth.is_connected(ws)
+    drive_ok = gmail_oauth.drive_connected(ws)
+    return GoogleStatus(
+        gmail_connected=gmail_ok,
+        drive_connected=drive_ok,
+        google_connected=gmail_ok and drive_ok,
+    )
 
 
 @app.post(

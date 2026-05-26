@@ -17,7 +17,17 @@ from dataclasses import dataclass
 from email.mime.text import MIMEText
 from typing import Optional
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
+SCOPES = [
+    # Read / create / update / delete the operator's own drafts. Cannot
+    # send mail -- the brief is explicit that the human stays in the
+    # send loop.
+    "https://www.googleapis.com/auth/gmail.compose",
+    # Build Session 13: write meeting-prep briefs into the operator's
+    # Drive. drive.file (not the broader drive scope) only grants
+    # access to files this app creates or opens; we cannot read or
+    # touch anything else in the operator's Drive.
+    "https://www.googleapis.com/auth/drive.file",
+]
 
 
 class GmailError(RuntimeError):
