@@ -233,11 +233,20 @@ def list_events(engine: Any, draft_id: int) -> list[Any]:
 def pending_review(engine: Any) -> list[Any]:
     """Drafts whose pointer is in REVIEWABLE_STATES, ordered by
     partner_id then draft_id. Drives `list_pending_review.py` +
-    the future review-queue UI."""
+    the future review-queue UI.
+
+    Superseded drafts (Slice 17: superseded_at IS NOT NULL) are
+    excluded -- a stale generation must never surface as
+    approvable. Stage 7's re-run creates a new live draft per
+    partner; the prior one stays in the table for audit only.
+    """
     with engine.begin() as conn:
         return list(conn.execute(
             select(email_drafts)
-            .where(email_drafts.c.approval_status.in_(REVIEWABLE_STATES))
+            .where(
+                email_drafts.c.approval_status.in_(REVIEWABLE_STATES),
+                email_drafts.c.superseded_at.is_(None),
+            )
             .order_by(email_drafts.c.partner_id, email_drafts.c.draft_id)
         ))
 
@@ -245,11 +254,22 @@ def pending_review(engine: Any) -> list[Any]:
 def approved_for_send(engine: Any) -> list[Any]:
     """Drafts cleared for Gmail / Attio / send_queue.csv. The single
     canonical read for any 'send this' consumer -- never branch on
-    approval_status string literals directly."""
+    approval_status string literals directly.
+
+    Superseded drafts are excluded so an old approved_to_send row
+    can't slip through after a Stage 7 re-run. Defense in depth:
+    Stage 7's supersede flips approved drafts to
+    stale_after_approval via the state machine, but a manual SQL
+    edit or a race could leave a superseded row still labeled
+    approved_to_send -- this filter is the final gate.
+    """
     with engine.begin() as conn:
         return list(conn.execute(
             select(email_drafts)
-            .where(email_drafts.c.approval_status.in_(APPROVED_STATES))
+            .where(
+                email_drafts.c.approval_status.in_(APPROVED_STATES),
+                email_drafts.c.superseded_at.is_(None),
+            )
             .order_by(email_drafts.c.draft_id)
         ))
 

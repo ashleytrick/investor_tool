@@ -87,6 +87,7 @@ HARD_BLOCKER_SUBSTRINGS: tuple[str, ...] = (
     "cold_reachability_score is unknown",
     "verification status = invalid",
     "draft_id=",  # "draft_id=N not found"
+    "superseded",  # Slice 17 immutable history: stale generation
 )
 
 
@@ -191,12 +192,29 @@ def can_approve_draft(
                 email_drafts.c.body,
                 email_drafts.c.template_smell,
                 email_drafts.c.qa_status,
+                email_drafts.c.superseded_at,
             ).where(email_drafts.c.draft_id == draft_id)
         ).first()
         if draft is None:
             return ApprovalGate(
                 ok=False,
                 blockers=(f"draft_id={draft_id} not found",),
+            )
+        # Slice 17 immutable history hard refusal: a superseded draft
+        # is a prior generation kept for audit. It must NEVER be
+        # approvable / sendable / syncable. Refuse before any other
+        # check so the operator sees the exact reason + so the
+        # downstream gate (export_send_queue, Gmail, Attio) can never
+        # accidentally treat a stale body as live. Classified HARD in
+        # HARD_BLOCKER_SUBSTRINGS so --override-blockers can't bypass.
+        if draft.superseded_at is not None:
+            return ApprovalGate(
+                ok=False,
+                blockers=(
+                    f"draft_id={draft_id} is superseded "
+                    f"(superseded_at={draft.superseded_at.isoformat()}); "
+                    f"approve the latest generation for this partner instead",
+                ),
             )
         partner = conn.execute(
             select(

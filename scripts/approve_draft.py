@@ -97,11 +97,27 @@ def main() -> int:
                     email_drafts.c.partner_id,
                     email_drafts.c.approval_status,
                     email_drafts.c.subject,
+                    email_drafts.c.superseded_at,
                 ).where(email_drafts.c.draft_id == args.draft_id)
             ).first()
         if row is None:
             print(f"[approve] draft_id={args.draft_id} not found")
             ctx.usage_error(f"draft_id={args.draft_id} not found")
+            return ctx.exit_code
+        # Belt + braces: refuse on superseded BEFORE running the
+        # full gate. The gate enforces it too (HARD blocker) but
+        # this short-circuit gives the operator the cleanest error
+        # message and prevents any later code from touching a stale
+        # row's approval state.
+        if row.superseded_at is not None:
+            print(
+                f"[approve] REFUSED: draft_id={args.draft_id} is "
+                f"superseded ({row.superseded_at.isoformat()}). Stage 7 "
+                f"replaced it with a newer generation. Approve the live "
+                f"draft for partner {row.partner_id!r} instead -- find "
+                f"it via list_pending_review.py or list_draft_history.py."
+            )
+            ctx.refuse(f"draft_id={args.draft_id} is superseded")
             return ctx.exit_code
 
         # Re-derive the approval gate from LIVE DB state. Stage 7's

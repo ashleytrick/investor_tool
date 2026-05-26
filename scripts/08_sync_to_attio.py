@@ -384,9 +384,16 @@ def main() -> int:
             # the LATEST recommended/alternate per partner. Previously the
             # select had no ORDER BY -- DB-iteration order could surface a
             # stale recommended draft from an old Stage 7 run.
+            #
+            # Defense in depth (Slice 17 follow-up): filter
+            # superseded_at IS NULL so an old generation can never
+            # populate Attio's outreach fields, even if the approval
+            # gate elsewhere has a regression.
             drafts_by_partner: dict[str, dict] = {}
             for d in conn.execute(
-                select(email_drafts).order_by(email_drafts.c.draft_id.asc())
+                select(email_drafts)
+                .where(email_drafts.c.superseded_at.is_(None))
+                .order_by(email_drafts.c.draft_id.asc())
             ):
                 key = "recommended" if d.is_recommended else "alternate"
                 drafts_by_partner.setdefault(d.partner_id, {})[key] = d
