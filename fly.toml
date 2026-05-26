@@ -21,7 +21,7 @@
 # the Fly free allotment. Bump the VM if Stage 7 / Stage 8 needs
 # more memory.
 
-app = "investor-outreach-api"  # CHANGE ME before first deploy
+app = "investor-outreach-api-trick"
 primary_region = "iad"
 
 [build]
@@ -34,6 +34,7 @@ API_OPERATOR = "api-client"
 # here). Same for ANTHROPIC_API_KEY, ATTIO_API_KEY. Anything in
 # this [env] block is committed in plaintext, so secrets must NOT
 # live here.
+# Set API_ALLOW_EXAMPLE_DOMAINS=true only for fixture/demo deployments.
 
 [mounts]
 source = "investor_workspace"
