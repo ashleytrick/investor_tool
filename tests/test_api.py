@@ -634,6 +634,15 @@ def test_oauth_callback_persists_token_and_renders_confirmation(
         return {"emailAddress": "operator@example.com"}
 
     monkeypatch.setattr(gomod, "complete_flow", fake_complete_flow)
+    # Post-#3 review: callback resolves the workspace via the
+    # pending-state map instead of `_engine_and_ws()` so it works
+    # in per-user mode (where the redirect has no Bearer header).
+    # Stub pending_workspace_path so the test doesn't have to run
+    # the real start_flow first.
+    monkeypatch.setattr(
+        gomod, "pending_workspace_path",
+        lambda state: str(workspace_with_one_pending_draft),
+    )
 
     res = client.get(
         "/oauth/gmail/callback"

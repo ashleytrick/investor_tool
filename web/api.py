@@ -389,9 +389,60 @@ app.add_middleware(
     allow_origins=_origins,
     allow_origin_regex=_origin_regex,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+# Per-user routing middleware (review items #1 + #2):
+#
+# FastAPI runs sync dependencies in a threadpool, and contextvar
+# mutations made there don't propagate back to the parent async
+# task -- so setting `_CURRENT_USER_ID_VAR` from inside
+# `current_principal` / `require_auth` (which are sync) doesn't
+# reach the endpoint. The fix is to stamp the contextvar from
+# an async middleware that runs in the parent task. Every
+# downstream dependency + endpoint then inherits the value via
+# the normal context-propagation rules.
+#
+# The middleware is best-effort -- it doesn't reject anything;
+# `require_auth` still does the actual gating. We just pre-resolve
+# the principal so the user_id is in the contextvar by the time
+# `_engine_and_ws()` / `_ws_path()` look for it.
+@app.middleware("http")
+async def _stamp_user_id_contextvar(request: Request, call_next):
+    from web.deps import (
+        _CURRENT_USER_ID_VAR,
+        _is_api_key_fallback_enabled,
+        _jwt_secret,
+        _principal_from_claims,
+        _verify_supabase_jwt,
+    )
+
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        user_id: str | None = None
+        if _jwt_secret() is not None:
+            claims = _verify_supabase_jwt(token)
+            if claims is not None:
+                principal = _principal_from_claims(claims)
+                if principal and principal.get("user_id"):
+                    user_id = principal["user_id"]
+        if user_id is None:
+            # Legacy API_KEY -> the bound fallback user_id (if any).
+            fallback_on = (
+                _jwt_secret() is None or _is_api_key_fallback_enabled()
+            )
+            if fallback_on:
+                expected = os.environ.get("API_KEY") or ""
+                if expected and hmac.compare_digest(token, expected):
+                    bound = os.environ.get("API_KEY_FALLBACK_USER_ID") or ""
+                    if bound:
+                        user_id = bound
+        if user_id:
+            _CURRENT_USER_ID_VAR.set(user_id)
+    return await call_next(request)
 
 
 # ---------- routers ----------

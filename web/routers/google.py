@@ -41,6 +41,7 @@ from pydantic import BaseModel
 
 from core import gmail_oauth
 from core import supabase_admin
+from core.config_loader import load_workspace
 from web.deps import _engine_and_ws, current_principal, require_auth
 
 
@@ -190,7 +191,22 @@ def gmail_oauth_callback(
             "<h1>Missing code or state on OAuth redirect</h1>",
             status_code=400,
         )
-    _, ws = _engine_and_ws()
+    # The callback has no Bearer header (Google redirects from
+    # accounts.google.com cross-origin), so we can't resolve the
+    # tenant via `_engine_and_ws()` -- it would fall through to
+    # the pinned INVESTOR_WORKSPACE and write the token into the
+    # wrong workspace in per-user mode. Look up the workspace
+    # stamped on the pending state (cryptographically random
+    # token minted inside the authenticated /gmail/connect call).
+    ws_path_str = gmail_oauth.pending_workspace_path(state)
+    if not ws_path_str:
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>Gmail OAuth error</title>"
+            "<h1>Unknown or expired OAuth state</h1>",
+            status_code=400,
+        )
+    ws = load_workspace(ws_path_str)
     try:
         profile = gmail_oauth.complete_flow(state, code, ws)
     except ValueError as exc:
