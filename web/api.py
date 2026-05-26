@@ -69,6 +69,7 @@ from core.config_loader import load_workspace  # noqa: E402
 from core.db import (  # noqa: E402
     email_drafts,
     get_engine,
+    outreach_events,
     partner_score_summaries,
     partners,
     runs,
@@ -746,6 +747,162 @@ def set_send_pace(
     engine, _ = _engine_and_ws()
     with engine.begin() as conn:
         return SendPaceView(value=_write_send_pace(conn, body.value))
+
+
+# ---------- B2: outreach events (Gmail Sent poll + read) ----------
+
+class SentItem(BaseModel):
+    """One row on the Coach Sent tab. Matches the frontend's
+    `SentItem` shape (best-effort -- adjust if the frontend's
+    types.ts diverges)."""
+    event_id: int
+    partner_id: str | None = None
+    partner_name: str | None = None
+    partner_email: str | None = None
+    draft_id: int | None = None
+    external_id: str | None = None  # Gmail Message-ID
+    thread_id: str | None = None
+    subject: str | None = None
+    body_snippet: str | None = None
+    recipient_email: str | None = None
+    occurred_at: str  # ISO datetime
+
+
+class PollResult(BaseModel):
+    workspace: str  # path or user_id of the tenant that was polled
+    inserted: int
+    error: str | None = None
+
+
+class PollGmailSentResult(BaseModel):
+    """Response from `POST /api/public/hooks/poll-gmail-sent`. The
+    hook caller (Fly cron / external scheduler) uses `total_inserted`
+    + the per-workspace `results` for logging / alerting."""
+    polled: int
+    total_inserted: int
+    results: list[PollResult]
+
+
+def _hook_secret_required(
+    x_hook_secret: str | None = Header(default=None, alias="X-Hook-Secret"),
+) -> None:
+    """Cron-hook auth: a shared secret in X-Hook-Secret. NOT JWT --
+    the scheduler hitting these endpoints is infrastructure, not a
+    user. Without `HOOK_SECRET` set in env, the endpoint refuses
+    every request (fail-closed; we don't want an unset secret to
+    silently allow anonymous polling)."""
+    expected = os.environ.get("HOOK_SECRET") or ""
+    if not expected:
+        raise HTTPException(
+            500, "HOOK_SECRET env var unset; hook endpoints disabled",
+        )
+    if not x_hook_secret or not hmac.compare_digest(x_hook_secret, expected):
+        raise HTTPException(401, "invalid hook secret")
+
+
+@app.post(
+    "/api/public/hooks/poll-gmail-sent",
+    response_model=PollGmailSentResult,
+    summary=(
+        "Cron-triggered poll of every tenant's Gmail Sent box -> "
+        "outreach_events"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_gmail_sent(
+    _hook: None = Depends(_hook_secret_required),
+) -> PollGmailSentResult:
+    """Iterates every per-user workspace and polls Gmail for new
+    Sent messages since the workspace's high-water mark. Failures
+    (gmail token missing, list call 5xx) are caught per-tenant so
+    one bad workspace doesn't stop the rest.
+
+    Schedule: every 10 minutes (per spec). External scheduler (Fly
+    cron, GHA, a tiny worker) is responsible for the cadence; this
+    endpoint just does one pass on each call.
+
+    Auth: X-Hook-Secret header == HOOK_SECRET env var. JWT-style
+    auth doesn't apply here -- the caller is infrastructure, not a
+    user.
+    """
+    from core.config_loader import load_workspace as _load_workspace
+    from core.outreach_events import (
+        poll_gmail_sent_for_workspace as _poll,
+    )
+    from web.routers.admin import _iter_tenant_workspaces
+
+    tenants = _iter_tenant_workspaces()
+    if not tenants:
+        # Legacy single-workspace mode (WORKSPACE_PER_USER off):
+        # poll the single configured workspace.
+        ws_dir = pathlib.Path(_ws_path())
+        if ws_dir.exists():
+            tenants = [ws_dir]
+
+    results: list[PollResult] = []
+    total = 0
+    for ws_dir in tenants:
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=str(ws_dir),
+                inserted=0,
+                error=f"load_workspace_failed: {exc}",
+            ))
+            continue
+        r = _poll(ws)
+        results.append(PollResult(
+            workspace=r.workspace,
+            inserted=r.inserted,
+            error=r.error,
+        ))
+        total += r.inserted
+
+    return PollGmailSentResult(
+        polled=len(results), total_inserted=total, results=results,
+    )
+
+
+@app.get(
+    "/sent",
+    response_model=list[SentItem],
+    summary="Recent Gmail Sent events for the current tenant",
+    tags=["coach"],
+)
+def get_sent(
+    limit: int = Query(default=100, ge=1, le=500),
+    _auth: None = Depends(require_auth),
+) -> list[SentItem]:
+    from core.outreach_events import list_sent_events
+    engine, _ = _engine_and_ws()
+    rows = list_sent_events(engine, limit=limit)
+    out: list[SentItem] = []
+    for r in rows:
+        occurred = r["occurred_at"]
+        # SQLite returns datetimes as Python objects via SA; coerce
+        # to ISO string for the JSON contract.
+        occurred_iso = (
+            occurred.isoformat()
+            if hasattr(occurred, "isoformat") else str(occurred)
+        )
+        out.append(SentItem(
+            event_id=int(r["event_id"]),
+            partner_id=r.get("partner_id"),
+            partner_name=r.get("partner_name"),
+            partner_email=r.get("partner_email"),
+            draft_id=(
+                int(r["draft_id"]) if r.get("draft_id") is not None
+                else None
+            ),
+            external_id=r.get("external_id"),
+            thread_id=r.get("thread_id"),
+            subject=r.get("subject"),
+            body_snippet=r.get("body_snippet"),
+            recipient_email=r.get("recipient_email"),
+            occurred_at=occurred_iso,
+        ))
+    return out
 
 
 # ---------- partner mutations ----------

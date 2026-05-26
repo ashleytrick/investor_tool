@@ -974,6 +974,78 @@ workspace_settings = Table(
 )
 
 
+# B2 (Coach Sent/Replies/Bounced): the canonical log of outreach
+# touchpoints we observe via integrations. Each row is one event we
+# saw -- a Gmail send confirmation, an Attio activity, an in-app
+# action. The shape is intentionally narrow so future event types
+# (e.g. bounces from a delivery report, opens from an open-tracker,
+# replies that get auto-classified) land without another migration.
+#
+# Tenant isolation is by workspace file boundary as elsewhere; no
+# user_id column is needed because the events live in the tenant's
+# own pipeline.db. The Lovable spec listed user_id but our backend
+# uses SQLite-per-tenant (see PR #65 / #69 discussion); the file is
+# the isolation surface.
+outreach_events = Table(
+    "outreach_events", metadata,
+    Column("event_id", Integer, primary_key=True, autoincrement=True),
+    # partner_id: SET NULL on partner delete so the event row
+    # survives the partner row (the audit "we sent this to someone"
+    # is preserved even if the partner is later purged from the
+    # workspace). The recipient_email below is the durable handle.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="SET NULL"),
+    ),
+    # draft_id: SET NULL on draft delete (same logic -- the event
+    # outlives the draft).
+    Column(
+        "draft_id", Integer,
+        ForeignKey("email_drafts.draft_id", ondelete="SET NULL"),
+    ),
+    # source: where the event came from -- 'gmail' (poll-gmail-sent /
+    # poll-gmail-replies), 'attio' (poll-attio-activity), 'app'
+    # (in-app actions we want to log, e.g. operator marked a partner
+    # do_not_contact).
+    Column("source", Text, nullable=False),
+    # event_type: what happened -- 'sent', 'opened', 'replied',
+    # 'bounced'. Lower-cased by convention.
+    Column("event_type", Text, nullable=False),
+    # external_id: the source's primary key for this event. For
+    # Gmail this is the RFC 822 Message-ID. For Attio it's the
+    # activity id. Unique per (source, external_id) -- a poll re-run
+    # that sees the same id is a no-op.
+    Column("external_id", Text),
+    # thread_id: groups events by conversation. Gmail's threadId.
+    Column("thread_id", Text),
+    Column("occurred_at", DateTime, nullable=False),
+    Column("recipient_email", Text),
+    Column("subject", Text),
+    Column("body_snippet", Text),
+    # B3 will populate classification ('interested' / 'pass' /
+    # 'meeting_booked' / 'unclear') for reply events. Left nullable
+    # so B2 can insert 'sent' rows without it.
+    Column("classification", Text),
+    # B3: unread = "operator hasn't seen this in the UI yet".
+    # GET /replies filters on it.
+    Column("unread", Boolean, default=False),
+    Column("created_at", DateTime),
+    Index("ix_outreach_events_partner_id", "partner_id"),
+    Index(
+        "ix_outreach_events_source_type", "source", "event_type",
+    ),
+    Index("ix_outreach_events_occurred_at", "occurred_at"),
+    # UNIQUE on (source, external_id): re-polling Gmail naturally
+    # sees the same Message-ID twice; the upsert must collapse to
+    # one row. SQLite UNIQUE tolerates multiple NULLs so app-source
+    # rows (which have no external_id) aren't constrained.
+    Index(
+        "ux_outreach_events_source_extid", "source", "external_id",
+        unique=True,
+    ),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
