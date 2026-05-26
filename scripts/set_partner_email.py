@@ -15,9 +15,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
+from core.approval.persistence import stale_live_approvals_for_partner
+from core.approval.state_machine import TRIGGER_EMAIL_CHANGED
 from core.config_loader import add_workspace_arg
 from core.csv_ingest import (
     CsvIngestSchema, ingest_csv, in_set, looks_like_email, require_field,
+    unique_field,
 )
 from core.db import partners
 from core.operator_command import operator_command_run
@@ -47,6 +50,14 @@ def main() -> int:
 
         with engine.begin() as conn:
             known = {r.partner_id for r in conn.execute(select(partners.c.partner_id))}
+            # Snapshot of current emails so we can detect a real change
+            # and only stale approvals when the recipient actually moves.
+            existing_email = {
+                r.partner_id: (r.email or "").strip().lower()
+                for r in conn.execute(
+                    select(partners.c.partner_id, partners.c.email),
+                )
+            }
 
         rows: list[tuple[str, str]] = []
         if args.from_csv:
@@ -60,6 +71,8 @@ def main() -> int:
                 row_validators=(
                     require_field("partner_id"),
                     require_field("email"),
+                    unique_field("partner_id",
+                                 error_type="duplicate_partner_id"),
                     in_set("partner_id", known,
                            error_type="unknown_partner"),
                     looks_like_email("email"),
@@ -86,6 +99,12 @@ def main() -> int:
         else:
             rows = [(args.partner_id, args.email)]
 
+        # Pairs of (partner_id, email) successfully written that changed
+        # the recipient. After the write transaction closes, stale
+        # any live approvals for those partners. We collect first +
+        # stale after the write so the partners.email row is
+        # already updated when downstream gate re-checks fire.
+        changed: list[tuple[str, str]] = []
         with engine.begin() as conn:
             for pid, email in rows:
                 with run.attempt():
@@ -110,6 +129,23 @@ def main() -> int:
                         )
                     )
                     print(f"[set_partner_email] {pid} -> {email}")
+                    if existing_email.get(pid, "") != email.strip().lower():
+                        changed.append((pid, email))
+
+        # Invalidate prior approvals on any partner whose email
+        # actually moved. Same trigger Apollo overwrite uses, so
+        # the audit log shape is uniform regardless of which CLI
+        # touched the row.
+        for pid, email in changed:
+            staled = stale_live_approvals_for_partner(
+                engine, partner_id=pid, trigger=TRIGGER_EMAIL_CHANGED,
+                notes=f"new email: {email}",
+            )
+            if staled:
+                print(
+                    f"[set_partner_email] {pid}: staled {staled} "
+                    f"approved draft(s) (email changed)"
+                )
 
         print(
             f"[set_partner_email] processed={run.processed} "

@@ -25,6 +25,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
+from core.approval.persistence import stale_live_approvals_for_partner
+from core.approval.state_machine import TRIGGER_EMPLOYMENT_LEFT_FUND
 from core.config_loader import add_workspace_arg
 from core.db import partners
 from core.operator_command import operator_command_run
@@ -77,6 +79,21 @@ def main() -> int:
         )
         print(f"[employment] {msg}")
         run.note(msg)
+        # The partner left the fund -- cold outreach approved against
+        # their old role no longer applies. Stale every live approval
+        # so the operator must re-confirm before sending.
+        if args.status == "left_fund" and old != "left_fund":
+            staled = stale_live_approvals_for_partner(
+                engine,
+                partner_id=args.partner_id,
+                trigger=TRIGGER_EMPLOYMENT_LEFT_FUND,
+                notes=args.reason,
+            )
+            if staled:
+                print(
+                    f"[employment] staled {staled} approved draft(s) "
+                    f"for {args.partner_id} (left fund)"
+                )
         run.succeeded = 1
         run.processed = 1
     return ctx.exit_code

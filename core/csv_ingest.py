@@ -234,6 +234,40 @@ def looks_like_email(field_name: str = "email") -> RowValidator:
 _URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$")
 
 
+def unique_field(field_name: str, *,
+                 error_type: str = "duplicate_field") -> RowValidator:
+    """Row's `field_name` value must not have appeared in any earlier
+    row. Stateful: the validator instance holds a set of seen values
+    across calls within one ingest_csv() invocation, so the 2nd+
+    occurrence of the same value lands in row_errors.
+
+    Empty values are NOT considered duplicates (require_field() should
+    be the source of truth for "missing"). Comparison is case-sensitive
+    on the stripped string -- callers needing case-insensitive
+    uniqueness should normalize upstream.
+
+    Use case: enrichment CSVs (Apollo email import, partner overrides)
+    where two rows for the same partner_id are ambiguous about which
+    value should win. Surfacing the duplicate forces the operator to
+    de-dupe their source rather than getting last-write-wins.
+    """
+    seen: set[str] = set()
+
+    def _check(row: dict[str, str]) -> None:
+        v = (row.get(field_name) or "").strip()
+        if not v:
+            return
+        if v in seen:
+            raise _TypedValueError(
+                f"duplicate {field_name}={v!r} in CSV (already seen "
+                f"earlier in this file)",
+                error_type=error_type,
+            )
+        seen.add(v)
+
+    return _check
+
+
 def looks_like_url(field_name: str = "source_url") -> RowValidator:
     """Row's `field_name` must look like an http(s) URL. Skips empty
     values."""

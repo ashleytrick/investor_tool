@@ -34,6 +34,8 @@ from sqlalchemy import select
 from core.config_loader import add_workspace_arg
 from core.db import outcomes, partners
 from core.operator_command import operator_command_run
+from core.outcomes.events import OutcomeEvent
+from core.outcomes.persistence import persist_outcome_event
 
 STAGE = "record_outcome"
 
@@ -101,18 +103,34 @@ def _validate_meeting_consistency(
         )
 
 
-def _insert(conn, *, partner_id, status, reply_type, meeting_booked,
-            meeting_date, meeting_outcome):
-    conn.execute(outcomes.insert().values(
+def _build_event(*, partner_id, status, reply_type, meeting_booked,
+                 meeting_date, meeting_outcome) -> OutcomeEvent:
+    """Construct an OutcomeEvent for the persistence layer. The
+    external_event_id is derived from a hash of the canonical state
+    fields PLUS the call timestamp so the duplicate-event dedup never
+    blocks a genuine manual recording. The is_unchanged_from_latest
+    check (in persist_outcome_event) is still the safety net: re-running
+    the exact same command twice in a row produces one row, not two.
+    """
+    import hashlib
+    now = _now()
+    payload = "|".join([
+        partner_id, str(status), str(reply_type),
+        str(bool(meeting_booked)), str(meeting_date),
+        str(meeting_outcome), now.isoformat(),
+    ])
+    h = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return OutcomeEvent(
         partner_id=partner_id,
         outreach_status=status,
         reply_type=reply_type,
         meeting_booked=bool(meeting_booked),
         meeting_date=meeting_date,
         meeting_outcome=meeting_outcome,
-        synced_from_attio_at=_now(),
         source="manual",
-    ))
+        external_event_id=f"manual:{h}",
+        observed_at=now,
+    )
 
 
 def main() -> int:
@@ -153,47 +171,53 @@ def main() -> int:
                 return 2
             with path.open(encoding="utf-8") as fh:
                 reader = csv.DictReader(fh)
-                with engine.begin() as conn:
-                    for row in reader:
-                        with run.attempt():
-                            pid = (row.get("partner_id") or "").strip()
-                            if not pid:
-                                run.skip()
-                                continue
-                            if pid not in known:
-                                run.fail(
-                                    pid, "unknown_partner",
-                                    "partner_id not in partners table",
-                                )
-                                continue
-                            try:
-                                _status = (row.get("status") or "").strip() or None
-                                _rt = (row.get("reply_type") or "").strip() or None
-                                _mo = (row.get("meeting_outcome") or "").strip() or None
-                                _mb = (row.get("meeting_booked") or "").strip().lower() in (
-                                    "true", "1", "yes",
-                                )
-                                _md = _parse_date(
-                                    (row.get("meeting_date") or "").strip() or None
-                                )
-                                _validate_choices(
-                                    status=_status, reply_type=_rt, meeting_outcome=_mo,
-                                )
-                                _validate_meeting_consistency(
-                                    meeting_booked=_mb,
-                                    meeting_date=_md,
-                                    meeting_outcome=_mo,
-                                    status=_status,
-                                    reply_type=_rt,
-                                )
-                                _insert(
-                                    conn, partner_id=pid,
-                                    status=_status, reply_type=_rt,
-                                    meeting_booked=_mb, meeting_date=_md,
-                                    meeting_outcome=_mo,
-                                )
-                            except SystemExit as exc:
-                                run.fail(pid, "validation", str(exc))
+                # persist_outcome_event opens its own transaction
+                # (and so does the suppression-staling tail), so the
+                # caller-level engine.begin() that used to wrap the
+                # batch insert would deadlock SQLite. Iterate without
+                # an outer transaction; each event lands atomically.
+                for row in reader:
+                    with run.attempt():
+                        pid = (row.get("partner_id") or "").strip()
+                        if not pid:
+                            run.skip()
+                            continue
+                        if pid not in known:
+                            run.fail(
+                                pid, "unknown_partner",
+                                "partner_id not in partners table",
+                            )
+                            continue
+                        try:
+                            _status = (row.get("status") or "").strip() or None
+                            _rt = (row.get("reply_type") or "").strip() or None
+                            _mo = (row.get("meeting_outcome") or "").strip() or None
+                            _mb = (row.get("meeting_booked") or "").strip().lower() in (
+                                "true", "1", "yes",
+                            )
+                            _md = _parse_date(
+                                (row.get("meeting_date") or "").strip() or None
+                            )
+                            _validate_choices(
+                                status=_status, reply_type=_rt, meeting_outcome=_mo,
+                            )
+                            _validate_meeting_consistency(
+                                meeting_booked=_mb,
+                                meeting_date=_md,
+                                meeting_outcome=_mo,
+                                status=_status,
+                                reply_type=_rt,
+                            )
+                            persist_outcome_event(
+                                engine,
+                                _build_event(
+                                    partner_id=pid, status=_status,
+                                    reply_type=_rt, meeting_booked=_mb,
+                                    meeting_date=_md, meeting_outcome=_mo,
+                                ),
+                            )
+                        except SystemExit as exc:
+                            run.fail(pid, "validation", str(exc))
             print(
                 f"[record_outcome] from-csv: processed={run.processed} "
                 f"ok={run.succeeded} failed={run.failed} skipped={run.skipped}"
@@ -220,16 +244,17 @@ def main() -> int:
             status=args.status,
             reply_type=args.reply_type,
         )
-        with engine.begin() as conn:
-            _insert(
-                conn,
+        persist_outcome_event(
+            engine,
+            _build_event(
                 partner_id=args.partner_id,
                 status=args.status,
                 reply_type=args.reply_type,
                 meeting_booked=args.meeting_booked,
                 meeting_date=_parse_date(args.meeting_date),
                 meeting_outcome=args.meeting_outcome,
-            )
+            ),
+        )
         run.processed = 1
         run.succeeded = 1
         print(

@@ -84,6 +84,12 @@ def persist_outcome_event(engine: Any, event: OutcomeEvent) -> int | None:
     each opens its own transaction so a concurrent inserter can't
     sneak between (the unique index on external_event_id is the
     final guard).
+
+    After hydration: if the new partner relationship state would
+    suppress further outreach, any live approved drafts for this
+    partner are flipped to stale_after_approval. The state-machine
+    invalidation rule ("relationship_changed" -- same trigger
+    set_relationship.py uses) keeps a single source of truth.
     """
     if is_duplicate_event(engine, event.external_event_id):
         return None
@@ -99,7 +105,51 @@ def persist_outcome_event(engine: Any, event: OutcomeEvent) -> int | None:
         # Same transaction so a hydrate failure rolls back the
         # outcome too.
         _hydrate_partner_from_event(conn, event)
-        return outcome_id
+    # Stale approved drafts AFTER the transaction commits so the
+    # gate re-check (which mark_stale runs) sees the new hydrated
+    # state. mark_stale opens its own engine.begin().
+    _stale_approvals_if_suppressed(engine, event.partner_id)
+    return outcome_id
+
+
+def _stale_approvals_if_suppressed(engine: Any, partner_id: str) -> None:
+    """After hydration, re-read the partner's live relationship state.
+    If it now suppresses outreach, invalidate any live approved
+    drafts so the operator must re-approve before they ship.
+
+    Conservative: we only check the live row, not the pre-hydration
+    snapshot. A no-op hydration leaves suppression unchanged, so
+    re-checking is idempotent. A hydration that flips to active /
+    no-suppression does nothing here -- approvals stay valid.
+    """
+    # Local imports to avoid a module-load cycle.
+    from core.approval.persistence import stale_live_approvals_for_partner
+    from core.approval.state_machine import TRIGGER_RELATIONSHIP_CHANGED
+    from core.relationships import suppress_outreach
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(
+                partners.c.relationship_status,
+                partners.c.last_contacted_at,
+                partners.c.last_reply_at,
+                partners.c.do_not_contact,
+            ).where(partners.c.partner_id == partner_id)
+        ).first()
+    if row is None:
+        return
+    suppression = suppress_outreach(
+        relationship_status=row.relationship_status,
+        last_contacted_at=row.last_contacted_at,
+        last_reply_at=row.last_reply_at,
+        do_not_contact=bool(row.do_not_contact),
+    )
+    if not suppression.suppressed:
+        return
+    stale_live_approvals_for_partner(
+        engine, partner_id=partner_id,
+        trigger=TRIGGER_RELATIONSHIP_CHANGED,
+        notes=f"outcome hydration: {suppression.reason}",
+    )
 
 
 def _hydrate_partner_from_event(conn: Any, event: OutcomeEvent) -> None:

@@ -131,6 +131,12 @@ TRIGGER_EMAIL_CHANGED: Final[str] = "partner_email_changed"
 TRIGGER_DO_NOT_CONTACT_SET: Final[str] = "do_not_contact_set"
 TRIGGER_RELATIONSHIP_CHANGED: Final[str] = "relationship_changed"
 TRIGGER_SCORE_MATERIALLY_CHANGED: Final[str] = "score_materially_changed"
+# Manual mutations that invalidate an approved draft. A partner who
+# left the fund or a fund that's been deactivated can no longer be
+# the recipient of cold outreach -- the approval was made against an
+# employment / fund state that no longer holds.
+TRIGGER_EMPLOYMENT_LEFT_FUND: Final[str] = "employment_left_fund"
+TRIGGER_FUND_INACTIVE: Final[str] = "fund_inactive"
 
 
 class InvalidApprovalTransition(ValueError):

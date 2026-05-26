@@ -52,7 +52,9 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import desc, select
 
-from core.db import draft_approvals, email_drafts, partner_score_summaries, partners
+from core.db import (
+    draft_approvals, email_drafts, funds, partner_score_summaries, partners,
+)
 from core.email.draft_routing import collect_blockers
 
 
@@ -88,6 +90,8 @@ HARD_BLOCKER_SUBSTRINGS: tuple[str, ...] = (
     "verification status = invalid",
     "draft_id=",  # "draft_id=N not found"
     "superseded",  # Slice 17 immutable history: stale generation
+    "employment_status=left_fund",  # partner left the fund
+    "fund is inactive",  # fund marked inactive
 )
 
 
@@ -225,6 +229,8 @@ def can_approve_draft(
                 partners.c.last_contacted_at,
                 partners.c.last_reply_at,
                 partners.c.email_verification_status,
+                partners.c.employment_status,
+                partners.c.fund_id,
             ).where(partners.c.partner_id == draft.partner_id)
         ).first()
         if partner is None:
@@ -235,6 +241,12 @@ def can_approve_draft(
                     f"no longer exists",
                 ),
             )
+        fund_row = None
+        if partner.fund_id:
+            fund_row = conn.execute(
+                select(funds.c.fund_id, funds.c.name, funds.c.is_active)
+                .where(funds.c.fund_id == partner.fund_id)
+            ).first()
         summary = conn.execute(
             select(
                 partner_score_summaries.c.recommended_to_send,
@@ -242,6 +254,25 @@ def can_approve_draft(
                 partner_score_summaries.c.recommendation_reasoning,
             ).where(partner_score_summaries.c.partner_id == draft.partner_id)
         ).first()
+
+    # Employment / fund-active hard blockers. Approval was made
+    # against a partner who held a role at an active fund; once
+    # either of those flip, the recipient is no longer the person
+    # we approved sending to. Classified HARD because cold outreach
+    # to "X who left the fund" is functionally wrong even if the
+    # email still works.
+    employment_blockers: list[str] = []
+    if (partner.employment_status or "").lower() == "left_fund":
+        employment_blockers.append(
+            f"partner employment_status=left_fund; cold outreach "
+            f"refused (re-verify role before re-approving)"
+        )
+    if fund_row is not None and fund_row.is_active is False:
+        employment_blockers.append(
+            f"fund is inactive ({fund_row.fund_id!r}); approve only "
+            f"after re-activating the fund or removing the partner "
+            f"from outreach"
+        )
 
     qa_blockers = _qa_blockers(draft.qa_status, draft.template_smell)
 
@@ -273,7 +304,9 @@ def can_approve_draft(
         banned=banned,
     )
 
-    all_blockers = list(qa_blockers) + list(routing_blockers)
+    all_blockers = (
+        list(employment_blockers) + list(qa_blockers) + list(routing_blockers)
+    )
     overridden: list[str] = []
     if respect_overrides and all_blockers:
         acknowledged = set(latest_overridden_blockers(engine, draft_id))
