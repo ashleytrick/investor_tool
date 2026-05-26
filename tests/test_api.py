@@ -1255,10 +1255,16 @@ def test_current_user_id_resolves_from_jwt_sub(
 def test_current_user_id_resolves_from_env_on_api_key_path(
     monkeypatch,
 ) -> None:
-    """When the legacy key authenticates, the user_id can be
-    overridden via API_KEY_FALLBACK_USER_ID -- typically pointed
-    at the operator's admin uuid so Phase 2 scoping tags pre-cutover
-    traffic to their tenant consistently."""
+    """When the legacy key authenticates, the user_id is sourced
+    from API_KEY_FALLBACK_USER_ID -- typically pointed at the
+    operator's admin uuid so pre-cutover traffic gets tagged to
+    their tenant consistently.
+
+    Phase 1.5 tightened this: the bearer token MUST match the
+    configured API_KEY for the legacy path to authenticate.
+    Sending an arbitrary string no longer works.
+    """
+    monkeypatch.setenv("API_KEY", "the-real-legacy-key")
     monkeypatch.setenv(
         "API_KEY_FALLBACK_USER_ID",
         "33333333-3333-3333-3333-333333333333",
@@ -1267,9 +1273,11 @@ def test_current_user_id_resolves_from_env_on_api_key_path(
     import importlib
     import web.deps as deps
     importlib.reload(deps)
-    # Any opaque token; the func doesn't validate, just looks up
-    # the env override.
-    uid = deps.current_user_id(authorization="Bearer some-legacy-key")
+    # Token must match the configured API_KEY -- legacy mode (no
+    # JWT secret) treats this as the canonical auth.
+    uid = deps.current_user_id(
+        authorization="Bearer the-real-legacy-key",
+    )
     assert uid == "33333333-3333-3333-3333-333333333333"
 
 
