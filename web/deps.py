@@ -231,8 +231,15 @@ def current_principal(
          (and `require_auth` rejects them with 401 below).
       3. None when neither path resolves.
 
-    Pure read; does NOT raise. `require_auth` is the gate.
+    Side effect: on a successful resolution, sets the request-scoped
+    `_CURRENT_USER_ID_VAR` contextvar so `_engine_and_ws()` routes to
+    the per-user workspace without each endpoint having to thread
+    `user_id` through. The contextvar is local to the request task,
+    so concurrent requests stay isolated.
+
+    Pure read otherwise; does NOT raise. `require_auth` is the gate.
     """
+    principal: dict | None = None
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
     token = authorization.split(" ", 1)[1].strip()
@@ -240,20 +247,24 @@ def current_principal(
     if _jwt_secret() is not None:
         claims = _verify_supabase_jwt(token)
         if claims is not None:
-            principal = _principal_from_claims(claims)
-            return principal or None
+            candidate = _principal_from_claims(claims)
+            if candidate:
+                principal = candidate
 
-    # API_KEY path -- only honored when the env var binds it to a
-    # specific user_id.
-    fallback_on = (
-        _jwt_secret() is None or _is_api_key_fallback_enabled()
-    )
-    if fallback_on:
-        expected = os.environ.get("API_KEY") or ""
-        if expected and hmac.compare_digest(token, expected):
-            return _api_key_fallback_principal()
+    if principal is None:
+        # API_KEY path -- only honored when the env var binds it to
+        # a specific user_id.
+        fallback_on = (
+            _jwt_secret() is None or _is_api_key_fallback_enabled()
+        )
+        if fallback_on:
+            expected = os.environ.get("API_KEY") or ""
+            if expected and hmac.compare_digest(token, expected):
+                principal = _api_key_fallback_principal()
 
-    return None
+    if principal is not None:
+        _CURRENT_USER_ID_VAR.set(principal["user_id"])
+    return principal
 
 
 def current_user_id(
@@ -302,12 +313,151 @@ def _ws_path() -> str:
     return ws
 
 
+# ---------- per-user workspace resolution (Phase 2a) ----------
+
+# Default values match the Fly deploy shape: `/data/workspaces/{uuid}/`
+# is the per-tenant tree; `clients/test_workspace` is the template
+# we copytree from on first auth. Locally, tests + dev override both
+# via env so nothing lands in /data/.
+_WORKSPACES_ROOT_DEFAULT = "/data/workspaces"
+_WORKSPACE_TEMPLATE_DEFAULT = "clients/test_workspace"
+
+# Anchor user_id to a safe slug regex -- Supabase emits UUIDs which
+# are alnum + dashes, but a malicious or buggy token could carry
+# anything in `sub`. We refuse to use the raw value as a path
+# component if it doesn't match this shape.
+import re  # noqa: E402
+
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _per_user_workspaces_enabled() -> bool:
+    """Opt-in switch for the Phase 2a per-user routing.
+
+    Default off so existing single-tenant deployments + the entire
+    test suite (which pins `INVESTOR_WORKSPACE` to the fixture
+    workspace) keep working unchanged. Operators flip this on after
+    setting `WORKSPACES_ROOT` and `WORKSPACE_TEMPLATE` to real
+    paths on the Fly volume.
+    """
+    raw = os.environ.get("WORKSPACE_PER_USER", "")
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _workspaces_root() -> pathlib.Path:
+    raw = os.environ.get("WORKSPACES_ROOT") or _WORKSPACES_ROOT_DEFAULT
+    return pathlib.Path(raw)
+
+
+def _workspace_template() -> pathlib.Path:
+    """Source path that `_provision_user_workspace` copytrees from on
+    first auth. The default ships every workspace with the same
+    config skeleton + empty examples; the user's wizard run then
+    overwrites the relevant fields via PUT /config/company etc.
+    """
+    raw = os.environ.get("WORKSPACE_TEMPLATE") or _WORKSPACE_TEMPLATE_DEFAULT
+    p = pathlib.Path(raw)
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+    return p
+
+
+def _user_workspace_path(user_id: str) -> pathlib.Path:
+    """Return the per-user workspace path for `user_id`. Does NOT
+    create it -- pair with `_provision_user_workspace` when you need
+    a guaranteed-existing tree."""
+    if not _USER_ID_RE.match(user_id or ""):
+        raise HTTPException(
+            400,
+            f"user_id {user_id!r} is not a valid path slug "
+            f"(expected alnum + dash/underscore, 1-64 chars)",
+        )
+    return _workspaces_root() / user_id
+
+
+def _provision_user_workspace(dst: pathlib.Path) -> None:
+    """Copytree the configured template into `dst` and wipe the
+    pipeline.db so the new tenant starts with an empty database +
+    a clean config skeleton. Idempotent on the target's existence:
+    if `dst` already exists, this is a no-op (the engine open will
+    handle schema migrations on an existing db).
+
+    Provisioning failures bubble up as 500s -- the user sees the
+    failure rather than silently getting a default-tenant fallback.
+    """
+    import shutil  # noqa: PLC0415
+
+    if dst.exists():
+        return
+    template = _workspace_template()
+    if not template.exists():
+        raise HTTPException(
+            500,
+            f"workspace template {template} is missing on disk; "
+            f"set WORKSPACE_TEMPLATE to a real path or deploy the "
+            f"template tree alongside the API.",
+        )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(template, dst)
+    # Don't carry the template's pipeline.db -- each user starts
+    # with a fresh SQLite (tables get created on first engine open
+    # via metadata.create_all).
+    db = dst / "data" / "pipeline.db"
+    if db.exists():
+        db.unlink()
+
+
 def _engine_and_ws():
-    """Load workspace + engine. Not cached -- engine creation is
-    cheap; caching across requests risks stale config when files
-    on disk change out-of-band (e.g. operator edits YAML)."""
+    """Load workspace + engine.
+
+    Phase 2a: when the active request authenticates via a Supabase
+    JWT (or the legacy API_KEY with `API_KEY_FALLBACK_USER_ID`
+    set), the workspace path is `${WORKSPACES_ROOT}/${user_id}/` --
+    auto-provisioned from `${WORKSPACE_TEMPLATE}` on first auth.
+
+    When no principal is available (legacy single-tenant mode,
+    tests pinned via `INVESTOR_WORKSPACE`), falls back to the
+    pinned env var. This preserves the existing test fixture story
+    AND every pre-Phase-2 deployment that hasn't wired Supabase
+    yet -- nothing breaks the day this code lands.
+
+    Routing is via the contextvar populated by `current_principal`
+    inside FastAPI's dependency-injection machinery. Endpoints that
+    declare `Depends(current_principal)` (or any dependency that
+    transitively calls it) get the per-user routing automatically;
+    endpoints that don't take an authenticated dependency continue
+    to use the pinned path.
+
+    Not cached -- engine creation is cheap; caching across requests
+    risks stale config when files on disk change out-of-band.
+    """
+    user_id = _CURRENT_USER_ID_VAR.get()
+    if user_id and _per_user_workspaces_enabled():
+        ws_path = _user_workspace_path(user_id)
+        _provision_user_workspace(ws_path)
+        ws = load_workspace(str(ws_path))
+        return get_engine(ws.db_url), ws
+    # No principal in context -> pinned-path legacy mode. Also
+    # the path when per-user routing is opt-out (default) -- tests
+    # and pre-Phase-2a deployments share one workspace.
     ws = load_workspace(_ws_path())
     return get_engine(ws.db_url), ws
+
+
+# Contextvar populated by `current_principal` when it resolves a
+# user_id (JWT path or env-bound API_KEY fallback). Read by
+# `_engine_and_ws()` to scope the workspace per request without
+# changing every endpoint signature.
+#
+# FastAPI runs each request in its own thread (or async task), so
+# contextvars give us per-request isolation automatically. The
+# previous all-singleton pattern (one INVESTOR_WORKSPACE for the
+# process) was wrong the moment we added a second tenant.
+import contextvars  # noqa: E402
+
+_CURRENT_USER_ID_VAR: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("_current_user_id", default=None)
+)
 
 
 def _actor() -> str:
