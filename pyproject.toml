@@ -29,6 +29,13 @@ web = [
 api = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    # Build Session 15: deck-first onboarding parses uploaded PDF /
+    # PPTX decks to seed the company profile. pypdf is pure Python +
+    # light; python-pptx covers .pptx (the binary .ppt format
+    # requires libreoffice and is left as a warning case).
+    "pypdf>=4.0",
+    "python-pptx>=0.6",
+    "python-multipart>=0.0.20",
 ]
 
 [tool.uv]

@@ -35,7 +35,10 @@ import subprocess
 import sys
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
+from fastapi import (
+    Depends, FastAPI, File, Form, HTTPException, Header,
+    Query, Request, UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -1017,6 +1020,234 @@ def put_company(
         stdout=f"company.yaml `company:` block updated ({body.name or 'unnamed'})\n",
         stderr="",
     )
+
+
+# ---------- deck-first onboarding extraction ----------
+#
+# Build Session 15. The wizard's first onboarding step uploads a
+# pitch deck; this endpoint parses it, asks the LLM to draft a
+# CompanyProfile + per-field evidence, and returns the result. It
+# DOES NOT WRITE to company.yaml -- the operator reviews + edits in
+# the form, then explicitly calls PUT /config/company to save.
+
+# Cap on the multipart upload. Pitch decks are normally <20MB but
+# some image-heavy ones get to 50MB; round to 50MB as the safety
+# valve. Files larger than this should be re-exported with
+# compressed images.
+_MAX_DECK_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _build_extraction_response(
+    *, filename: str, extracted_text, llm_output, llm_warnings: list[str],
+) -> "ExtractionResponse":
+    """Collapse the LLM's flat extracted_fields list into a draft
+    CompanyProfile dict + the audit-trail fields the frontend reads.
+
+    Done as a pure function so the test that doesn't go through HTTP
+    can construct the same response without touching the endpoint.
+    """
+    from schemas.deck_extraction import (
+        ExtractionResult,
+        NEEDS_REVIEW_THRESHOLD,
+        REQUIRED_FIELDS,
+    )
+
+    # Start from a default-empty CompanyProfile so the response shape
+    # always has every field even if the deck only filled three.
+    profile = CompanyProfile().model_dump()
+    valid_keys = set(profile.keys())
+    extracted_fields = []
+    needs_review = set()
+    for ef in llm_output.extracted_fields:
+        if ef.field not in valid_keys:
+            # LLM hallucinated a field name -- skip silently rather
+            # than 422'ing the whole response. The evidence-bearing
+            # ExtractedField never makes it to the form.
+            continue
+        # Type-coerce list fields whose CompanyProfile counterpart
+        # expects list[str]. The LLM can return a string by mistake;
+        # normalize so the frontend doesn't have to.
+        if isinstance(profile[ef.field], list) and isinstance(ef.value, str):
+            ef = ef.model_copy(update={"value": [ef.value]})
+        profile[ef.field] = ef.value
+        extracted_fields.append(ef)
+        if ef.confidence < NEEDS_REVIEW_THRESHOLD:
+            needs_review.add(ef.field)
+
+    missing = []
+    for req in REQUIRED_FIELDS:
+        val = profile.get(req)
+        if val is None or val == "" or val == []:
+            missing.append(req)
+        # A required field that WAS extracted but with low confidence
+        # also goes into needs_review (already added above for
+        # confidence; this block just covers the missing case).
+    text_preview = extracted_text.text[:1000]
+
+    # ExtractedField (schemas/) and ExtractedFieldOut (web/api.py)
+    # are byte-identical in fields but distinct Pydantic models;
+    # Pydantic v2 doesn't auto-coerce between them. Round-trip via
+    # model_dump so the response_model is happy.
+    return ExtractionResponse(
+        profile=profile,
+        extracted_fields=[ef.model_dump() for ef in extracted_fields],
+        missing_required_fields=missing,
+        needs_review_fields=sorted(needs_review),
+        warnings=extracted_text.warnings + llm_warnings,
+        source_filename=filename,
+        text_preview=text_preview,
+    )
+
+
+class ExtractedFieldOut(BaseModel):
+    """Response copy of schemas.deck_extraction.ExtractedField --
+    duplicated here so the FastAPI response_model is self-contained
+    (the schemas module sits below the web layer)."""
+    field: str
+    value: str | int | list[str] | None = None
+    confidence: float = 0.0
+    evidence: str = ""
+    source: str = ""
+
+
+class ExtractionResponse(BaseModel):
+    """HTTP response for POST /config/company/extract-from-deck.
+
+    `profile` is a draft -- the frontend pre-fills the form with
+    it, the operator reviews + edits, then PUT /config/company saves.
+    The endpoint NEVER writes to company.yaml on its own.
+    """
+    profile: CompanyProfile
+    extracted_fields: list[ExtractedFieldOut] = Field(default_factory=list)
+    missing_required_fields: list[str] = Field(default_factory=list)
+    needs_review_fields: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    source_filename: str = ""
+    text_preview: str = ""
+
+
+@app.post(
+    "/config/company/extract-from-deck",
+    response_model=ExtractionResponse,
+    summary="Parse a PDF/PPTX deck and return a draft CompanyProfile",
+    tags=["onboarding"],
+)
+async def extract_from_deck(
+    deck: UploadFile = File(
+        ..., description="PDF or PPTX pitch deck (50 MB max)",
+    ),
+    _auth: None = Depends(require_auth),
+) -> ExtractionResponse:
+    """Read the uploaded deck, extract text, ask the LLM to draft
+    a CompanyProfile, return the result + per-field evidence.
+
+    Does NOT persist the deck file or mutate company.yaml. The
+    response is a SETUP ASSISTANT artifact only; the operator
+    reviews + saves via PUT /config/company.
+    """
+    from core.deck_extraction import extract_profile_draft, extract_text
+    from core.llm.client import LLMClient
+
+    content = await deck.read()
+    if not content:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "empty file upload",
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    if len(content) > _MAX_DECK_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            detail={
+                "error": (
+                    f"deck is {len(content) // (1024 * 1024)} MB; "
+                    f"limit is "
+                    f"{_MAX_DECK_UPLOAD_BYTES // (1024 * 1024)} MB. "
+                    f"Re-export with compressed images or fill the "
+                    f"form manually."
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+
+    extracted = extract_text(deck.filename or "", content)
+    # When extraction yields no usable text, return a clean empty
+    # response with warnings rather than blowing up. The operator
+    # falls back to manual entry; PUT /config/company still works.
+    if not extracted.text.strip():
+        return _build_extraction_response(
+            filename=deck.filename or "",
+            extracted_text=extracted,
+            llm_output=__import__(
+                "schemas.deck_extraction",
+                fromlist=["DeckLLMOutput"],
+            ).DeckLLMOutput(extracted_fields=[]),
+            llm_warnings=[],
+        )
+
+    _, ws = _engine_and_ws()
+    llm = LLMClient(workspace=ws)
+    stub = _deck_stub_response() if llm.stub else None
+    try:
+        llm_output = extract_profile_draft(
+            llm=llm, deck_text=extracted.text, stub_response=stub,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface as response, not 500
+        # An LLM failure during extraction shouldn't 500 the whole
+        # onboarding flow -- return what we got from the text layer
+        # plus a warning so the operator can continue manually.
+        from schemas.deck_extraction import DeckLLMOutput
+        llm_output = DeckLLMOutput(
+            extracted_fields=[],
+            warnings=[f"LLM extraction failed: {exc}"],
+        )
+
+    return _build_extraction_response(
+        filename=deck.filename or "",
+        extracted_text=extracted,
+        llm_output=llm_output,
+        llm_warnings=list(llm_output.warnings),
+    )
+
+
+def _deck_stub_response() -> dict:
+    """Stub LLM output for offline mode (CI, tests, no API key).
+
+    Returns a small but realistic ExtractedField set -- enough to
+    exercise the endpoint's response shaping (low-confidence -> needs
+    review, missing required -> missing_required_fields) without
+    requiring a live model.
+    """
+    return {
+        "extracted_fields": [
+            {
+                "field": "name", "value": "Stub Co",
+                "confidence": 0.9,
+                "evidence": "(stub) cover slide title",
+                "source": "slide 1",
+            },
+            {
+                "field": "one_liner",
+                "value": "Stub one-liner from a stub deck.",
+                "confidence": 0.8,
+                "evidence": "(stub) tagline below the title",
+                "source": "slide 1",
+            },
+            {
+                "field": "problem",
+                "value": "stub problem statement",
+                "confidence": 0.5,   # below NEEDS_REVIEW_THRESHOLD
+                "evidence": "(stub) problem section",
+                "source": "slide 2",
+            },
+        ],
+        "warnings": [
+            "stub-mode response (no ANTHROPIC_API_KEY); fill the "
+            "form manually after the deploy is configured with a key"
+        ],
+    }
 
 
 def _shell_pipeline_stage(
