@@ -29,8 +29,10 @@ from schemas.deck_extraction import DeckLLMOutput
 
 # Max chars of deck text to send to the LLM. Pitch decks are short;
 # 200k chars is a hard upper bound (Sonnet's context is far larger
-# but the prompt only needs the punchy bits). We truncate from the
-# END so the cover slide / title page always survives.
+# but the prompt only needs the punchy bits). We keep the BEGINNING
+# (text[:budget]) because company name + one-liner live on the
+# cover slide. Review item #20 fixed an inverted truncation that
+# was dropping the start of very-large decks instead of the end.
 _LLM_TEXT_BUDGET = 200_000
 
 # Min chars of deck text before we even bother calling the LLM.
@@ -206,10 +208,13 @@ def extract_profile_draft(
                 "automatic extraction; please fill the form manually"
             ],
         )
-    # Truncate from the start, preserving the title/cover slide is
-    # less important than the closing ask + traction slides which
-    # tend to be deeper in the deck. (Keep the END.)
-    truncated = text[-_LLM_TEXT_BUDGET:] if len(text) > _LLM_TEXT_BUDGET else text
+    # Review item #20: keep the BEGINNING. The cover/title slide
+    # carries the company name + one-liner; truncating from the
+    # start dropped exactly the fields most likely to be required
+    # downstream. Traction / ask slides further into the deck are
+    # less load-bearing for the extraction (the LLM can still
+    # infer "stage" from the first ~50 pages of context).
+    truncated = text[:_LLM_TEXT_BUDGET] if len(text) > _LLM_TEXT_BUDGET else text
     prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace(
         "{DECK_TEXT}", truncated,
     )

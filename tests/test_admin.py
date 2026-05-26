@@ -459,4 +459,5 @@ def test_admin_companies_empty_when_per_user_routing_off(
     client = TestClient(api_mod.app)
     res = client.get("/admin/companies", headers=_auth_headers())
     assert res.status_code == 200, res.text
-    assert res.json() == {"companies": [], "count": 0}
+    # Review #22 added a `skipped` array; legacy mode = empty.
+    assert res.json() == {"companies": [], "count": 0, "skipped": []}

@@ -270,6 +270,13 @@ def claim_investor(
             f"investors_global needs an enriched_fields.domain or "
             f"an email"
         )
+    # Review item #12: a `.unclaimed` slug means we had no real
+    # domain. Mark the fund provisional + do_not_contact the
+    # partner so Stage 6 de-emphasizes it AND Stage 7 refuses to
+    # generate an email -- the operator must edit the funds row
+    # with a real domain before outreach goes out. Stage 2
+    # enrichment can still try to scrape (it will 404 cleanly).
+    is_pseudo_domain = domain.endswith(".unclaimed")
     fund_id = fund_id_for(domain)
     partner_id = partner_id_for(domain, partner_name)
     now = datetime.now(timezone.utc)
@@ -295,6 +302,9 @@ def claim_investor(
                     enriched.get("check_size_range") or ""
                 ) or None,
                 is_active=True,
+                # is_provisional flags this fund as "needs operator
+                # follow-up" -- see #12.
+                is_provisional=is_pseudo_domain,
                 last_updated=now,
             ))
             created_fund = True
@@ -313,6 +323,23 @@ def claim_investor(
                 # Stamp the audit trail back to the source row in
                 # the discovery pool.
                 claimed_from_global_id=int(global_id),
+                # #12: also stamp do_not_contact when we have only
+                # a pseudo-domain. Stage 7 refuses to draft cold
+                # outreach to do_not_contact partners; this stops
+                # the email going out before the operator has
+                # fixed the domain by hand.
+                do_not_contact=is_pseudo_domain,
+                do_not_contact_reason=(
+                    "claimed without a real domain "
+                    "(.unclaimed slug); edit the fund's domain "
+                    "before contacting"
+                ) if is_pseudo_domain else None,
+                do_not_contact_source=(
+                    "discovery_claim_pseudo_domain"
+                    if is_pseudo_domain else None
+                ),
+                do_not_contact_set_at=now if is_pseudo_domain else None,
+                is_provisional=is_pseudo_domain,
                 last_updated=now,
             ))
             created_partner = True
