@@ -51,37 +51,67 @@ FUND_NAME_FUZZY_THRESHOLD = 0.85
 RSS_LOOKBACK_DAYS = 365  # only attribute announcements published in last N days
 
 
-def _fetch_live_rss_announcements(feeds: list[dict]) -> list[dict]:
+def _feed_required(feed_cfg: dict) -> bool:
+    """RSS feeds are required unless explicitly marked optional."""
+    return bool(feed_cfg.get("required", True))
+
+
+def _fetch_live_rss_announcements(
+    feeds: list[dict],
+) -> tuple[list[dict], list[dict]]:
     """Pull RSS items from each feed in sources.yaml.funding_announcement_feeds.
 
-    Returns a list of {"source_url", "text"} dicts ready for LLM attribution.
-    Items older than RSS_LOOKBACK_DAYS are filtered out (per brief: 12 months).
+    Returns (announcements, failures). Announcements are {"source_url", "text"}
+    dicts ready for LLM attribution. Items older than RSS_LOOKBACK_DAYS are
+    filtered out (per brief: 12 months).
     """
     if not feeds:
-        return []
+        return [], []
     try:
         import feedparser
     except ImportError:
-        print(
-            "[stage 3] feedparser not installed; run `uv sync`. "
-            "Skipping live RSS."
-        )
-        return []
+        failures = [
+            {
+                "name": feed_cfg.get("name") or feed_cfg.get("url") or "<missing-url>",
+                "url": feed_cfg.get("url"),
+                "required": _feed_required(feed_cfg),
+                "error": "feedparser not installed; run `uv sync`",
+            }
+            for feed_cfg in feeds
+        ]
+        return [], failures
     client = HttpClient()
     cutoff = date.today().toordinal() - RSS_LOOKBACK_DAYS
     out: list[dict] = []
+    failures: list[dict] = []
     for feed_cfg in feeds:
         url = feed_cfg.get("url")
         name = feed_cfg.get("name") or url
         if not url:
+            failures.append({
+                "name": name or "<missing-url>",
+                "url": None,
+                "required": _feed_required(feed_cfg),
+                "error": "missing url",
+            })
             continue
         try:
             res = asyncio.run(client.fetch(url))
-        except Exception as exc:  # noqa: BLE001 - one bad feed shouldn't kill the run
-            print(f"[stage 3] feed {name!r} fetch failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - classified below
+            failures.append({
+                "name": name,
+                "url": url,
+                "required": _feed_required(feed_cfg),
+                "error": f"fetch failed: {exc}",
+            })
             continue
         if res.status != 200 or not res.text:
-            print(f"[stage 3] feed {name!r} returned HTTP {res.status}")
+            failures.append({
+                "name": name,
+                "url": url,
+                "required": _feed_required(feed_cfg),
+                "error": f"HTTP {res.status}",
+            })
             continue
         feed = feedparser.parse(res.text)
         for entry in getattr(feed, "entries", []):
@@ -108,7 +138,7 @@ def _fetch_live_rss_announcements(feeds: list[dict]) -> list[dict]:
             if body:
                 out.append({"source_url": link, "text": body})
         print(f"[stage 3] feed {name!r}: {len(feed.entries)} entries pulled")
-    return out
+    return out, failures
 
 
 def _now() -> datetime:
@@ -184,18 +214,21 @@ def resolve_partner_id(
     return pid if pid in known_partner_ids else None
 
 
-# Batch 32 (#742): provisional fund creation. Synthesize a fund_id from
-# the normalized name; flag is_provisional=TRUE so Stage 2 (or the
-# operator) can promote it once enriched.
-def _create_provisional_fund(engine, name: str) -> str | None:
-    from core.ids import fund_id_for
+def _provisional_domain_for_fund_name(name: str) -> str | None:
     norm = normalize_name(name).strip()
     if not norm:
         return None
-    # Use the normalized name as the synthetic domain so the existing
-    # fund_id_for() hash is stable; the row's `domain` column carries
-    # `<slug>.provisional` so the operator can distinguish stubs.
-    pseudo_domain = norm.replace(" ", "-") + ".provisional"
+    return norm.replace(" ", "-") + ".provisional"
+
+
+# Batch 32 (#742): provisional fund creation. Synthesize a fund_id from
+# the normalized name; flag is_provisional=TRUE so Stage 2 (or the
+# operator) can promote it once enriched.
+def _create_provisional_fund(engine, name: str) -> tuple[str, str] | tuple[None, None]:
+    from core.ids import fund_id_for
+    pseudo_domain = _provisional_domain_for_fund_name(name)
+    if not pseudo_domain:
+        return None, None
     fund_id = fund_id_for(pseudo_domain)
     with engine.begin() as conn:
         existing = conn.execute(
@@ -210,7 +243,7 @@ def _create_provisional_fund(engine, name: str) -> str | None:
                 is_provisional=True,
                 last_updated=_now(),
             ))
-    return fund_id
+    return fund_id, pseudo_domain
 
 
 # Batch 32 (#741): provisional partner creation. Requires a resolvable
@@ -343,7 +376,30 @@ def main() -> int:
                 (ws.fixtures_dir / "announcements.json").read_text(encoding="utf-8")
             )
         else:
-            announcements = _fetch_live_rss_announcements(feeds)
+            announcements, feed_failures = _fetch_live_rss_announcements(feeds)
+            required_feed_failures = [
+                f for f in feed_failures if f.get("required")
+            ]
+            optional_feed_failures = [
+                f for f in feed_failures if not f.get("required")
+            ]
+            for f in optional_feed_failures:
+                run.note(
+                    f"optional RSS feed failed: {f['name']!r} "
+                    f"({f.get('url') or 'no url'}): {f['error']}"
+                )
+            if required_feed_failures:
+                ctx.refuse(
+                    "FAIL: required funding announcement feed(s) failed: "
+                    + "; ".join(
+                        f"{f['name']!r} ({f.get('url') or 'no url'}): "
+                        f"{f['error']}"
+                        for f in required_feed_failures
+                    )
+                )
+                run.failed = max(run.failed, len(required_feed_failures))
+                print("[stage 3] REFUSED: required RSS feed failure(s)")
+                return ctx.exit_code
             if not announcements:
                 if feeds:
                     ctx.refuse(
@@ -506,16 +562,14 @@ def main() -> int:
                         and args.allow_provisional
                         and deal.lead_investor
                     ):
-                        lead_fund_id = _create_provisional_fund(
+                        lead_fund_id, pseudo_domain = _create_provisional_fund(
                             engine, deal.lead_investor,
                         )
                         if lead_fund_id:
                             funds_by_name[normalize_name(deal.lead_investor)] = (
                                 lead_fund_id
                             )
-                            fund_id_to_domain[lead_fund_id] = (
-                                f"{lead_fund_id}.provisional"
-                            )
+                            fund_id_to_domain[lead_fund_id] = pseudo_domain
                             run.note(
                                 f"provisional fund created for "
                                 f"{deal.lead_investor!r} (id={lead_fund_id})"
