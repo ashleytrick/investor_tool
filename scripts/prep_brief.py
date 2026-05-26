@@ -31,11 +31,107 @@ from core.db import (
     followup_drafts,
     funds,
     get_engine,
+    outcomes,
     partner_score_summaries,
     partners,
     scores,
     signals,
 )
+from core.llm.client import LLMClient
+from core.meeting_prep import framing_brief as fb
+from core.meeting_prep import objection_map as om
+from core.meeting_prep.cache import hash_signal_set
+from core.meeting_prep.drive_sync import push_if_needed
+from core.meeting_prep.evidence import load_evidence
+from core.meeting_prep.render import render_framing_brief, render_objection_map
+
+
+_AUTO_INCLUDE_STATUSES = ("replied", "meeting_booked")
+
+
+def _stub_objection_map(partner_id: str) -> dict:
+    """Stub response used when ANTHROPIC_API_KEY is unset (CI, tests,
+    smoke runs). Returns a single sector_norm objection so the path
+    exercises the renderer without requiring partner-specific
+    evidence. The schema validator accepts this shape because the
+    partner-specific gate only fires when source != sector_norm."""
+    return {
+        "partner_id": partner_id,
+        "objections": [
+            {
+                "objection": "API concentration risk",
+                "underlying_concern": (
+                    "Founder may be a thin wrapper over one provider; "
+                    "switching costs / negotiating leverage at risk."
+                ),
+                "source": "sector_norm",
+                "citing_signal_ids": [],
+                "strong_answer_hint": (
+                    "Acknowledge the dependency, then show concrete "
+                    "mitigation (multi-provider abstraction, contractual "
+                    "terms, customer-facing fallback paths)."
+                ),
+                "weak_answer_hint": (
+                    "Dismiss the risk or claim a vendor switch is "
+                    "trivial without showing the architecture."
+                ),
+                "severity": "medium",
+            },
+        ],
+        "insufficient_evidence": True,
+        "notes": "stub-mode response (no ANTHROPIC_API_KEY)",
+    }
+
+
+def _record_drive(
+    pushed: list, skipped: list, artifact_type: str, res,
+) -> None:
+    """Sort a DrivePushResult into the right footer bucket. Skipped
+    pushes ARE recorded (with reason) so the operator sees why their
+    brief didn't make it to Drive -- silent skips would invite
+    'I clicked Connect Google -- why is nothing showing up?'"""
+    if res.pushed:
+        pushed.append((artifact_type, res.doc_url or "(no url)"))
+    elif res.doc_id:
+        # Already-pushed cache hit; show the existing url so the
+        # operator can jump straight to the doc.
+        pushed.append(
+            (f"{artifact_type} (already on Drive)", res.doc_url or "(no url)")
+        )
+    else:
+        skipped.append((artifact_type, res.skipped_reason or "(unknown)"))
+
+
+def _stub_framing_brief(partner_id: str) -> dict:
+    """Stub response for the framing brief; matches the
+    insufficient_evidence shape so the schema validator passes
+    without requiring partner-specific citations."""
+    return {
+        "partner_id": partner_id,
+        "lead_with": "",
+        "amplify": [],
+        "address_unprompted": [],
+        "do_not_lead_with": [],
+        "question_to_ask_them": "",
+        "citing_signal_ids": [],
+        "insufficient_evidence": True,
+        "notes": "stub-mode response (no ANTHROPIC_API_KEY)",
+    }
+
+
+def _latest_outreach_status(engine, partner_id: str) -> str | None:
+    """Newest outcome row's outreach_status for the partner. Returns
+    None when the partner has no outcome history. The renderer uses
+    this to auto-include the LLM-driven sections only when the
+    partner has earned a real-world signal (reply / meeting), so
+    cold-pipeline runs don't burn LLM budget."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(outcomes.c.outreach_status).where(
+                outcomes.c.partner_id == partner_id,
+            ).order_by(desc(outcomes.c.outcome_id)).limit(1)
+        ).first()
+    return row.outreach_status if row else None
 
 
 def main() -> int:
@@ -44,6 +140,40 @@ def main() -> int:
     parser.add_argument("--partner-id", required=True)
     parser.add_argument("--out", default=None,
                         help="Write markdown to this path; default: stdout.")
+    parser.add_argument(
+        "--include-objections", action="store_true",
+        help=(
+            "Include the LLM-built objection map. "
+            "Auto-enabled when outreach_status IN "
+            f"{_AUTO_INCLUDE_STATUSES}; otherwise an opt-in to spend LLM "
+            "budget on cold-pipeline partners."
+        ),
+    )
+    parser.add_argument(
+        "--include-framing", action="store_true",
+        help=(
+            "Include the LLM-built framing brief. "
+            "Auto-enabled on the same statuses as --include-objections; "
+            "requires the objection map (also auto-built)."
+        ),
+    )
+    parser.add_argument(
+        "--force-rebuild", action="store_true",
+        help=(
+            "Bypass the meeting_prep_artifacts cache even when the "
+            "verified signal set is unchanged. Use after the operator "
+            "manually edits a signal's verification or quality outside "
+            "the normal Stage 5 path."
+        ),
+    )
+    parser.add_argument(
+        "--no-drive-push", action="store_true",
+        help=(
+            "Skip the auto-push to Google Drive even when the "
+            "workspace has Google connected. Useful for offline runs "
+            "or when iterating on the rendering layer."
+        ),
+    )
     args = parser.parse_args()
 
     ws = load_workspace(args.workspace)
@@ -226,6 +356,72 @@ def main() -> int:
     if followup:
         parts.append("## Follow-up template (if no reply in 4-6 business days)")
         parts.append(f"> {followup.body}")
+        parts.append("")
+
+    # --- Meeting prep extensions (Build Session 12) ---
+    # Auto-enable when the partner has earned a substantive signal;
+    # otherwise require explicit opt-in so cold-pipeline operators
+    # don't burn LLM time on partners who never replied.
+    latest_status = _latest_outreach_status(engine, pid)
+    auto_enable = latest_status in _AUTO_INCLUDE_STATUSES
+    want_objections = args.include_objections or auto_enable
+    want_framing = args.include_framing or auto_enable
+
+    drive_results: list[tuple[str, str]] = []  # (artifact_type, url)
+    drive_skipped: list[tuple[str, str]] = []  # (artifact_type, reason)
+    if want_objections or want_framing:
+        llm = LLMClient(workspace=ws)
+        ev = load_evidence(engine, pid)
+        signal_hash = (
+            hash_signal_set(ev.quality_signal_ids) if ev else ""
+        )
+        if want_objections:
+            obj_stub = _stub_objection_map(pid) if llm.stub else None
+            obj_out = om.build(
+                engine=engine, llm=llm, partner_id=pid,
+                company_cfg=ws.company, force=args.force_rebuild,
+                stub_response=obj_stub,
+            )
+            section = render_objection_map(obj_out)
+            parts.append(section)
+            if not args.no_drive_push and signal_hash:
+                res = push_if_needed(
+                    engine, ws, partner_id=pid,
+                    signal_set_hash=signal_hash,
+                    artifact_type="objection_map",
+                    markdown_text=section,
+                )
+                _record_drive(drive_results, drive_skipped, "objection_map", res)
+        if want_framing:
+            obj_stub = _stub_objection_map(pid) if llm.stub else None
+            fram_stub = _stub_framing_brief(pid) if llm.stub else None
+            fram_out = fb.build(
+                engine=engine, llm=llm, partner_id=pid,
+                company_cfg=ws.company, force=args.force_rebuild,
+                stub_response=fram_stub,
+                objection_map_stub=obj_stub,
+            )
+            section = render_framing_brief(fram_out)
+            parts.append(section)
+            if not args.no_drive_push and signal_hash:
+                res = push_if_needed(
+                    engine, ws, partner_id=pid,
+                    signal_set_hash=signal_hash,
+                    artifact_type="framing_brief",
+                    markdown_text=section,
+                )
+                _record_drive(drive_results, drive_skipped, "framing_brief", res)
+
+    # Surface the Drive outcome as a footer the operator can scan
+    # without scrolling back through the artifact bodies. Drive
+    # status changes between runs (e.g. operator just connected
+    # Google) are visible from the footer alone.
+    if drive_results or drive_skipped:
+        parts.append("## Drive sync")
+        for atype, url in drive_results:
+            parts.append(f"- {atype}: pushed -> {url}")
+        for atype, reason in drive_skipped:
+            parts.append(f"- {atype}: skipped ({reason})")
         parts.append("")
 
     output = "\n".join(parts) + "\n"

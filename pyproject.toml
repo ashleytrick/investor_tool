@@ -28,6 +28,10 @@ web = [
 # Install with: uv sync --extra api
 api = [
     "fastapi>=0.115",
+    # PDF / PPTX parsing for the deck-first onboarding step
+    # (POST /config/company/extract-from-deck). pypdf is pure Python
+    # + light; python-pptx covers .pptx (the binary .ppt format
+    # requires libreoffice and is left as a warning case).
     "pypdf>=5.0",
     "python-pptx>=1.0",
     # openpyxl is the canonical xlsx reader. Operators uploading
@@ -35,6 +39,7 @@ api = [
     # /pipeline/sources endpoint normalizes them to CSV server-side
     # before Stage 1 consumes them.
     "openpyxl>=3.1",
+    "python-multipart>=0.0.20",
     "uvicorn[standard]>=0.30",
 ]
 
@@ -42,4 +47,9 @@ api = [
 package = false
 dev-dependencies = [
     "pytest>=8.0",
+    # pytest-xdist parallelizes the smoke suite across CPU cores.
+    # On GHA's standard 2-core runner this is roughly 1.7x; locally
+    # on a 4+ core machine it's 3x+. Tests are already
+    # tmp_path-isolated so per-worker collisions don't happen.
+    "pytest-xdist>=3.6",
 ]

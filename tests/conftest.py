@@ -132,6 +132,67 @@ def workspace_db(workspace: Path) -> Path:
     return workspace / "data" / "pipeline.db"
 
 
+@pytest.fixture(scope="session")
+def _scored_workspace_source(tmp_path_factory) -> Path:
+    """Session-scoped cache of a workspace whose pipeline has been
+    run through Stage 6 already.
+
+    Building this is expensive: stages 1-6 each shell out and the
+    sum is roughly 10s per full build. Caching it once per test
+    session and copytree'ing into a per-test tmp_path lets every
+    downstream test that just needs "a scored workspace" skip the
+    build entirely.
+
+    This fixture is internal -- tests pull `scored_workspace` (the
+    per-test copy), not the cached source. The source is read-only
+    by convention; tests must not mutate it (pytest's session scope
+    + the copytree pattern enforces this in practice).
+    """
+    src = REPO_ROOT / "clients" / "test_workspace"
+    cache_root = tmp_path_factory.mktemp("scored_ws_cache")
+    dst = cache_root / "test_workspace"
+    shutil.copytree(src, dst)
+    db = dst / "data" / "pipeline.db"
+    if db.exists():
+        db.unlink()
+    run_pipeline_through_stage_6(dst)
+    return dst
+
+
+@pytest.fixture
+def scored_workspace(_scored_workspace_source: Path, tmp_path: Path) -> Path:
+    """Per-test copy of a session-cached post-stage-6 workspace.
+
+    Use this when a test needs a fully-pipelined workspace as its
+    starting state but doesn't care HOW the pipeline ran:
+
+        def test_foo(scored_workspace: Path):
+            ws = str(scored_workspace)
+            # stages 1-6 already done; partners + signals + scores
+            # are all in scored_workspace / "data" / "pipeline.db"
+
+    Replaces the older pattern:
+
+        def test_foo(workspace: Path):
+            run_pipeline_through_stage_6(workspace)
+            ...
+
+    which runs the full pipeline once PER TEST. Tests that exercise
+    stages 1-6 themselves (test_pipeline_e2e, test_stage6_scoring,
+    test_check_ready) should keep using `workspace` so they see a
+    fresh pre-pipeline starting state.
+    """
+    dst = tmp_path / "test_workspace"
+    shutil.copytree(_scored_workspace_source, dst)
+    return dst
+
+
+@pytest.fixture
+def scored_workspace_db(scored_workspace: Path) -> Path:
+    """SQLite path inside the scored-workspace fixture."""
+    return scored_workspace / "data" / "pipeline.db"
+
+
 @pytest.fixture
 def workspace_factory(tmp_path_factory):
     """Multi-workspace variant. Tests that need >1 isolated workspace
