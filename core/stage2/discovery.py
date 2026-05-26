@@ -64,6 +64,23 @@ def _canonical_host(host: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _same_site_host(target_host: str, home_host: str) -> bool:
+    """Best-effort same-site check without adding a publicsuffix dep.
+
+    Exact host matches are accepted. Subdomains are accepted in either
+    direction so links from `fund.com` to `portfolio.fund.com` and from
+    `www.fund.com` to `fund.com` stay discoverable. This intentionally does
+    not try to collapse unrelated domains like `fund.co` and `fund.com`.
+    """
+    target = _canonical_host(target_host)
+    home = _canonical_host(home_host)
+    return (
+        target == home
+        or target.endswith("." + home)
+        or home.endswith("." + target)
+    )
+
+
 def _normalize_url(url: str) -> str:
     clean, _frag = urldefrag(url)
     parsed = urlparse(clean)
@@ -81,14 +98,16 @@ def _is_internal(url: str, homepage_url: str) -> bool:
     home = urlparse(homepage_url)
     if target.scheme not in ("http", "https"):
         return False
-    return _canonical_host(target.netloc) == _canonical_host(home.netloc)
+    return _same_site_host(target.netloc, home.netloc)
 
 
 def extract_internal_links(homepage_html: str, homepage_url: str) -> list[tuple[str, str]]:
     """Return unique internal (url, anchor_text) pairs from homepage HTML.
 
     Relative links are resolved against `homepage_url`; fragments are stripped;
-    mailto/tel/javascript links and external hosts are ignored.
+    mailto/tel/javascript links and external hosts are ignored. Same-site
+    subdomains are kept because fund sites often put portfolio/blog/team pages
+    on `portfolio.fund.com`, `blog.fund.com`, or similar hosts.
     """
     tree = HTMLParser(homepage_html or "")
     seen: set[str] = set()
@@ -112,6 +131,7 @@ def score_fund_link(url: str, anchor_text: str) -> dict[str, int]:
     """Score a link for each Stage 2 enrichment category."""
     parsed = urlparse(url)
     haystack = " ".join([
+        parsed.netloc.replace("-", " ").replace(".", " ").lower(),
         parsed.path.replace("-", " ").replace("_", " ").lower(),
         (anchor_text or "").lower(),
     ])
