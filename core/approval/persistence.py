@@ -335,3 +335,67 @@ def mark_sent(
         to_state="sent", actor=actor, source="system",
         notes=notes,
     )
+
+
+def stale_live_approvals_for_partner(
+    engine: Any, *, partner_id: str, trigger: str,
+    notes: str | None = None,
+) -> int:
+    """Flip every LIVE approved draft for a partner to
+    stale_after_approval. Returns the count of drafts staled.
+
+    "Live" means approval_status=approved_to_send AND superseded_at
+    IS NULL: a superseded approved row would never have shipped (the
+    canonical read filters those out) but staling them too would be
+    a spurious event in the audit log.
+
+    Centralized so every manual mutation that invalidates a prior
+    approval (set_partner_email, set_do_not_contact, set_relationship,
+    set_employment_status, etc.) writes the same audit shape and the
+    state-machine edge is enforced uniformly.
+    """
+    with engine.begin() as conn:
+        approved = list(conn.execute(
+            select(email_drafts.c.draft_id).where(
+                email_drafts.c.partner_id == partner_id,
+                email_drafts.c.approval_status == "approved_to_send",
+                email_drafts.c.superseded_at.is_(None),
+            )
+        ))
+    for d in approved:
+        mark_stale(
+            engine, draft_id=int(d.draft_id), partner_id=partner_id,
+            trigger=trigger, notes=notes,
+        )
+    return len(approved)
+
+
+def stale_live_approvals_for_fund(
+    engine: Any, *, fund_id: str, trigger: str,
+    notes: str | None = None,
+) -> int:
+    """Flip every LIVE approved draft whose partner belongs to a given
+    fund to stale_after_approval. Returns total drafts staled across
+    the fund's partners. Used when a fund is marked inactive: every
+    pending outreach to that fund's partners must be re-approved.
+    """
+    from core.db import partners  # local import to avoid cycle at module load
+    with engine.begin() as conn:
+        approved = list(conn.execute(
+            select(
+                email_drafts.c.draft_id, email_drafts.c.partner_id,
+            ).join(
+                partners, partners.c.partner_id == email_drafts.c.partner_id,
+            ).where(
+                partners.c.fund_id == fund_id,
+                email_drafts.c.approval_status == "approved_to_send",
+                email_drafts.c.superseded_at.is_(None),
+            )
+        ))
+    for d in approved:
+        mark_stale(
+            engine, draft_id=int(d.draft_id),
+            partner_id=str(d.partner_id),
+            trigger=trigger, notes=notes,
+        )
+    return len(approved)

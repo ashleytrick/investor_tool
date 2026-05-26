@@ -44,15 +44,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
-from core.approval.persistence import mark_stale
-from core.approval.state_machine import (
-    STATE_APPROVED_TO_SEND, TRIGGER_EMAIL_CHANGED,
-)
+from core.approval.persistence import stale_live_approvals_for_partner
+from core.approval.state_machine import TRIGGER_EMAIL_CHANGED
 from core.config_loader import add_workspace_arg
 from core.csv_ingest import (
     CsvIngestSchema, ingest_csv, in_set, looks_like_email, require_field,
+    unique_field,
 )
-from core.db import email_drafts, partners
+from core.db import partners
 from core.operator_command import operator_command_run
 
 STAGE = "import_partner_emails_apollo"
@@ -100,6 +99,11 @@ def main() -> int:
             row_validators=(
                 require_field("partner_id"),
                 require_field("email"),
+                # Refuse duplicate partner_id within a single import so
+                # last-write-wins doesn't quietly overwrite the first
+                # value. The operator must de-dupe their source.
+                unique_field("partner_id",
+                             error_type="duplicate_partner_id"),
                 in_set("partner_id", known_pids, error_type="unknown_partner"),
                 looks_like_email("email"),
             ),
@@ -158,9 +162,21 @@ def main() -> int:
                     # --overwrite: write the new email AND flip
                     # approved drafts to stale_after_approval (Slice 1
                     # invalidation rule: partner email changed).
-                    _overwrite_email_and_stale_approvals(
-                        engine, pid=pid, new_email=new_email,
+                    with engine.begin() as conn:
+                        conn.execute(
+                            partners.update()
+                            .where(partners.c.partner_id == pid)
+                            .values(email=new_email, last_updated=_now())
+                        )
+                    stale_live_approvals_for_partner(
+                        engine, partner_id=pid,
+                        trigger=TRIGGER_EMAIL_CHANGED,
+                        notes=f"new email: {new_email}",
                     )
+                    # Refresh the local snapshot so a later row in the
+                    # same CSV for the same partner doesn't trip the
+                    # "no existing email" branch with a stale view.
+                    existing_email_by_pid[pid] = new_email.lower()
                     written += 1
                     print(
                         f"[apollo_import] OVERWROTE {pid}: "
@@ -175,6 +191,7 @@ def main() -> int:
                         .where(partners.c.partner_id == pid)
                         .values(email=new_email, last_updated=_now())
                     )
+                existing_email_by_pid[pid] = new_email.lower()
                 written += 1
                 print(f"[apollo_import] {pid} -> {new_email}")
 
@@ -186,35 +203,6 @@ def main() -> int:
         # wrappers notice; pure no-op runs (every row already matched)
         # exit clean. ctx.exit_code maps run.failed (>0) -> 2.
         return ctx.exit_code
-
-
-def _overwrite_email_and_stale_approvals(
-    engine, *, pid: str, new_email: str,
-) -> None:
-    """Write the new email + invalidate any approved drafts for this
-    partner. The state-machine rule: when a partner email changes
-    after approval, the recipient is no longer who was approved, so
-    the approval is stale."""
-    with engine.begin() as conn:
-        conn.execute(
-            partners.update()
-            .where(partners.c.partner_id == pid)
-            .values(email=new_email, last_updated=_now())
-        )
-        approved_drafts = list(conn.execute(
-            select(email_drafts.c.draft_id).where(
-                email_drafts.c.partner_id == pid,
-                email_drafts.c.approval_status == STATE_APPROVED_TO_SEND,
-            )
-        ))
-    for d in approved_drafts:
-        mark_stale(
-            engine,
-            draft_id=int(d.draft_id),
-            partner_id=pid,
-            trigger=TRIGGER_EMAIL_CHANGED,
-            notes=f"new email: {new_email}",
-        )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
+from core.approval.persistence import stale_live_approvals_for_fund
+from core.approval.state_machine import TRIGGER_FUND_INACTIVE
 from core.config_loader import add_workspace_arg
 from core.db import funds
 from core.operator_command import operator_command_run
@@ -70,6 +72,21 @@ def main() -> int:
         )
         print(f"[fund] {msg}")
         run.note(msg)
+        # Deactivating a fund invalidates every live approval against
+        # any partner in that fund -- the recipient still works, but
+        # the business reason for the outreach (active fund) no
+        # longer holds.
+        if not new_state and old:
+            staled = stale_live_approvals_for_fund(
+                engine, fund_id=args.fund_id,
+                trigger=TRIGGER_FUND_INACTIVE,
+                notes=args.reason,
+            )
+            if staled:
+                print(
+                    f"[fund] staled {staled} approved draft(s) across "
+                    f"{args.fund_id}'s partners (fund just deactivated)"
+                )
         run.succeeded = 1
         run.processed = 1
     return ctx.exit_code

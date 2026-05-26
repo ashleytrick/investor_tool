@@ -29,6 +29,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 
+from core.approval.persistence import stale_live_approvals_for_partner
+from core.approval.state_machine import TRIGGER_DO_NOT_CONTACT_SET
 from core.config_loader import add_workspace_arg
 from core.db import partners
 from core.operator_command import operator_command_run
@@ -108,6 +110,22 @@ def main() -> int:
         )
         print(f"[dnc] {msg}")
         run.note(msg)
+        # Setting DNC on a partner must invalidate any live approved
+        # drafts: we promised not to send cold to this person, period.
+        # Only fires on a 0->1 transition; clearing DNC is fine to
+        # leave alone (operator can re-approve manually).
+        if set_flag and not old:
+            staled = stale_live_approvals_for_partner(
+                engine,
+                partner_id=args.partner_id,
+                trigger=TRIGGER_DO_NOT_CONTACT_SET,
+                notes=args.reason or None,
+            )
+            if staled:
+                print(
+                    f"[dnc] staled {staled} approved draft(s) for "
+                    f"{args.partner_id} (DNC just set)"
+                )
         run.succeeded = 1
         run.processed = 1
     return ctx.exit_code
