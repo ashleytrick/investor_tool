@@ -219,8 +219,25 @@ def main() -> int:
                 })
 
             # Per-fund deals (for round_fit recent_relevant_deals + has_led_recently).
+            from core.attribution.status import counts_toward_scoring
             deals_by_fund: dict[str, list[dict]] = {}
+            filtered_fund_deal_evidence = 0
             for d in conn.execute(select(deal_attributions)):
+                if d.lead_fund_id is None:
+                    continue
+                if (
+                    min_deal_confidence > 0.0
+                    and d.match_confidence is not None
+                    and d.match_confidence < min_deal_confidence
+                ):
+                    filtered_fund_deal_evidence += 1
+                    continue
+                if d.match_status is not None and not counts_toward_scoring(
+                    match_status=d.match_status,
+                    match_confidence=d.match_confidence,
+                ):
+                    filtered_fund_deal_evidence += 1
+                    continue
                 tags_raw = d.sector_tags
                 try:
                     sector_tags = json.loads(tags_raw) if tags_raw else []
@@ -245,7 +262,6 @@ def main() -> int:
             # count toward lead_likelihood. Ambiguous / rejected /
             # unmatched rows are context only -- they MUST NOT pad
             # the partner's deal count.
-            from core.attribution.status import counts_toward_scoring
             partner_deals: dict[str, list[dict]] = {}
             filtered_low_confidence = 0
             filtered_unscored_status = 0
@@ -617,6 +633,14 @@ def main() -> int:
             msg = (
                 f"filtered {filtered_low_confidence} deal_attributions "
                 f"row(s) below min_deal_confidence={min_deal_confidence}"
+            )
+            print(f"[stage 6] {msg}")
+            run.note(msg)
+        if filtered_fund_deal_evidence:
+            msg = (
+                f"filtered {filtered_fund_deal_evidence} fund-level "
+                f"deal_attributions row(s) from round-fit evidence "
+                f"(low confidence or non-scoring match_status)"
             )
             print(f"[stage 6] {msg}")
             run.note(msg)

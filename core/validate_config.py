@@ -384,6 +384,12 @@ def _check_sources(sources_cfg: dict, issues: list[str]) -> None:
                     f"sources.yaml: funding_announcement_feeds[{i}].parser="
                     f"{p!r} not in {sorted(SUPPORTED_PARSERS)}"
                 )
+            req = (f or {}).get("required")
+            if req is not None and not isinstance(req, bool):
+                issues.append(
+                    f"sources.yaml: funding_announcement_feeds[{i}].required "
+                    f"must be bool (got {req!r})"
+                )
 
 
 def _check_examples(ws, issues: list[str]) -> None:
@@ -496,6 +502,14 @@ def validate_workspace_config(
 
     if ws.sources:
         _check_sources(ws.sources, issues)
+        mode = ((ws.company or {}).get("mode") or "").strip().lower()
+        public_lists = (ws.sources or {}).get("public_lists") or []
+        if mode == "production" and not public_lists:
+            issues.append(
+                "sources.yaml: production mode requires at least one "
+                "public_lists source with a fund URL/CSV/markdown input; "
+                "otherwise Stage 1 can succeed without discovering any funds"
+            )
 
     if require_examples:
         _check_examples(ws, issues)
