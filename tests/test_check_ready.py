@@ -213,10 +213,33 @@ def test_scheduling_link_reachable_flags_broken_link():
         assert "scheduling_link_reachable: BLOCKED" in res.stdout, res.stdout
 
 
-def test_gmail_oauth_check_skips_when_not_linked():
-    """When the workspace has no .gmail_credentials.json, the check
-    returns OK (not configured -- nothing to verify); operators who
-    don't push to Gmail aren't blocked."""
+def test_scheduling_link_reachable_blocks_empty_link_for_gmail():
+    """--for gmail is the last stop before draft creation, so a missing
+    scheduling CTA is a blocker there even though earlier phases skip it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        cfg_path = ws_dst / "config" / "company.yaml"
+        cfg = cfg_path.read_text(encoding="utf-8")
+        cfg = cfg.replace(
+            'preferred_scheduling_link: "https://cal.example/dana-tendril"',
+            'preferred_scheduling_link: ""',
+        )
+        cfg_path.write_text(cfg, encoding="utf-8")
+
+        res = _check(ws, "--for", "gmail")
+
+        assert res.returncode == 1
+        assert "scheduling_link_reachable: BLOCKED" in res.stdout, res.stdout
+        assert "no scheduling link configured" in res.stdout
+
+
+def test_gmail_oauth_check_blocks_when_not_linked_for_gmail():
+    """--for gmail verifies the Gmail handoff specifically, so an
+    unlinked workspace must be blocked instead of skipped."""
     with tempfile.TemporaryDirectory() as tmpdir:
         ws_src = REPO_ROOT / "clients" / "test_workspace"
         ws_dst = Path(tmpdir) / "test_workspace"
@@ -224,7 +247,8 @@ def test_gmail_oauth_check_skips_when_not_linked():
         ws = str(ws_dst)
         _run_pipeline_through_stage_6(ws_dst)
         res = _check(ws, "--for", "gmail")
-        assert "gmail_oauth: OK" in res.stdout, res.stdout
+        assert res.returncode == 1
+        assert "gmail_oauth: BLOCKED" in res.stdout, res.stdout
         assert "not linked" in res.stdout
 
 

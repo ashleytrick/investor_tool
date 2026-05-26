@@ -374,7 +374,7 @@ def _check_daily_cap_headroom(ws, engine) -> CheckResult:
     )
 
 
-def _check_scheduling_link_reachable(ws) -> CheckResult:
+def _check_scheduling_link_reachable(ws, *, phase: str) -> CheckResult:
     """Slice 15: HEAD-request the configured scheduling link with a
     short timeout. A 404 / DNS failure here = the link in every cold
     email is broken, which is the worst possible kind of silent
@@ -389,6 +389,12 @@ def _check_scheduling_link_reachable(ws) -> CheckResult:
     link = (co.get("meeting_ask") or {}).get("preferred_scheduling_link") or ""
     link = link.strip()
     if not link:
+        if phase == "gmail":
+            return CheckResult(
+                "scheduling_link_reachable", False,
+                "no scheduling link configured; Gmail draft readiness "
+                "requires an explicit CTA in company.yaml",
+            )
         return CheckResult(
             "scheduling_link_reachable", True,
             "no scheduling link configured (production_guard catches this)",
@@ -444,7 +450,7 @@ def _check_scheduling_link_reachable(ws) -> CheckResult:
     )
 
 
-def _check_gmail_oauth(ws) -> CheckResult:
+def _check_gmail_oauth(ws, *, phase: str) -> CheckResult:
     """Slice 15: confirm Gmail OAuth still works WITHOUT pushing a
     draft. Calls users.getProfile (the cheapest read in the
     gmail.compose scope). When credentials aren't set up, returns OK
@@ -457,6 +463,11 @@ def _check_gmail_oauth(ws) -> CheckResult:
         )
         client = GmailClient.from_workspace(ws)
     except GmailNotConfigured:
+        if phase == "gmail":
+            return CheckResult(
+                "gmail_oauth", False,
+                "Gmail not linked; run connect_gmail.py before pushing drafts",
+            )
         return CheckResult(
             "gmail_oauth", True,
             "Gmail not linked (skipped); run connect_gmail.py if you "
@@ -532,8 +543,8 @@ def _run_all_checks(
     ])
     if phase == "gmail":
         checks.extend([
-            _check_scheduling_link_reachable(ws),
-            _check_gmail_oauth(ws),
+            _check_scheduling_link_reachable(ws, phase=phase),
+            _check_gmail_oauth(ws, phase=phase),
         ])
     elif phase == "attio":
         checks.append(_check_attio_config(ws))
