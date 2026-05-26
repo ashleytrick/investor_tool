@@ -77,9 +77,18 @@ def main() -> int:
                 stmt = stmt.where(cond)
             rows = list(conn.execute(stmt))
 
-        verified_count = 0
-        quality2_plus = 0
-        method_counts: dict[str, int] = {}
+        if not rows:
+            ctx.refuse(
+                "FAIL: Stage 5 found 0 signal rows to verify. This usually "
+                "means Stage 4 produced no partner evidence, or every signal "
+                "was already processed and --force was omitted. Run Stage 4 "
+                "first, or pass --force if you intentionally want a full "
+                "re-verification pass."
+            )
+            print("[stage 5] REFUSED: no signals available to verify")
+            print(f"[stage 5] llm stub mode: {llm.stub}")
+            return ctx.exit_code
+
         verified_count = 0
         quality2_plus = 0
         method_counts: dict[str, int] = {}
