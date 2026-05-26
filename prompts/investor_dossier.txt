@@ -1,0 +1,120 @@
+You are producing a CONFIDENTIAL Investor Dossier for a founder preparing for a real meeting with this VC partner. This is a post-reply / post-meeting-interest artifact -- the partner has already engaged. Your job is to make the meeting itself better.
+
+Target style: confident, structured, specific, meeting-oriented, founder-useful. Include exact language the founder can use. Identify the meeting dynamic (is this a likely lead, a specialist, a syndicate participant, a strategic helper, or someone who is too early/late/not fit). If evidence is thin in a particular section, SAY SO explicitly -- do not fabricate partner-specific positions.
+
+Partner: {PARTNER_NAME} ({PARTNER_TITLE})
+Fund: {FUND_NAME}
+Fund stated thesis: {FUND_THESIS}
+Fund kill signals: {FUND_KILL_SIGNALS}
+Partner bio: {PARTNER_BIO}
+
+Company pitching this partner:
+- Name: {COMPANY_NAME}
+- One-liner: {COMPANY_ONE_LINER}
+- Problem: {COMPANY_PROBLEM}
+- Solution: {COMPANY_SOLUTION}
+- Differentiators: {COMPANY_DIFFERENTIATORS}
+- Why now: {COMPANY_WHY_NOW}
+- Traction: {COMPANY_TRACTION}
+- Round: {ROUND_AMOUNT} {ROUND_INSTRUMENT}, closing {ROUND_CLOSE_TARGET}
+- Desired investor traits: {COMPANY_DESIRED_TRAITS}
+- Excluded sectors (do NOT pitch as fitting these): {COMPANY_EXCLUDED_SECTORS}
+
+VERIFIED app signals for this partner (signal_id, source_type, date, axes_relevance, quote):
+{SIGNALS_JSON}
+
+Partner-led deals in last 18 months:
+{PARTNER_DEALS_JSON}
+
+Style sample present (use only for structure/tone guidance, do NOT copy claims): {STYLE_SAMPLE_FLAG}
+
+Hard rules:
+- Topics_to_handle items that cite a signal_id MUST point to a signal_id that appears in the verified list above. Items with no signal_ids are clearly labeled (in the renderer) as generic sector norms.
+- Same rule for anticipated_questions.
+- Lead_with_paragraph is written IN THE FOUNDER'S VOICE -- first person, plain language, no buzzwords ("game-changing", "synergy", "would love", "excited to" are banned).
+- If fewer than 2 verified, quality>=2 signals exist for the partner, set insufficient_evidence=true and:
+    - leave lead_with_paragraph empty
+    - leave topics_to_handle empty (or only include sector_norm-style entries WITHOUT citing_signal_ids)
+    - leave anticipated_questions empty
+    - populate evidence_gaps explicitly with the specific things you can't say
+- meeting_role MUST be one of: lead_investor, specialist, syndicate_participant, strategic_helper, too_early, too_late, not_fit, unknown.
+- fit_assessment.verdict MUST be one of: strong, neutral, weak, unknown.
+- Do not invent fund AUM, founding year, or LP network details. Leave those fields empty when not in the evidence.
+- Do not include the company's `excluded_sectors` in any positive framing.
+
+Return JSON shaped like this. No prose outside the JSON. No code fences.
+
+{
+  "partner_id": "{PARTNER_ID}",
+  "partner_name": "...",
+  "partner_role": "...",
+  "fund_name": "...",
+  "former_roles": ["..."],
+  "location": "...",
+  "investment_themes": ["..."],
+
+  "profile_summary": "2-4 paragraph markdown summary",
+  "meeting_role": "lead_investor|specialist|syndicate_participant|strategic_helper|too_early|too_late|not_fit|unknown",
+
+  "background": "...",
+  "operator_investor_pattern": "...",
+  "portfolio_advisory_pattern": "...",
+  "what_they_value": ["..."],
+  "how_to_show_up": ["..."],
+
+  "firm_founded": "...",
+  "firm_aum": "...",
+  "firm_stage_focus": "...",
+  "firm_check_size": "...",
+  "firm_sectors": ["..."],
+  "firm_investment_model": "...",
+  "firm_lp_network": "...",
+  "firm_recent_context": "...",
+
+  "fit_assessment": [
+    {"criterion": "stage fit", "verdict": "strong|neutral|weak|unknown", "notes": "..."},
+    {"criterion": "check size fit", "verdict": "...", "notes": "..."},
+    {"criterion": "thesis fit", "verdict": "...", "notes": "..."},
+    {"criterion": "GTM/customer fit", "verdict": "...", "notes": "..."},
+    {"criterion": "capital efficiency fit", "verdict": "...", "notes": "..."},
+    {"criterion": "sector fit", "verdict": "...", "notes": "..."},
+    {"criterion": "risks/gaps", "verdict": "weak|neutral", "notes": "..."}
+  ],
+
+  "lead_with_paragraph": "one paragraph in founder voice opening the conversation",
+  "why_thesis_match": "...",
+  "what_to_emphasize": ["..."],
+  "what_not_to_overemphasize": ["..."],
+  "founder_language": ["specific phrase 1", "specific phrase 2"],
+
+  "topics_to_handle": [
+    {
+      "topic": "...",
+      "why_they_care": "...",
+      "how_to_answer": "...",
+      "citing_signal_ids": [12, 47]
+    }
+  ],
+
+  "anticipated_questions": [
+    {
+      "question": "...",
+      "suggested_answer_direction": "...",
+      "partner_specific_basis": "why this is a likely question from THIS partner specifically",
+      "citing_signal_ids": [88]
+    }
+  ],
+
+  "next_step_ask": "...",
+  "lead_vs_syndicate_frame": "...",
+  "process_ask": "...",
+  "partner_specific_help_ask": "...",
+  "if_too_early_framing": "...",
+
+  "citing_signal_ids": [12, 47, 88],
+  "live_research_source_urls": [],
+  "style_sample_used": false,
+  "insufficient_evidence": false,
+  "evidence_gaps": [],
+  "notes": ""
+}

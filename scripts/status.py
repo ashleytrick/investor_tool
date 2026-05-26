@@ -230,6 +230,20 @@ def main() -> int:
         )
     print(f"  outcomes recorded:      {n_outcomes} "
           f"(latest sync: {_fmt_ts(latest_outcome_sync)})")
+    # Build Session 14: surface pending dossier tasks so the operator
+    # sees outstanding post-reply work alongside the cold-pipeline
+    # counts. Lazy import keeps status.py runnable even on workspaces
+    # whose schema_migrations haven't run yet.
+    try:
+        from core.meeting_prep.eligibility import count_open_tasks
+        n_pending_dossiers = count_open_tasks(engine)
+    except Exception:  # noqa: BLE001
+        n_pending_dossiers = 0
+    if n_pending_dossiers > 0:
+        print(
+            f"  investor dossiers needed:{n_pending_dossiers} "
+            f"-- run scripts/prep_brief.py --dossier --pending-only"
+        )
     print(f"  pending axis suggestions:{n_pending_suggestions}")
     if latest_learning:
         print(
