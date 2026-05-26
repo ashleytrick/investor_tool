@@ -17,8 +17,8 @@ Streamlit UI uses). The API never lets a client pick a workspace at
 runtime -- multi-tenant is a future concern.
 
 Run locally:
-    API_KEY=dev-key \\
-    INVESTOR_WORKSPACE=clients/test_workspace \\
+    API_KEY=dev-key \
+    INVESTOR_WORKSPACE=clients/test_workspace \
     uv run --extra api uvicorn web.api:app --reload --port 8080
 
 OpenAPI spec is auto-generated at /openapi.json (and used by the
@@ -123,12 +123,8 @@ class CommandResult(BaseModel):
 # ---------- onboarding wizard schemas ----------
 
 class ConfigInfo(BaseModel):
-    """Snapshot the onboarding wizard polls. `mode` is the binary
-    fixture/production view; the underlying `dry_run` value (a real
-    workspace whose external syncs are gated off) surfaces as
-    "production" since the wizard's question is "are you on fake data
-    or your own data?", not "are external syncs armed?"."""
-    mode: Literal["fixture", "production"]
+    """Snapshot the onboarding wizard polls."""
+    mode: Literal["fixture", "dry_run", "production"]
     gmail_connected: bool
     # True when company.name + company.one_liner are both non-empty,
     # i.e. the operator finished Step 1 of the wizard.
@@ -182,7 +178,7 @@ class CompanyProfile(BaseModel):
 
 
 class SetModeBody(BaseModel):
-    mode: Literal["fixture", "production"]
+    mode: Literal["fixture", "dry_run", "production"]
 
 
 class GmailStatus(BaseModel):
@@ -253,6 +249,18 @@ def _engine_and_ws():
 
 def _actor() -> str:
     return os.environ.get("API_OPERATOR", "api-client")
+
+
+def _allow_example_domains_args() -> list[str]:
+    """Expose fixture-domain bypass only when the API operator opts in.
+
+    The CLI flag is useful for local/fixture demos, but the hosted API should
+    not silently weaken production guards for browser clients.
+    """
+    raw = os.environ.get("API_ALLOW_EXAMPLE_DOMAINS", "")
+    if raw.lower() in {"1", "true", "yes", "on"}:
+        return ["--allow-example-domains"]
+    return []
 
 
 def _run_cli(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -370,7 +378,10 @@ def get_pending(_auth: None = Depends(require_auth)) -> list[DraftView]:
     out: list[DraftView] = []
     for d in drafts:
         gate = can_approve_draft(
-            ws, engine, int(d.draft_id), allow_example_domains=True,
+            ws,
+            engine,
+            int(d.draft_id),
+            allow_example_domains=bool(_allow_example_domains_args()),
         )
         out.append(_serialize_draft(
             d,
@@ -420,8 +431,8 @@ def approve_draft(
         "approve_draft.py", "--workspace", _ws_path(),
         "--draft-id", str(draft_id),
         "--notes", body.notes,
-        "--allow-example-domains",
     ]
+    cli.extend(_allow_example_domains_args())
     if body.override_blockers:
         cli.append("--override-blockers")
     res = _run_cli(*cli)
@@ -509,7 +520,7 @@ def check_ready(
 ) -> CheckReadyResult:
     res = _run_cli(
         "check_ready.py", "--workspace", _ws_path(),
-        "--for", phase, "--allow-example-domains",
+        "--for", phase, *_allow_example_domains_args(),
     )
     return CheckReadyResult(
         phase=phase,
@@ -570,7 +581,7 @@ def send_queue_csv(_auth: None = Depends(require_auth)) -> FileResponse:
     approved drafts; stale approvals not skipped)."""
     res = _run_cli(
         "export_send_queue.py", "--workspace", _ws_path(),
-        "--allow-example-domains",
+        *_allow_example_domains_args(),
     )
     if res.returncode != 0:
         raise HTTPException(
@@ -846,19 +857,22 @@ def _write_company_block(
 
 
 def _read_mode_from_yaml(yaml_path: pathlib.Path) -> str:
-    """Wizard-facing mode value. The on-disk vocabulary is
-    {fixture, dry_run, production} (see core/config_loader.py); the
-    wizard only cares about fixture vs not-fixture, so dry_run maps to
-    production here."""
+    """Wizard-facing mode value.
+
+    Preserve the full on-disk vocabulary {fixture, dry_run, production}; the
+    browser UI needs dry_run as a real safe pilot state.
+    """
     if not yaml_path.exists():
         raise HTTPException(500, f"company.yaml missing at {yaml_path}")
     text = yaml_path.read_text(encoding="utf-8")
     m = _MODE_LINE.search(text)
     if not m:
-        # config_loader defaults absence to dry_run; surface as production.
-        return "production"
+        # config_loader defaults absence to dry_run.
+        return "dry_run"
     value = m.group(2).strip().strip("\"'")
-    return "fixture" if value == "fixture" else "production"
+    if value in {"fixture", "dry_run", "production"}:
+        return value
+    return "dry_run"
 
 
 def _write_mode_to_yaml(yaml_path: pathlib.Path, new_mode: str) -> None:
@@ -920,7 +934,7 @@ def get_config(_auth: None = Depends(require_auth)) -> ConfigInfo:
 @app.post(
     "/config/mode",
     response_model=CommandResult,
-    summary="Flip company.yaml `mode:` (fixture <-> production)",
+    summary="Flip company.yaml `mode:` (fixture | dry_run | production)",
     tags=["onboarding"],
 )
 def set_mode(
@@ -1040,14 +1054,12 @@ def pipeline_score(_auth: None = Depends(require_auth)) -> CommandResult:
 )
 def pipeline_generate(_auth: None = Depends(require_auth)) -> CommandResult:
     # Cap at TOP_BEFORE_CALIBRATION_REQUIRED (=10 in scripts/07) so the
-    # wizard's run never trips Gate 5.5's calibration refusal. Real
-    # operators scale higher via the CLI after the calibration cohort
-    # comes back Green. --allow-example-domains is a no-op for real
-    # workspaces and lets the fixture path through.
+    # wizard's run never trips Gate 5.5's calibration refusal. Fixture
+    # domains are allowed only when API_ALLOW_EXAMPLE_DOMAINS is set.
     return _shell_pipeline_stage(
         "07_generate_emails.py",
         "--top", "10",
-        "--allow-example-domains",
+        *_allow_example_domains_args(),
         label="generate_emails",
     )
 
