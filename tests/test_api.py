@@ -1061,3 +1061,199 @@ def test_sources_upload_xlsx_rejects_corrupt_workbook(
     assert res.status_code == 400
     detail = res.json()["detail"]
     assert "xlsx" in detail["error"].lower()
+
+
+# ---------- Phase 1 Supabase JWT auth -------------------------------------
+
+_JWT_SECRET = "test-supabase-jwt-secret-do-not-use-anywhere-real"
+
+
+def _make_jwt(
+    *, sub: str = "11111111-1111-1111-1111-111111111111",
+    secret: str = _JWT_SECRET, audience: str = "authenticated",
+    ttl_seconds: int = 300, extra: dict | None = None,
+) -> str:
+    """Mint an HS256 JWT shaped like a Supabase user token. Default
+    audience matches what `_verify_supabase_jwt` requires; tests pass
+    `audience=...` to exercise the rejection path."""
+    import time
+    import jwt
+    payload = {
+        "sub": sub,
+        "aud": audience,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + ttl_seconds,
+        "role": "authenticated",
+    }
+    if extra:
+        payload.update(extra)
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+
+@pytest.fixture
+def jwt_client(
+    workspace_with_one_pending_draft: Path, monkeypatch,
+) -> TestClient:
+    """TestClient with SUPABASE_JWT_SECRET set so the JWT path is
+    active. Fallback default-off so we can prove the JWT gate
+    actually rejects non-JWT tokens unless explicitly allowed."""
+    monkeypatch.setenv("API_KEY", "legacy-api-key")
+    monkeypatch.setenv(
+        "INVESTOR_WORKSPACE", str(workspace_with_one_pending_draft),
+    )
+    monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com")
+    monkeypatch.setenv("API_ALLOW_EXAMPLE_DOMAINS", "true")
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", _JWT_SECRET)
+    # Default off; individual tests opt in via monkeypatch.setenv.
+    monkeypatch.delenv("AUTH_ALLOW_API_KEY_FALLBACK", raising=False)
+    import importlib
+    import web.api as api_mod
+    import web.deps as deps_mod
+    importlib.reload(deps_mod)
+    importlib.reload(api_mod)
+    return TestClient(api_mod.app)
+
+
+def test_jwt_valid_token_authenticates(jwt_client: TestClient) -> None:
+    """Happy path: a JWT signed with the configured secret +
+    `aud: authenticated` is accepted on a normally-authed endpoint."""
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": f"Bearer {_make_jwt()}"},
+    )
+    assert res.status_code == 200, res.text
+
+
+def test_jwt_wrong_secret_rejected(jwt_client: TestClient) -> None:
+    """A JWT signed with a different secret must NOT authenticate
+    -- otherwise anyone with a Supabase project can issue tokens
+    for our backend."""
+    bad = _make_jwt(secret="some-other-secret")
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": f"Bearer {bad}"},
+    )
+    assert res.status_code == 401
+    assert "invalid token" in res.text.lower()
+
+
+def test_jwt_expired_rejected(jwt_client: TestClient) -> None:
+    """Expired tokens are refused (PyJWT default validates `exp`)."""
+    expired = _make_jwt(ttl_seconds=-60)
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": f"Bearer {expired}"},
+    )
+    assert res.status_code == 401
+
+
+def test_jwt_wrong_audience_rejected(jwt_client: TestClient) -> None:
+    """Non-authenticated audience (e.g. an anon token from a
+    different aud claim) is refused so the gate stays narrow."""
+    weird_aud = _make_jwt(audience="some-other-audience")
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": f"Bearer {weird_aud}"},
+    )
+    assert res.status_code == 401
+
+
+def test_jwt_missing_sub_rejected(jwt_client: TestClient) -> None:
+    """A token with no `sub` claim has no user_id to scope on.
+    PyJWT raises via `options={"require": ["sub", "exp"]}`."""
+    import time
+    import jwt as pyjwt
+    no_sub = pyjwt.encode(
+        {"aud": "authenticated", "exp": int(time.time()) + 60},
+        _JWT_SECRET, algorithm="HS256",
+    )
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": f"Bearer {no_sub}"},
+    )
+    assert res.status_code == 401
+
+
+def test_legacy_api_key_rejected_when_fallback_off(
+    jwt_client: TestClient,
+) -> None:
+    """SUPABASE_JWT_SECRET set + fallback OFF -> the legacy shared
+    key is refused. This is the post-cutover steady state the
+    operator flips into once the frontend stops sending the key."""
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": "Bearer legacy-api-key"},
+    )
+    assert res.status_code == 401
+
+
+def test_legacy_api_key_accepted_when_fallback_on(
+    jwt_client: TestClient, monkeypatch,
+) -> None:
+    """Cutover window: both JWTs AND the legacy key work while
+    AUTH_ALLOW_API_KEY_FALLBACK=true. The frontend can ship JWT
+    support without breaking already-running clients."""
+    monkeypatch.setenv("AUTH_ALLOW_API_KEY_FALLBACK", "true")
+    res = jwt_client.get(
+        "/review/pending",
+        headers={"Authorization": "Bearer legacy-api-key"},
+    )
+    assert res.status_code == 200, res.text
+
+
+def test_legacy_api_key_still_works_when_jwt_secret_unset(
+    client: TestClient,
+) -> None:
+    """Backwards-compat guarantee: a deployment that hasn't yet
+    set SUPABASE_JWT_SECRET keeps working unchanged on the
+    shared key. This test uses the original `client` fixture
+    (no SUPABASE_JWT_SECRET in env)."""
+    res = client.get("/review/pending", headers=_auth_headers())
+    assert res.status_code == 200
+
+
+def test_current_user_id_resolves_from_jwt_sub(
+    jwt_client: TestClient,
+) -> None:
+    """Phase 2 prep: when the JWT path authenticates, the new
+    `current_user_id` dependency returns the `sub` claim verbatim.
+    Tests it via the dependency directly since no endpoint
+    consumes it yet."""
+    from fastapi import Request
+    import web.deps as deps
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    token = _make_jwt(sub=target_uuid)
+    # Call the dependency function directly with a synthesized
+    # Authorization header value -- this is the same signature
+    # FastAPI uses when resolving the dependency.
+    uid = deps.current_user_id(authorization=f"Bearer {token}")
+    assert uid == target_uuid
+
+
+def test_current_user_id_resolves_from_env_on_api_key_path(
+    monkeypatch,
+) -> None:
+    """When the legacy key authenticates, the user_id can be
+    overridden via API_KEY_FALLBACK_USER_ID -- typically pointed
+    at the operator's admin uuid so Phase 2 scoping tags pre-cutover
+    traffic to their tenant consistently."""
+    monkeypatch.setenv(
+        "API_KEY_FALLBACK_USER_ID",
+        "33333333-3333-3333-3333-333333333333",
+    )
+    monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
+    import importlib
+    import web.deps as deps
+    importlib.reload(deps)
+    # Any opaque token; the func doesn't validate, just looks up
+    # the env override.
+    uid = deps.current_user_id(authorization="Bearer some-legacy-key")
+    assert uid == "33333333-3333-3333-3333-333333333333"
+
+
+def test_current_user_id_is_none_when_no_auth() -> None:
+    """No Authorization header at all -> None. The dependency does
+    not raise -- it's informational. `require_auth` is the gate."""
+    import web.deps as deps
+    assert deps.current_user_id(authorization=None) is None
+    assert deps.current_user_id(authorization="Basic foo") is None
