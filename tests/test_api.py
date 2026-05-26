@@ -344,8 +344,125 @@ def test_openapi_spec_lists_all_8_documented_endpoints(client: TestClient) -> No
         "/check_ready",
         "/runs",
         "/send_queue.csv",
+        # Onboarding wizard endpoints (Lovable's required surface).
+        "/config",
+        "/config/mode",
+        "/pipeline/score",
+        "/pipeline/generate",
+        "/gmail/status",
+        "/gmail/connect",
     ):
         assert required in paths, (
             f"OpenAPI spec dropped {required}; "
             f"frontend regen will lose the endpoint"
         )
+
+
+# ---------- onboarding: config endpoints ----------
+
+def test_get_config_returns_fixture_and_gmail_unlinked(client: TestClient) -> None:
+    res = client.get("/config", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # Fixture workspace ships with `mode: fixture`.
+    assert body["mode"] == "fixture"
+    # No .gmail_token.json on disk -> gmail_connected is false.
+    assert body["gmail_connected"] is False
+
+
+def test_set_config_mode_flips_yaml_and_preserves_comments(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """The wizard's "switch out of fixture" button. Assert the
+    flip wrote to company.yaml AND that the comment header above
+    it survived (regex replace, not pyyaml normalize)."""
+    company_yaml = (
+        workspace_with_one_pending_draft / "config" / "company.yaml"
+    )
+    before = company_yaml.read_text(encoding="utf-8")
+    assert "# Batch 30" in before, "fixture header sanity check"
+
+    res = client.post(
+        "/config/mode",
+        headers=_auth_headers(),
+        json={"mode": "dry_run"},
+    )
+    assert res.status_code == 200, res.text
+    after = company_yaml.read_text(encoding="utf-8")
+    assert "mode: dry_run" in after
+    assert "mode: fixture" not in after
+    assert "# Batch 30" in after, "regex replace clobbered the YAML comment"
+
+    # /config now reflects the flip.
+    config = client.get("/config", headers=_auth_headers()).json()
+    assert config["mode"] == "dry_run"
+
+
+def test_set_config_mode_rejects_unknown_value(client: TestClient) -> None:
+    res = client.post(
+        "/config/mode",
+        headers=_auth_headers(),
+        json={"mode": "junk"},
+    )
+    assert res.status_code == 422  # pydantic pattern enforcement
+
+
+# ---------- onboarding: gmail status ----------
+
+def test_gmail_status_false_when_token_missing(client: TestClient) -> None:
+    res = client.get("/gmail/status", headers=_auth_headers())
+    assert res.status_code == 200
+    assert res.json() == {"connected": False}
+
+
+def test_gmail_connect_412_when_credentials_missing(client: TestClient) -> None:
+    """Without an uploaded GCP OAuth client JSON, /gmail/connect
+    can't start the flow. Return 412 + an operator-actionable
+    'next_step' message the frontend renders as a banner."""
+    res = client.post("/gmail/connect", headers=_auth_headers())
+    assert res.status_code == 412, res.text
+    detail = res.json()["detail"]
+    assert detail["error"] == "gmail_credentials_missing"
+    assert "Web-type OAuth client" in detail["next_step"]
+
+
+# ---------- onboarding: pipeline shells ----------
+
+def test_pipeline_score_runs_stage_6_through_cli(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """Already-ran-stage-6 workspace re-runs Stage 6 cleanly.
+    Mostly proves the shell-out plumbing + 600s timeout works."""
+    res = client.post("/pipeline/score", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert "stage 6" in body["stdout"].lower() or "score" in body["stdout"].lower()
+
+
+def test_pipeline_generate_runs_stage_7_through_cli(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """Idempotent stage-7 re-run is a no-op (PR A fix); the endpoint
+    still returns ok=True with the stage's stdout."""
+    res = client.post(
+        "/pipeline/generate?top=3", headers=_auth_headers(),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert "stage 7" in body["stdout"].lower() or "generate" in body["stdout"].lower()
+
+
+# ---------- gmail oauth helper unit tests ----------
+
+def test_token_valid_helper_false_on_missing_path(tmp_path: Path) -> None:
+    from core.gmail_oauth import token_valid
+    assert token_valid(tmp_path / "nope.json") is False
+
+
+def test_token_valid_helper_false_on_garbage_file(tmp_path: Path) -> None:
+    from core.gmail_oauth import token_valid
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json at all", encoding="utf-8")
+    assert token_valid(bad) is False

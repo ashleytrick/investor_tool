@@ -30,13 +30,14 @@ from __future__ import annotations
 import hmac
 import os
 import pathlib
+import re
 import subprocess
 import sys
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Query
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
@@ -58,6 +59,11 @@ from core.db import (  # noqa: E402
     get_engine,
     partners,
     runs,
+)
+from core.gmail_oauth import (  # noqa: E402
+    complete_flow as gmail_complete_flow,
+    start_flow as gmail_start_flow,
+    token_valid as gmail_token_valid,
 )
 
 
@@ -123,6 +129,24 @@ class RunRow(BaseModel):
     failed: int | None
     skipped: int | None
     error_summary: str | None
+
+
+class ConfigInfo(BaseModel):
+    mode: str = Field(description="fixture | dry_run | production")
+    gmail_connected: bool
+
+
+class SetModeBody(BaseModel):
+    mode: str = Field(pattern="^(fixture|dry_run|production)$")
+
+
+class GmailStatus(BaseModel):
+    connected: bool
+
+
+class GmailConnectStart(BaseModel):
+    auth_url: str
+    state: str
 
 
 # ---------- helpers ----------
@@ -511,4 +535,260 @@ def send_queue_csv(_auth: None = Depends(require_auth)) -> FileResponse:
         path=str(csv_path),
         media_type="text/csv",
         filename="send_queue.csv",
+    )
+
+
+# ---------- onboarding: config / pipeline / gmail OAuth ----------
+#
+# These power the Lovable frontend's onboarding wizard. The shape
+# is: read the workspace's current state, let the operator flip
+# mode out of fixture, kick off Stage 6 / 7, then connect Gmail
+# via a web OAuth flow that bounces off Google and back into
+# /gmail/callback.
+
+_MODE_LINE_RE = re.compile(r"^mode:\s*\S+\s*$", re.MULTILINE)
+
+
+def _read_mode(company_yaml_path: pathlib.Path) -> str:
+    """Read the top-level `mode:` value from company.yaml. Returns
+    'production' as the safe default when the line is missing -- a
+    workspace without an explicit mode shouldn't claim to be a
+    sandbox."""
+    if not company_yaml_path.exists():
+        return "production"
+    text = company_yaml_path.read_text(encoding="utf-8")
+    match = _MODE_LINE_RE.search(text)
+    if not match:
+        return "production"
+    return match.group().split(":", 1)[1].strip()
+
+
+def _set_mode(company_yaml_path: pathlib.Path, mode: str) -> None:
+    """Write the requested mode into company.yaml in place. We use
+    a regex replace so YAML comments + ordering + indentation
+    survive untouched (round-tripping with PyYAML would normalize
+    the file and lose the inline comments the file relies on for
+    operator context). If no `mode:` line exists, prepend one."""
+    text = (
+        company_yaml_path.read_text(encoding="utf-8")
+        if company_yaml_path.exists() else ""
+    )
+    new_line = f"mode: {mode}"
+    if _MODE_LINE_RE.search(text):
+        text = _MODE_LINE_RE.sub(new_line, text, count=1)
+    else:
+        # Prepend (cheap; preserves operator comments below).
+        text = new_line + "\n\n" + text
+    company_yaml_path.write_text(text, encoding="utf-8")
+
+
+def _gmail_paths():
+    """Resolve workspace-relative paths for the gmail credentials +
+    token files. Single source of truth so the API + the CLI both
+    look in the same place."""
+    _, ws = _engine_and_ws()
+    return (
+        pathlib.Path(ws.path) / ".gmail_credentials.json",
+        pathlib.Path(ws.path) / ".gmail_token.json",
+    )
+
+
+@app.get(
+    "/config",
+    response_model=ConfigInfo,
+    summary="Current workspace mode + gmail link status",
+    tags=["onboarding"],
+)
+def get_config(_auth: None = Depends(require_auth)) -> ConfigInfo:
+    _, ws = _engine_and_ws()
+    company_yaml = pathlib.Path(ws.path) / "config" / "company.yaml"
+    _, token_path = _gmail_paths()
+    return ConfigInfo(
+        mode=_read_mode(company_yaml),
+        gmail_connected=gmail_token_valid(token_path),
+    )
+
+
+@app.post(
+    "/config/mode",
+    response_model=CommandResult,
+    summary="Flip workspace mode (fixture | dry_run | production)",
+    tags=["onboarding"],
+)
+def set_config_mode(
+    body: SetModeBody, _auth: None = Depends(require_auth),
+) -> CommandResult:
+    _, ws = _engine_and_ws()
+    company_yaml = pathlib.Path(ws.path) / "config" / "company.yaml"
+    try:
+        _set_mode(company_yaml, body.mode)
+    except OSError as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "could not write company.yaml",
+                "stdout": "",
+                "stderr": str(exc),
+            },
+        )
+    return CommandResult(
+        ok=True,
+        stdout=f"mode set to {body.mode!r} in {company_yaml.name}",
+    )
+
+
+@app.post(
+    "/pipeline/score",
+    response_model=CommandResult,
+    summary="Run Stage 6 (score candidates) for the active workspace",
+    tags=["onboarding"],
+)
+def pipeline_score(_auth: None = Depends(require_auth)) -> CommandResult:
+    res = _run_cli(
+        "06_score_candidates.py", "--workspace", _ws_path(),
+        timeout=600,
+    )
+    if res.returncode != 0:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "stage 6 (score) failed",
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+            },
+        )
+    return CommandResult(ok=True, stdout=res.stdout, stderr=res.stderr)
+
+
+@app.post(
+    "/pipeline/generate",
+    response_model=CommandResult,
+    summary="Run Stage 7 (generate emails) for the active workspace",
+    tags=["onboarding"],
+)
+def pipeline_generate(
+    top: int = Query(25, ge=1, le=100),
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    res = _run_cli(
+        "07_generate_emails.py", "--workspace", _ws_path(),
+        "--top", str(top), "--allow-example-domains",
+        timeout=900,
+    )
+    if res.returncode != 0:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "stage 7 (generate) failed",
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+            },
+        )
+    return CommandResult(ok=True, stdout=res.stdout, stderr=res.stderr)
+
+
+@app.get(
+    "/gmail/status",
+    response_model=GmailStatus,
+    summary="Is Gmail linked for the active workspace?",
+    tags=["onboarding"],
+)
+def gmail_status(_auth: None = Depends(require_auth)) -> GmailStatus:
+    _, token_path = _gmail_paths()
+    return GmailStatus(connected=gmail_token_valid(token_path))
+
+
+@app.post(
+    "/gmail/connect",
+    response_model=GmailConnectStart,
+    summary="Begin Gmail OAuth web flow",
+    description=(
+        "Starts the Google OAuth web flow and returns the URL the "
+        "browser should redirect to. After the user consents, "
+        "Google redirects back to `/gmail/callback?code=...&state=...` "
+        "which writes the token to the workspace. The frontend can "
+        "poll `/gmail/status` to detect completion."
+    ),
+    tags=["onboarding"],
+)
+def gmail_connect(
+    request: Request, _auth: None = Depends(require_auth),
+) -> GmailConnectStart:
+    creds_path, token_path = _gmail_paths()
+    # Redirect URI must EXACTLY match what's registered on the
+    # Google Cloud Console OAuth client. We derive it from the
+    # incoming request so localhost dev + Fly prod both work
+    # without a manual env-var flip.
+    redirect_uri = (
+        os.environ.get("GMAIL_OAUTH_REDIRECT_URI")
+        or str(request.url_for("gmail_callback"))
+    )
+    try:
+        auth_url, state = gmail_start_flow(
+            credentials_path=creds_path,
+            token_path=token_path,
+            redirect_uri=redirect_uri,
+        )
+    except FileNotFoundError as exc:
+        # The workspace has no OAuth client JSON yet -- the
+        # operator hasn't uploaded their Google Cloud Console
+        # credentials. Return a clear instruction.
+        raise HTTPException(
+            412,
+            detail={
+                "error": "gmail_credentials_missing",
+                "message": str(exc),
+                "next_step": (
+                    "Create a Web-type OAuth client in Google Cloud "
+                    "Console with the deployed callback URL as an "
+                    "Authorized redirect URI, download the JSON, and "
+                    "upload it to the workspace's "
+                    ".gmail_credentials.json (see docs/GMAIL_OAUTH.md)."
+                ),
+            },
+        )
+    return GmailConnectStart(auth_url=auth_url, state=state)
+
+
+@app.get(
+    "/gmail/callback",
+    summary="Google OAuth callback (browser-only)",
+    include_in_schema=False,  # internal flow, not for frontend code
+    name="gmail_callback",
+)
+def gmail_callback(
+    code: str = Query(...),
+    state: str = Query(...),
+):
+    """Google redirects the user's browser here after consent. We
+    finish the token exchange + store creds, then redirect back to
+    the frontend so the wizard can continue. We bypass the API-key
+    auth on THIS endpoint because Google's redirect is a plain
+    browser GET with no header injection -- the `state` token is the
+    CSRF defense."""
+    try:
+        profile = gmail_complete_flow(code=code, state=state)
+    except KeyError as exc:
+        raise HTTPException(400, detail={"error": "state_expired", "message": str(exc)})
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": "exchange_failed", "message": str(exc)})
+    # Bounce back to the frontend's "Gmail connected" route. The
+    # frontend origin is the first entry of CORS_ORIGINS by
+    # convention (or a dedicated GMAIL_OAUTH_RETURN_URL override).
+    return_url = (
+        os.environ.get("GMAIL_OAUTH_RETURN_URL")
+        or (
+            (os.environ.get("CORS_ORIGINS") or "")
+            .split(",")[0]
+            .strip()
+            or "/"
+        )
+    )
+    sep = "&" if "?" in return_url else "?"
+    return RedirectResponse(
+        url=(
+            f"{return_url}{sep}gmail_connected=1"
+            f"&email={profile.get('emailAddress', '')}"
+        ),
+        status_code=302,
     )
