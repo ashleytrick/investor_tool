@@ -692,12 +692,19 @@ def get_today(
 
         # Review item #14: filter snoozed drafts out of the read
         # path too -- if the operator snoozes a draft AFTER today's
-        # picks were materialized, refreshing Today should drop it
-        # rather than confusingly show the row they just snoozed.
+        # picks were materialized, refreshing Today should drop it.
         #
-        # SQLite stores DateTime tz-naive even when the python
-        # value was tz-aware, so compare against a naive UTC now
-        # to keep the SQL string-comparison honest.
+        # Post-#1-fixup: both branches now apply the snooze filter,
+        # so the "operator snoozed every materialized row" case
+        # correctly falls through to materialize fresh non-snoozed
+        # candidates from the reviewable queue. Pre-fixup we'd
+        # either show the snoozed row (old) or strand the queue
+        # empty for the day (post-PR #85).
+        #
+        # Convention: snoozed_until is stored tz-naive UTC end-to-
+        # end (see _parse_future_iso post-#4-fixup). Compare
+        # against naive UTC `now` so the SQL stays honest on both
+        # SQLite + a future Postgres migration.
         now_dt = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         active_snooze_ids = {
             row.draft_id for row in conn.execute(
@@ -706,21 +713,19 @@ def get_today(
             )
         }
 
-        # 1) Existing picks for today -- return as-is (minus snoozes).
-        # Branch on whether any today_picks row exists (regardless
-        # of snooze) so a workspace whose entire materialized batch
-        # is snoozed doesn't re-trigger materialization (which
-        # would re-create the same rows the snooze just filtered).
-        raw_existing = list(conn.execute(
-            select(today_picks)
-            .where(today_picks.c.pick_date == today_iso)
-            .order_by(today_picks.c.rank)
-        ))
+        # 1) Existing picks for today, with snoozes filtered out.
+        # Branch on whether the FILTERED set has any rows -- if
+        # the operator snoozed every persisted pick, we want to
+        # fall through to materialize fresh non-snoozed candidates.
         existing = [
-            r for r in raw_existing
+            r for r in conn.execute(
+                select(today_picks)
+                .where(today_picks.c.pick_date == today_iso)
+                .order_by(today_picks.c.rank)
+            )
             if r.draft_id not in active_snooze_ids
         ]
-        if raw_existing:
+        if existing:
             picks_rows = existing[:effective_limit]
         else:
             # 2) Materialize today's picks from the reviewable queue
@@ -791,11 +796,18 @@ def get_today(
                         "created_at": now,
                     },
                 )
-            picks_rows = list(conn.execute(
-                select(today_picks)
-                .where(today_picks.c.pick_date == today_iso)
-                .order_by(today_picks.c.rank)
-            ))
+            # Re-read but apply the snooze filter so stale
+            # snoozed rows from a prior materialization don't
+            # leak back when we fall through to this branch
+            # because the operator snoozed every prior pick.
+            picks_rows = [
+                r for r in conn.execute(
+                    select(today_picks)
+                    .where(today_picks.c.pick_date == today_iso)
+                    .order_by(today_picks.c.rank)
+                )
+                if r.draft_id not in active_snooze_ids
+            ][:effective_limit]
 
         if not picks_rows:
             return []
@@ -1063,7 +1075,15 @@ def get_snooze(
 
 def _parse_future_iso(value: str) -> "object":
     """Parse an ISO datetime and require it's in the future.
-    Returns a tz-aware datetime in UTC."""
+
+    Returns a tz-NAIVE UTC datetime. SQLAlchemy's DateTime column on
+    SQLite strips tzinfo at bind time anyway, so storing tz-aware
+    here was a foot-gun: the read-side filter in `/today` was
+    comparing tz-naive `now()` against the stored value and only
+    worked because SQLite happened to ignore the offset. Keeping
+    the convention tz-naive UTC end-to-end means write + read
+    agree explicitly. Post-#4 review.
+    """
     import datetime as _dt
     try:
         dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -1072,14 +1092,20 @@ def _parse_future_iso(value: str) -> "object":
             422, f"snoozed_until must be ISO 8601: {exc}",
         )
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_dt.timezone.utc)
+        # Bare ISO with no timezone -- assume UTC. (Frontend usually
+        # sends with Z; this branch covers operator-supplied bare
+        # ISO timestamps for testing.)
+        utc_aware = dt.replace(tzinfo=_dt.timezone.utc)
     else:
-        dt = dt.astimezone(_dt.timezone.utc)
-    if dt <= _dt.datetime.now(_dt.timezone.utc):
+        utc_aware = dt.astimezone(_dt.timezone.utc)
+    if utc_aware <= _dt.datetime.now(_dt.timezone.utc):
         raise HTTPException(
             422, "snoozed_until must be in the future",
         )
-    return dt
+    # Strip the tzinfo before returning so writers + readers both
+    # use naive UTC. The `> now()` future-check above was done
+    # tz-aware so the comparison is correct.
+    return utc_aware.replace(tzinfo=None)
 
 
 @app.post(
