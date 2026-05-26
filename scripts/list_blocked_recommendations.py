@@ -41,7 +41,13 @@ BLOCKER_PATTERNS = (
     ("employment_status=", "employment not current"),
     ("major kill signal", "major kill signal present"),
     ("cold_reachability_score", "cold_reachability below 5.0"),
-    ("warm_path_available=TRUE", "warm path available (prefer warm route)"),
+    # PR #10 / Slice 13 removed warm-path from the recommendation
+    # gate ("no warm intros, ever"). Legacy reasoning strings on
+    # pre-Slice-13 rows may still mention warm_path_available; show
+    # them in their own bucket so the operator knows that bucket is
+    # historical and not active gate behavior.
+    ("warm_path_available=TRUE",
+     "warm_path_available=TRUE (LEGACY -- pre-Slice-13 gate, no longer blocks)"),
 )
 
 

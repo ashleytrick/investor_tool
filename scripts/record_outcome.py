@@ -38,6 +38,10 @@ from core.operator_command import operator_command_run
 STAGE = "record_outcome"
 
 STATUS_VALUES = {
+    # "warm_path_needed" was a Stage 7 route until Slice 1 (cold-
+    # outreach approval workflow) removed warm-path routing. Kept in
+    # the allowed set so legacy CSV imports still parse; not produced
+    # by any current code path.
     "draft", "ready_to_send", "sent", "replied",
     "meeting_booked", "dead", "warm_path_needed",
 }

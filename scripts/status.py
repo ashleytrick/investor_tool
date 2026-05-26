@@ -72,7 +72,10 @@ def main() -> int:
                 partners.c.employment_status.in_(("likely_current", "verified_current"))
             )
         ).scalar()
-        n_warm = conn.execute(
+        # Legacy warm-path count -- kept as inert audit info only.
+        # "No warm intros, ever" is the product line; nothing in
+        # scoring / routing / approval / send consults this column.
+        n_warm_legacy = conn.execute(
             select(func.count()).select_from(partners).where(
                 partners.c.warm_path_available.is_(True)
             )
@@ -207,7 +210,8 @@ def main() -> int:
     print("== Pipeline counts ==")
     print(f"  funds:                  {n_funds} (active: {n_active_funds})")
     print(f"  partners:               {n_partners} "
-          f"(employment current/likely: {n_partners_likely}, warm path: {n_warm})")
+          f"(employment current/likely: {n_partners_likely}, "
+          f"warm_path_available legacy flag: {n_warm_legacy})")
     print(f"  signals:                {n_signals} "
           f"(verified: {n_verified}, quality>=2: {n_q2}, quality>=3: {n_q3})")
     print(f"  deal_attributions:      {n_deals}")
@@ -279,7 +283,6 @@ def main() -> int:
         # from the file itself + the most recent generation timestamp.
         ready_count = 0
         draft_count = 0
-        warm_count = 0
         total_rows = 0
         with csv_path.open(encoding="utf-8") as fh:
             import csv as _csv
@@ -288,14 +291,17 @@ def main() -> int:
                 st = r.get("outreach_status") or ""
                 if st == "ready_to_send":
                     ready_count += 1
-                elif st == "warm_path_needed":
-                    warm_count += 1
                 else:
+                    # "no warm intros, ever" -- every non-ready row is
+                    # a draft awaiting human approval, not a warm-path
+                    # candidate. Legacy CSVs may still carry an
+                    # outreach_status='warm_path_needed' row from a
+                    # pre-Slice-1 pipeline run; those count as drafts.
                     draft_count += 1
         mtime = datetime.fromtimestamp(csv_path.stat().st_mtime)
         print(
             f"  {csv_path} ({total_rows} row(s); ready_to_send={ready_count} "
-            f"draft={draft_count} warm_path_needed={warm_count})"
+            f"draft={draft_count})"
         )
         print(f"  written at:          {mtime:%Y-%m-%d %H:%M}")
         if latest_csv_write and total_rows > 0:

@@ -18,7 +18,6 @@ running a stage, or on a cron alongside `status.py`, to catch:
   - verified signals lacking a quality score / unverified signals
     carrying one (Stage 5 hygiene drift)
   - duplicate pending axis suggestions for the same axis
-  - warm-path partners marked ready_to_send in the latest CSV
   - missing recommended drafts for partners with recommended_to_send=TRUE
   - axis scores keyed off axis_ids not present in axes.yaml
 
@@ -279,31 +278,21 @@ def _check_verified_quality_consistency(engine) -> list[tuple[Severity, str]]:
 
 
 def _check_warm_path_not_ready(engine) -> list[tuple[Severity, str]]:
-    """520: warm-path partners shouldn't be marked recommended_to_send.
-    Stage 7 already routes them to warm_path_needed; this catches DB
-    drift if a manual override slipped past."""
-    with engine.begin() as conn:
-        rows = conn.execute(
-            select(partners.c.partner_id, partners.c.name)
-            .join(
-                partner_score_summaries,
-                partner_score_summaries.c.partner_id == partners.c.partner_id,
-            )
-            .where(
-                partners.c.warm_path_available.is_(True),
-                partner_score_summaries.c.recommended_to_send.is_(True),
-            )
-        ).all()
-    if not rows:
-        return []
-    sample = ", ".join(f"{r.partner_id}" for r in rows[:5])
-    return [(
-        "warn",
-        f"{len(rows)} partner(s) flagged warm_path_available=TRUE AND "
-        f"recommended_to_send=TRUE (Stage 7 will route to warm_path_needed "
-        f"on the next run, but the DB shows a contradiction). Sample: "
-        f"{sample}",
-    )]
+    """No-op stub kept so CHECKS doesn't drift in numbering, and so any
+    operator who reads the source knows the prior behavior is
+    intentionally removed.
+
+    History: this check used to flag partners with
+    warm_path_available=TRUE that were ALSO recommended_to_send,
+    on the theory Stage 7 would route them to a "warm_path_needed"
+    branch. PR #10 / Slice 13 removed warm-path routing from
+    `core/scoring/recommendation.py` per the product line "no warm
+    intros, ever". The warm-path columns remain only as inert legacy
+    audit data; no scoring / routing / approval / send path consults
+    them. So a partner being warm_path_available + recommended is
+    NOT a contradiction -- they're a cold-outreach candidate like
+    everyone else."""
+    return []
 
 
 def _check_recommended_has_draft(engine) -> list[tuple[Severity, str]]:
