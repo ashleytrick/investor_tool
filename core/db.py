@@ -1074,6 +1074,62 @@ crm_connections = Table(
 )
 
 
+# B4 (Coach Pipeline): the partner's stage in the operator's mental
+# pipeline (sourced -> researching -> sent -> replied -> ... etc).
+# Pre-B4 this lived in the frontend's localStorage, which meant the
+# state was scoped to a single browser session per user. Moving it
+# to the workspace DB makes it durable across devices + visible to
+# the polling layer (so future logic can advance the stage when a
+# reply lands).
+#
+# Stage values are kept as plain strings rather than an enum so the
+# frontend can introduce new states without a backend migration.
+# Conventional values: 'sourced', 'researching', 'queued', 'sent',
+# 'replied', 'meeting_booked', 'won', 'lost', 'no_response'.
+partner_pipeline = Table(
+    "partner_pipeline", metadata,
+    # CASCADE: removing the partner removes the pipeline row.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("stage", Text, nullable=False),
+    Column("notes", Text),  # operator's freeform note
+    Column("updated_at", DateTime, nullable=False),
+    # Audit trail: who last touched it. Optional -- ops may not
+    # always set this.
+    Column("updated_by", Text),
+    Index("ix_partner_pipeline_stage", "stage"),
+)
+
+
+# B4 (Coach Snoozes): "remind me about this draft on date X". Pre-
+# B4 this lived in localStorage; moving it to the DB lets the Today
+# queue filter out snoozed drafts server-side and lets the operator
+# see the same snooze state across devices.
+#
+# One row per draft (PK); resnoozing overwrites. If we need a
+# history later we can add a separate `draft_snooze_events` table
+# without breaking this read shape.
+draft_snoozes = Table(
+    "draft_snoozes", metadata,
+    Column(
+        "draft_id", Integer,
+        ForeignKey("email_drafts.draft_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    # When to surface the draft again. Compare against
+    # datetime.now(UTC) -- snoozed_until <= now means the snooze
+    # has elapsed and the draft is eligible again.
+    Column("snoozed_until", DateTime, nullable=False),
+    Column("reason", Text),
+    Column("created_at", DateTime, nullable=False),
+    Column("created_by", Text),
+    Index("ix_draft_snoozes_until", "snoozed_until"),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
