@@ -78,9 +78,15 @@ QA_FAIL_BLOCKERS_BY_STATUS: dict[str, str] = {
 
 
 # Substrings that mark a blocker as HARD -- the approval CLI refuses
-# `--override-blockers` outright when any of these match. The list is
-# narrow on purpose: only the genuinely-cannot-send and
-# we-promised-not-to-send classes.
+# `--override-blockers` outright when any of these match.
+#
+# Each entry is intentionally anchored to a string the gate emits
+# verbatim, NOT a token that could appear inside an unrelated soft
+# blocker. Earlier shape used `"draft_id="` and `"superseded"` as
+# matches; both were too loose -- a future soft blocker that quoted
+# a draft id (e.g. cross-batch similarity "body close to draft_id=42")
+# or used the word "superseded" anywhere would silently flip to HARD
+# and `--override-blockers` would stop working for it.
 HARD_BLOCKER_SUBSTRINGS: tuple[str, ...] = (
     "partner email is unknown",
     "do_not_contact",
@@ -88,8 +94,11 @@ HARD_BLOCKER_SUBSTRINGS: tuple[str, ...] = (
     "Stage 7 batch QA marked this draft qa_status=fail",
     "cold_reachability_score is unknown",
     "verification status = invalid",
-    "draft_id=",  # "draft_id=N not found"
-    "superseded",  # Slice 17 immutable history: stale generation
+    # Anchored markers -- matched against the gate's exact emitted
+    # phrasing rather than a free-floating token. See the matching
+    # `ApprovalGate(blockers=(...,))` constructions below.
+    "draft not found (draft_id=",
+    "draft is superseded (draft_id=",
     "employment_status=left_fund",  # partner left the fund
     "fund is inactive",  # fund marked inactive
 )
@@ -202,7 +211,10 @@ def can_approve_draft(
         if draft is None:
             return ApprovalGate(
                 ok=False,
-                blockers=(f"draft_id={draft_id} not found",),
+                # Phrasing anchored on "draft not found (draft_id=" so
+                # classify_blocker tags this HARD without using a
+                # collide-prone substring like "draft_id=".
+                blockers=(f"draft not found (draft_id={draft_id})",),
             )
         # Slice 17 immutable history hard refusal: a superseded draft
         # is a prior generation kept for audit. It must NEVER be
@@ -212,11 +224,15 @@ def can_approve_draft(
         # accidentally treat a stale body as live. Classified HARD in
         # HARD_BLOCKER_SUBSTRINGS so --override-blockers can't bypass.
         if draft.superseded_at is not None:
+            # Phrasing anchored on "draft is superseded (draft_id="
+            # so classify_blocker tags this HARD without using the
+            # bare token "superseded" which could appear inside an
+            # unrelated soft blocker.
             return ApprovalGate(
                 ok=False,
                 blockers=(
-                    f"draft_id={draft_id} is superseded "
-                    f"(superseded_at={draft.superseded_at.isoformat()}); "
+                    f"draft is superseded (draft_id={draft_id}, "
+                    f"superseded_at={draft.superseded_at.isoformat()}); "
                     f"approve the latest generation for this partner instead",
                 ),
             )
