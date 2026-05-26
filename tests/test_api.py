@@ -350,6 +350,7 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         # Onboarding wizard surface.
         "/config",
         "/config/mode",
+        "/config/company",
         "/pipeline/score",
         "/pipeline/generate",
         "/gmail/status",
@@ -372,6 +373,9 @@ def test_config_returns_fixture_mode_and_gmail_false(client: TestClient) -> None
     # token, so gmail_connected must be false.
     assert body["mode"] == "fixture"
     assert body["gmail_connected"] is False
+    # test_workspace's company.yaml has name="Tendril" + one_liner set,
+    # so the wizard sees Step 1 as already complete on the fixture.
+    assert body["company_configured"] is True
 
 
 def test_set_mode_flips_company_yaml_and_round_trips(
@@ -597,3 +601,166 @@ def test_oauth_callback_rejects_missing_code(client: TestClient) -> None:
     res = client.get("/oauth/gmail/callback?state=abc")
     assert res.status_code == 400
     assert "code or state" in res.text.lower()
+
+
+# ---------- onboarding: /config/company ----------
+
+def test_get_company_returns_existing_test_workspace_profile(
+    client: TestClient,
+) -> None:
+    """The shipped test_workspace has a real `company:` block. The GET
+    endpoint must surface its values + fall back through the legacy
+    nested keys (target_check_size_usd, current_traction,
+    meeting_ask) to the flat shape the UI expects."""
+    res = client.get("/config/company", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # Direct flat fields.
+    assert body["name"] == "Tendril"
+    assert body["founder_name"] == "Dana Okafor"
+    assert body["founder_email"] == "dana@tendril.example"
+    assert body["stage"] == "SEED"
+    assert "fintech" in body["target_sectors"]
+    assert "United States" in body["target_geographies"]
+    # Legacy nested -> flat fallback.
+    assert body["target_check_min_usd"] == 250000
+    assert body["target_check_max_usd"] == 1500000
+    assert body["traction"] == "$180K ARR"
+    assert body["scheduling_link"] == "https://cal.example/dana-tendril"
+    # Fields the fixture doesn't set come back as defaults, not 404'd.
+    assert body["problem"] == ""
+    assert body["do_not_contact"] == []
+    assert body["founded_year"] is None
+
+
+def test_get_company_on_missing_file_returns_empty_shape(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """A workspace with no company.yaml at all must still return the
+    documented shape, not 404 -- the form's controlled inputs need
+    something to bind to."""
+    (workspace_with_one_pending_draft / "config" / "company.yaml").unlink()
+    res = client.get("/config/company", headers=_auth_headers())
+    assert res.status_code == 200
+    body = res.json()
+    assert body["name"] == ""
+    assert body["one_liner"] == ""
+    assert body["target_sectors"] == []
+    assert body["target_check_min_usd"] is None
+
+
+def test_put_company_writes_block_and_round_trips(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    yaml_path = (
+        workspace_with_one_pending_draft / "config" / "company.yaml"
+    )
+    before = yaml_path.read_text(encoding="utf-8")
+    # Make sure the test starts from the fixture content, not whatever
+    # an earlier test mutated.
+    assert "mode: fixture" in before
+    assert "Tendril" in before
+
+    payload = {
+        "name": "Acme",
+        "one_liner": "B2B compliance API.",
+        "website": "https://acme.example",
+        "founded_year": 2024,
+        "hq_location": "NYC",
+        "stage": "Seed",
+        "sectors": ["fintech", "compliance"],
+        "business_model": "SaaS",
+        "problem": "Manual reporting is slow.",
+        "solution": "API for reporting.",
+        "differentiators": "Built by ex-regulators.",
+        "why_now": "New mandates this quarter.",
+        "traction": "$200K ARR",
+        "round_amount_usd": 3000000,
+        "round_instrument": "SAFE",
+        "round_valuation_usd": 15000000,
+        "round_close_target": "Q1",
+        "target_check_min_usd": 250000,
+        "target_check_max_usd": 1500000,
+        "target_stages": ["seed"],
+        "target_sectors": ["fintech"],
+        "target_geographies": ["US"],
+        "desired_traits": ["leads rounds", "writes first check"],
+        "excluded_sectors": ["consumer"],
+        "excluded_geographies": ["RU"],
+        "do_not_contact": ["evil@example.com"],
+        "founder_name": "Jane Founder",
+        "founder_title": "CEO",
+        "founder_email": "jane@acme.example",
+        "signature": "— Jane",
+        "tone": "direct",
+        "scheduling_link": "https://cal.example/jane",
+    }
+    res = client.put(
+        "/config/company", headers=_auth_headers(), json=payload,
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["returncode"] == 0
+    assert "Acme" in body["stdout"]
+
+    # Round-trip: GET reflects every field we PUT.
+    fetched = client.get("/config/company", headers=_auth_headers()).json()
+    for key, want in payload.items():
+        assert fetched[key] == want, f"{key} did not round-trip"
+
+    # Sibling blocks and the mode line must be preserved.
+    after = yaml_path.read_text(encoding="utf-8")
+    assert "mode: fixture" in after
+    assert "raise_context:" in after
+    assert "founder_voice:" in after
+    assert "round_fit:" in after
+
+    # Legacy nested mirrors got populated so the pipeline keeps working.
+    assert "target_check_size_usd:" in after
+    assert "min: 250000" in after
+    assert "max: 1500000" in after
+    assert "current_traction:" in after
+    assert "headline_metric: $200K ARR" in after
+    assert "preferred_scheduling_link: https://cal.example/jane" in after
+
+    # /config snapshot now reports the wizard as configured.
+    snap = client.get("/config", headers=_auth_headers()).json()
+    assert snap["company_configured"] is True
+
+
+def test_put_company_with_only_required_fields_is_accepted(
+    client: TestClient,
+) -> None:
+    """Optional fields really are optional -- a half-filled form must
+    not 422 just because the operator skipped some questions."""
+    res = client.put(
+        "/config/company",
+        headers=_auth_headers(),
+        json={"name": "Bare", "one_liner": "Bare bones."},
+    )
+    assert res.status_code == 200, res.text
+    fetched = client.get("/config/company", headers=_auth_headers()).json()
+    assert fetched["name"] == "Bare"
+    assert fetched["target_sectors"] == []
+    assert fetched["target_check_min_usd"] is None
+
+
+def test_put_company_requires_auth(client: TestClient) -> None:
+    res = client.put("/config/company", json={"name": "X", "one_liner": "Y"})
+    assert res.status_code == 401
+
+
+def test_config_company_configured_false_when_empty(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """company_configured tracks the (name && one_liner) check, so an
+    empty profile must surface as not-configured to the wizard."""
+    res = client.put(
+        "/config/company",
+        headers=_auth_headers(),
+        json={"name": "", "one_liner": ""},
+    )
+    assert res.status_code == 200
+    snap = client.get("/config", headers=_auth_headers()).json()
+    assert snap["company_configured"] is False
