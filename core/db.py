@@ -465,6 +465,49 @@ email_drafts = Table(
 )
 
 
+# Slice 18a (REFACTOR_PLAN item 19): normalize manual_override reasons
+# into an append-only event log. The legacy
+# `partner_score_summaries.manual_override_reason` packed namespaced
+# reasons into one TEXT field ("score: bumped; rec: yes; warm: ...");
+# this table captures each operator action as its own row so audits
+# can answer "who set what when, with what justification" without
+# spelunking a string.
+#
+# kind values:
+#   score   -- manual score override set/cleared
+#   rec     -- manual recommendation override set/cleared
+#   warm    -- warm-path flag set/cleared (Slice 7 deprecated this
+#              from scoring but operators still record it for context)
+#
+# action values:
+#   set     -- override applied with `reason`
+#   clear   -- override removed (reason optional)
+#
+# The legacy packed string is still written by manual_override.py for
+# back-compat (read paths haven't fully migrated); this table is the
+# new canonical event source.
+manual_override_events = Table(
+    "manual_override_events", metadata,
+    Column("event_id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("kind", Text, nullable=False),  # score | rec | warm
+    Column("action", Text, nullable=False),  # set | clear
+    Column("reason", Text),
+    # Recommendation override carries the new value (yes/no) so the
+    # event log can reconstruct the recommended state without joining
+    # to partner_score_summaries. NULL for score / warm events.
+    Column("new_value", Text),
+    Column("actor", Text, nullable=False),
+    Column("at", DateTime, nullable=False),
+    Index("ix_moe_partner_id", "partner_id"),
+    Index("ix_moe_partner_kind", "partner_id", "kind"),
+)
+
+
 # Slice 1: append-only event log of every approval action against a
 # draft. The latest row's event_type matches email_drafts.approval_status
 # (denormalized for fast filtering); this table preserves WHO, WHEN,

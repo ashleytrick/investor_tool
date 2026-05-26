@@ -35,6 +35,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sqlalchemy import select
 
 from core.config_loader import add_workspace_arg
-from core.db import partner_score_summaries, partners
+from core.db import manual_override_events, partner_score_summaries, partners
 from core.operator_command import operator_command_run
 
 STAGE = "manual_override"
@@ -52,6 +53,38 @@ STAGE = "manual_override"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _actor() -> str:
+    return (
+        os.environ.get("USER")
+        or os.environ.get("USERNAME")
+        or "unknown"
+    )
+
+
+def _record_event(
+    conn,
+    *,
+    partner_id: str,
+    kind: str,
+    action: str,
+    reason: str | None = None,
+    new_value: str | None = None,
+) -> None:
+    """Slice 18a: append-only manual_override audit row. Called
+    alongside the legacy packed-string write so existing readers stay
+    working during the transition. The event log is the new canonical
+    audit source -- list_override_events.py reads it directly."""
+    conn.execute(manual_override_events.insert().values(
+        partner_id=partner_id,
+        kind=kind,
+        action=action,
+        reason=reason,
+        new_value=new_value,
+        actor=_actor(),
+        at=_now(),
+    ))
 
 
 def main() -> int:
@@ -203,6 +236,11 @@ def main() -> int:
                 _append_override_reason(
                     conn, pid, "warm", args.reason,
                 )
+                # Slice 18a: append-only audit event for the warm-path set.
+                _record_event(
+                    conn, partner_id=pid, kind="warm",
+                    action="set", reason=args.reason,
+                )
             print(f"[overrides] {pid}: warm_path=TRUE; reason logged: {args.reason!r}")
             run.note(f"warm_path set on {pid}: {args.reason!r}")
             run.succeeded = 1
@@ -275,6 +313,25 @@ def main() -> int:
                         _drop_override_reason_namespaces(
                             conn, pid, drop=("warm",),
                         )
+                # Slice 18a: append-only audit events for every kind
+                # the operator actually cleared. clear_all expands to
+                # all three kinds so the event log reflects the full
+                # scope of the wipe.
+                if clear_all or args.clear_score:
+                    _record_event(
+                        conn, partner_id=pid, kind="score",
+                        action="clear", reason=args.reason,
+                    )
+                if clear_all or args.clear_rec:
+                    _record_event(
+                        conn, partner_id=pid, kind="rec",
+                        action="clear", reason=args.reason,
+                    )
+                if clear_all or args.clear_warm:
+                    _record_event(
+                        conn, partner_id=pid, kind="warm",
+                        action="clear", reason=args.reason,
+                    )
             label = (
                 "all overrides cleared" if clear_all
                 else "cleared: " + "+".join(
@@ -298,6 +355,11 @@ def main() -> int:
                     partner_score_summaries.update()
                     .where(partner_score_summaries.c.partner_id == pid)
                     .values(manual_score_override=True)
+                )
+                # Slice 18a: append-only audit row.
+                _record_event(
+                    conn, partner_id=pid, kind="score",
+                    action="set", reason=args.reason,
                 )
             label = "manual_score_override=TRUE"
             print(f"[overrides] {pid}: {label}; reason={args.reason!r}")
@@ -337,6 +399,11 @@ def main() -> int:
                 .values(**update)
             )
             _append_override_reason(conn, pid, "rec", args.reason)
+            # Slice 18a: append-only audit row carrying the new value.
+            _record_event(
+                conn, partner_id=pid, kind="rec", action="set",
+                reason=args.reason, new_value=args.recommend,
+            )
         print(f"[overrides] {pid}: {label}; reason={args.reason!r}")
         run.note(f"{label} on {pid}: {args.reason!r}")
         run.succeeded = 1
