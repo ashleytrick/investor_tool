@@ -30,13 +30,21 @@ curl -H "Authorization: Bearer $API_KEY" https://.../review/pending
 
 ## CORS
 
-Allow-list set via `CORS_ORIGINS` (comma-separated). Default `*`
-for local dev — production should pin to the frontend's exact
-origin:
+Two env vars, used together. starlette OR's them — an Origin matches
+if it's in the explicit list OR matches the regex.
 
 ```bash
-fly secrets set CORS_ORIGINS=https://app.your-domain.com
+# Exact origins (comma-separated):
+fly secrets set CORS_ORIGINS=https://app.your-domain.com,https://staging.your-domain.com
+
+# OR a regex (use this when the frontend rotates preview URLs):
+fly secrets set CORS_ORIGIN_REGEX='https://([a-z0-9-]+--)?<project-id>\.(lovable\.app|lovableproject\.com)'
 ```
+
+Wildcard `*` only fires when neither env var is set — local-dev
+shape. Production must pin one or both. The regex is the right
+answer for hosts like Lovable that spawn ephemeral preview
+subdomains per session.
 
 ## Endpoints
 
