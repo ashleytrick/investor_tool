@@ -40,6 +40,11 @@ api = [
     # before Stage 1 consumes them.
     "openpyxl>=3.1",
     "python-multipart>=0.0.20",
+    # Supabase JWT verification on every authed endpoint
+    # (HS256 with SUPABASE_JWT_SECRET). PyJWT is the canonical
+    # minimal library; python-jose adds JWS/JWE machinery we don't
+    # need for symmetric-secret tokens.
+    "PyJWT>=2.8",
     "uvicorn[standard]>=0.30",
 ]
 
