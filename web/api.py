@@ -1532,11 +1532,113 @@ async def upload_pipeline_sources(
             },
         )
 
+    # Phase 3: also seed the shared discovery pool. Per the auth
+    # spec: every enrichment upserts into investors_global, deduped
+    # on email or (firm, partner). The upload is the EARLIEST point
+    # we know a firm name + maybe an email, so we seed here; Stage
+    # 2/4 enrichment can re-upsert later with richer fields. The
+    # sync is best-effort -- a global-pool failure must not block
+    # the tenant's CSV landing.
+    global_synced = 0
+    try:
+        global_synced = _sync_uploaded_csv_to_global_pool(content)
+    except Exception as exc:  # noqa: BLE001 - never block the tenant write
+        # Surface in stdout so the operator can audit; don't 5xx
+        # the request -- the tenant's CSV is already on disk and
+        # sources.yaml is wired.
+        global_sync_note = (
+            f" (global-pool sync failed: {exc!s}; tenant upload "
+            f"succeeded)"
+        )
+    else:
+        # Skip the note entirely on a zero-row sync so the operator
+        # can tell "the discovery pool is disabled" / "header-only
+        # CSV had nothing to sync" from "synced N rows" without
+        # parsing the count.
+        global_sync_note = (
+            f"; synced {global_synced} row(s) into the shared "
+            f"discovery pool"
+            if global_synced > 0
+            else ""
+        )
+
     stdout = (
         f"[sources] uploaded {safe_name} ({row_count} rows) -> "
-        f"{csv_relative}; sources.yaml updated."
+        f"{csv_relative}; sources.yaml updated{global_sync_note}."
     )
     return SourcesUploadResult(
         ok=True, row_count=row_count, stdout=stdout,
     )
+
+
+def _sync_uploaded_csv_to_global_pool(csv_bytes: bytes) -> int:
+    """Read the just-uploaded CSV and upsert each row into the
+    shared `investors_global` pool. Returns the number of rows
+    upserted.
+
+    Mapping: the uploaded shape (post-aliasing) carries `name` ==
+    firm name and `domain` == fund site host. We seed the global
+    pool with one row per (firm, partner=None) -- the discovery
+    pool is keyed on firm + partner, so a firm-only row is a
+    placeholder Stage 2 / 4 later enriches with partner names +
+    emails via a subsequent upsert call (Phase 3 lands the
+    mechanism; future PRs wire the per-partner re-sync).
+
+    Disabled when the operator hasn't set GLOBAL_DB_PATH (or in
+    tests that haven't enabled the pool) -- the env-default
+    `/data/global/global.db` is only meaningful on the Fly volume,
+    so a missing path is an explicit signal to skip the sync.
+    """
+    if os.environ.get("INVESTORS_GLOBAL_DISABLED", "").lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return 0
+    import csv as _csv
+    import io
+    from core.investors_global import (
+        InvestorRow,
+        get_global_engine,
+        upsert_many,
+    )
+    text = csv_bytes.decode("utf-8-sig", errors="replace")
+    reader = _csv.DictReader(io.StringIO(text))
+    rows: list[InvestorRow] = []
+    for raw_row in reader:
+        # The CSV came through with original-case headers; do a
+        # case-insensitive lookup for name / firm / investor name.
+        lower = {
+            (k or "").strip().lower(): (v or "").strip()
+            for k, v in raw_row.items() if k is not None
+        }
+        firm = (
+            lower.get("name")
+            or lower.get("firm")
+            or lower.get("investor")
+            or lower.get("investor name")
+            or lower.get("fund")
+            or lower.get("fund name")
+        )
+        if not firm:
+            continue
+        # Partner column is rarely in the upload shape; allow it
+        # but default to a placeholder so the firm-only row still
+        # gets a stable dedup key.
+        partner = (
+            lower.get("partner")
+            or lower.get("contact")
+            or lower.get("partner name")
+            or "(unknown)"
+        )
+        email = (
+            lower.get("email")
+            or lower.get("partner email")
+            or None
+        )
+        rows.append(InvestorRow(
+            firm=firm, partner=partner, email=email,
+        ))
+    if not rows:
+        return 0
+    engine = get_global_engine()
+    return upsert_many(engine, rows)
 
