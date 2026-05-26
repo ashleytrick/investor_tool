@@ -1,24 +1,47 @@
 """Google OAuth endpoints (Gmail + Drive).
 
-Four routes extracted from `web/api.py`:
+Five routes:
 
   GET  /gmail/status            -- legacy single-scope status
   GET  /google/status           -- per-scope (gmail + drive) status
   POST /gmail/connect           -- start the browser OAuth flow
   GET  /oauth/gmail/callback    -- Google redirects here after consent
+  POST /gmail/bootstrap         -- Phase 6: harvest the Google
+                                   refresh token Supabase already
+                                   has (when the operator signed in
+                                   via Supabase OAuth with the gmail
+                                   scope) so the wizard's connect
+                                   step is one click instead of two.
 
-Paths and behavior are byte-identical to the pre-extraction
-versions; the only difference is that the routes live on an
-APIRouter that `web/api.py` includes at import time.
+Phase 6 (`/gmail/bootstrap`) makes the standard wizard signup also
+cover the Gmail connection in the same OAuth round-trip: the
+frontend asks Supabase for Google OAuth with
+`scopes='https://www.googleapis.com/auth/gmail.send' access_type=offline
+prompt=consent`, and the backend reads the resulting
+`provider_refresh_token` from Supabase's admin API + persists it
+at the workspace's standard `.gmail_token.json` path so the rest
+of the Gmail surface (status, draft creation) works without a
+second consent.
+
+Paths and behavior of the original four routes are byte-identical
+to the pre-extraction versions; the only difference is that the
+routes live on an APIRouter that `web/api.py` includes at import
+time.
 """
 from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from core import gmail_oauth
-from web.deps import _engine_and_ws, require_auth
+from core import supabase_admin
+from web.deps import _engine_and_ws, current_principal, require_auth
 
 
 # ---------- response models ----------
@@ -40,6 +63,31 @@ class GoogleStatus(BaseModel):
     gmail_connected: bool
     drive_connected: bool
     google_connected: bool
+
+
+class GmailBootstrapResult(BaseModel):
+    """Response from POST /gmail/bootstrap. The frontend renders
+    `connected: true` + the discovered email as the wizard's
+    confirmation step."""
+    connected: bool
+    email: Optional[str] = None
+
+
+# Required Gmail scope for draft creation. Matches the scope the
+# existing CLI flow asks for (gmail.compose). Phase 6 doesn't
+# touch gmail_client.SCOPES, so a Supabase OAuth that granted
+# gmail.send is accepted IFF gmail.send subsumes the compose
+# permission Drafts API uses. The check below also accepts
+# gmail.compose for ops who set up Supabase OAuth narrowly.
+_BOOTSTRAP_ACCEPTABLE_GMAIL_SCOPES = {
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.compose",
+    # gmail.modify / mail.google.com are broader and ALSO subsume
+    # compose -- operators who chose those scopes during signup
+    # don't need to re-consent for the narrower one.
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
+}
 
 
 router = APIRouter(tags=["onboarding"])
@@ -167,3 +215,151 @@ def gmail_oauth_callback(
         f"<p>Connected as <b>{email}</b>. "
         f"You can close this tab and return to the dashboard.</p>"
     )
+
+
+@router.post(
+    "/gmail/bootstrap",
+    response_model=GmailBootstrapResult,
+    summary=(
+        "Harvest the Google refresh token Supabase already has + "
+        "persist it as the workspace's Gmail token (single-step "
+        "signup)"
+    ),
+)
+def gmail_bootstrap(
+    principal: dict | None = Depends(current_principal),
+    _auth: None = Depends(require_auth),
+) -> GmailBootstrapResult:
+    """When the frontend signs the user in via Supabase OAuth
+    with the gmail.send scope + `access_type=offline` +
+    `prompt=consent`, Supabase stores the provider refresh token
+    on the user's Google identity row. This endpoint reads it via
+    the Supabase admin API and persists it at the workspace's
+    standard `.gmail_token.json` path so the rest of the Gmail
+    surface works without a second consent.
+
+    Error contract:
+      - 401 if the request isn't authenticated.
+      - 409 `missing_refresh_token` -- Supabase has the user but
+        no Google identity OR the identity has no refresh_token.
+        The frontend falls back to the explicit `/gmail/connect`
+        flow.
+      - 403 `insufficient_scope` -- the granted Google scopes don't
+        cover Gmail draft creation. The frontend should re-request
+        OAuth with the right scope.
+      - 500 if Supabase / google client credentials are
+        unconfigured -- the operator hasn't completed the deploy
+        steps and the bootstrap can't work yet.
+    """
+    if principal is None:
+        # require_auth would normally catch this, but keep the
+        # belt-and-braces 401 so the path stays explicit.
+        raise HTTPException(401, "missing bearer token")
+
+    user_id = principal.get("user_id")
+    if not user_id:
+        raise HTTPException(
+            500,
+            "authenticated principal carries no user_id; refusing "
+            "to bootstrap Gmail to an unknown tenant",
+        )
+
+    identity = supabase_admin.fetch_google_identity(user_id)
+    if identity is None or not identity.provider_refresh_token:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "missing_refresh_token",
+                "message": (
+                    "no Google refresh token on file for this user. "
+                    "Re-sign-in via Supabase Google OAuth with "
+                    "access_type=offline + prompt=consent, or fall "
+                    "back to /gmail/connect for the browser flow."
+                ),
+            },
+        )
+    if not _has_acceptable_scope(identity.scopes):
+        raise HTTPException(
+            403,
+            detail={
+                "error": "insufficient_scope",
+                "granted_scopes": identity.scopes,
+                "required_one_of": sorted(
+                    _BOOTSTRAP_ACCEPTABLE_GMAIL_SCOPES
+                ),
+                "message": (
+                    "the granted Google scopes do not include a "
+                    "scope that allows Gmail draft creation. "
+                    "Re-request OAuth with at least gmail.compose "
+                    "(or gmail.send, gmail.modify, or "
+                    "mail.google.com)."
+                ),
+            },
+        )
+
+    # We need Supabase's OWN Google OAuth client_id + secret to
+    # refresh the access token later. These live on the Supabase
+    # dashboard (Auth -> Providers -> Google); the operator
+    # duplicates them as Fly secrets so the backend can refresh.
+    client_id = os.environ.get("SUPABASE_GOOGLE_CLIENT_ID") or ""
+    client_secret = (
+        os.environ.get("SUPABASE_GOOGLE_CLIENT_SECRET") or ""
+    )
+    if not client_id or not client_secret:
+        raise HTTPException(
+            500,
+            detail={
+                "error": "supabase_google_client_unconfigured",
+                "message": (
+                    "the backend needs SUPABASE_GOOGLE_CLIENT_ID + "
+                    "SUPABASE_GOOGLE_CLIENT_SECRET to refresh the "
+                    "harvested provider tokens. Set them to the "
+                    "same Google OAuth client Supabase uses, then "
+                    "retry."
+                ),
+            },
+        )
+
+    _, ws = _engine_and_ws()
+    token_path = ws.path / ".gmail_token.json"
+    # Build a creds JSON google.oauth2.credentials.Credentials can
+    # load directly. The access token is short-lived; the refresh
+    # token + client credentials carry the long-lived authority.
+    expiry_iso: Optional[str] = None
+    if identity.provider_access_token:
+        # The Supabase admin API doesn't surface the original
+        # exp; assume a conservative 50-minute lifetime so the
+        # refresh fires before Google would 401.
+        expiry_iso = (
+            datetime.now(timezone.utc) + timedelta(minutes=50)
+        ).isoformat()
+    token_payload = {
+        "token": identity.provider_access_token,
+        "refresh_token": identity.provider_refresh_token,
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scopes": identity.scopes,
+    }
+    if expiry_iso:
+        token_payload["expiry"] = expiry_iso
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(token_payload, indent=2),
+        encoding="utf-8",
+    )
+
+    return GmailBootstrapResult(
+        connected=True,
+        email=identity.email,
+    )
+
+
+def _has_acceptable_scope(scopes: list[str]) -> bool:
+    """True iff at least one of the granted scopes covers Gmail
+    draft creation. Acceptable scopes are the precise compose
+    permission OR any broader scope that subsumes it."""
+    if not scopes:
+        return False
+    granted = set(scopes)
+    return bool(granted & _BOOTSTRAP_ACCEPTABLE_GMAIL_SCOPES)
