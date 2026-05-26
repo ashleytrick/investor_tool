@@ -389,7 +389,7 @@ app.add_middleware(
     allow_origins=_origins,
     allow_origin_regex=_origin_regex,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -2158,7 +2158,7 @@ class ExtractionResponse(BaseModel):
     tags=["onboarding"],
 )
 async def extract_from_deck(
-    deck: UploadFile = File(
+    file: UploadFile = File(
         ..., description="PDF or PPTX pitch deck (50 MB max)",
     ),
     _auth: None = Depends(require_auth),
@@ -2173,7 +2173,7 @@ async def extract_from_deck(
     from core.deck_extraction import extract_profile_draft, extract_text
     from core.llm.client import LLMClient
 
-    content = await deck.read()
+    content = await file.read()
     if not content:
         raise HTTPException(
             400,
@@ -2197,13 +2197,13 @@ async def extract_from_deck(
             },
         )
 
-    extracted = extract_text(deck.filename or "", content)
+    extracted = extract_text(file.filename or "", content)
     # When extraction yields no usable text, return a clean empty
     # response with warnings rather than blowing up. The operator
     # falls back to manual entry; PUT /config/company still works.
     if not extracted.text.strip():
         return _build_extraction_response(
-            filename=deck.filename or "",
+            filename=file.filename or "",
             extracted_text=extracted,
             llm_output=__import__(
                 "schemas.deck_extraction",
@@ -2230,7 +2230,7 @@ async def extract_from_deck(
         )
 
     return _build_extraction_response(
-        filename=deck.filename or "",
+        filename=file.filename or "",
         extracted_text=extracted,
         llm_output=llm_output,
         llm_warnings=list(llm_output.warnings),
