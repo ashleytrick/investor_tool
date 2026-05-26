@@ -188,10 +188,50 @@ partners = Table(
     ),
 )
 
+# Slice 18b (REFACTOR_PLAN item 21): normalize source identity.
+# Today source_url is duplicated as a TEXT column on
+# source_snapshots, signals, deal_attributions, ambiguous_matches,
+# and funds.source_urls (JSON list). A typo in one of the writers
+# produces "two different source_urls that mean the same thing" with
+# no easy way to detect it. This table is the canonical registry --
+# one row per unique URL, stable source_id PK -- and over the next
+# slices the loose columns migrate to FKs that point here.
+#
+# This slice only WIRES UP the registry + adds source_id to
+# source_snapshots. Other tables keep their loose source_url for now;
+# future migrations move them over (the migration system landed in
+# Slice 16 makes that safe).
+sources = Table(
+    "sources", metadata,
+    Column("source_id", Integer, primary_key=True, autoincrement=True),
+    Column("source_url", Text, nullable=False),
+    # source_type names the kind of feed/page this URL is. Examples:
+    #   funding_announcement_feed | fund_team_page |
+    #   partner_content | press_release | rss_seed | manual
+    # NULL when unknown -- backfill stamps NULL on rows we can't
+    # reliably categorize.
+    Column("source_type", Text),
+    Column("first_seen_at", DateTime, nullable=False),
+    Column("last_seen_at", DateTime, nullable=False),
+    # JSON metadata for future per-source state (rate-limit budget,
+    # robots.txt parse, etc.); NULL today.
+    Column("metadata", Text),
+    # UNIQUE on source_url enforces "one canonical row per URL". A
+    # second upsert of the same URL bumps last_seen_at on the
+    # existing row instead of creating a duplicate.
+    Index("ux_sources_source_url", "source_url", unique=True),
+)
+
+
 source_snapshots = Table(
     "source_snapshots", metadata,
     Column("snapshot_id", Integer, primary_key=True, autoincrement=True),
     Column("source_url", Text, nullable=False),
+    # Slice 18b: FK to the canonical sources registry. Populated by
+    # core.sources.upsert_source() inside source_fetch / direct
+    # writers. NULL on legacy rows backfill hasn't reached yet;
+    # readers should treat NULL as "use source_url string fallback".
+    Column("source_id", Integer, ForeignKey("sources.source_id")),
     # Batch 29 (#326): final_url after redirect resolution. The verifier
     # and any future re-fetch step should hit final_url; source_url is
     # kept for traceability ("what did the operator originally configure").
@@ -211,6 +251,7 @@ source_snapshots = Table(
         unique=True,
     ),
     Index("ix_source_snapshots_source_url", "source_url"),
+    Index("ix_source_snapshots_source_id", "source_id"),
 )
 
 signals = Table(
