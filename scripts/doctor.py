@@ -44,12 +44,14 @@ from core.db import (
     email_drafts,
     funds,
     get_engine,
+    manual_override_events,
     outcomes,
     partner_score_summaries,
     partners,
     scores,
     signals,
     source_snapshots,
+    sources,
 )
 
 Severity = str  # "error" | "warn" | "info"
@@ -487,6 +489,164 @@ def _check_source_reachability(ws) -> list[tuple[Severity, str]]:
     return out
 
 
+def _check_draft_history_invariants(engine) -> list[tuple[Severity, str]]:
+    """Slice 17: every (partner_id, version) live row is unique +
+    superseded versions are strictly less than the live version. A
+    drift here means Stage 7's supersede pattern was bypassed or a
+    manual SQL edit went wrong."""
+    out: list[tuple[Severity, str]] = []
+    with engine.begin() as conn:
+        # Two live rows for the same partner with is_recommended=TRUE
+        # would confuse "latest rec" readers.
+        rows = conn.execute(
+            select(email_drafts.c.partner_id, func.count().label("n"))
+            .where(
+                email_drafts.c.superseded_at.is_(None),
+                email_drafts.c.is_recommended.is_(True),
+            )
+            .group_by(email_drafts.c.partner_id)
+            .having(func.count() > 1)
+        ).all()
+        if rows:
+            sample = ", ".join(f"{r.partner_id}({r.n})" for r in rows[:5])
+            out.append((
+                "error",
+                f"{len(rows)} partner(s) have >1 LIVE recommended draft "
+                f"(should be exactly one per partner). Sample: {sample}",
+            ))
+        # Superseded rows that still claim is_recommended=TRUE.
+        bad_rec = conn.execute(
+            select(func.count())
+            .select_from(email_drafts)
+            .where(
+                email_drafts.c.superseded_at.isnot(None),
+                email_drafts.c.is_recommended.is_(True),
+            )
+        ).scalar() or 0
+        if bad_rec:
+            out.append((
+                "warn",
+                f"{bad_rec} superseded email_drafts row(s) still have "
+                f"is_recommended=TRUE (Stage 7's supersede should clear it). "
+                f"SQL: select draft_id from email_drafts where "
+                f"superseded_at is not null and is_recommended=1",
+            ))
+        # Version ordering: every superseded row's version must be
+        # less than every live row's version for the same partner.
+        # Drop into raw SQL to avoid SQLAlchemy alias() boilerplate;
+        # the doctor module already uses exec_driver_sql elsewhere.
+        violations = next(iter(conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM email_drafts a "
+            "JOIN email_drafts b ON a.partner_id = b.partner_id "
+            "WHERE a.superseded_at IS NOT NULL "
+            "  AND b.superseded_at IS NULL "
+            "  AND a.version >= b.version"
+        )))[0] or 0
+        if violations:
+            out.append((
+                "error",
+                f"{violations} email_drafts row pair(s) violate version "
+                f"monotonicity (superseded version >= live version for the "
+                f"same partner). SQL: "
+                f"select a.draft_id, b.draft_id from email_drafts a "
+                f"join email_drafts b on a.partner_id=b.partner_id "
+                f"where a.superseded_at is not null and b.superseded_at is "
+                f"null and a.version >= b.version",
+            ))
+    return out
+
+
+def _check_sources_registry_consistency(engine) -> list[tuple[Severity, str]]:
+    """Slice 18b: every source_snapshots.source_id should point at an
+    existing sources row. NULL is permitted on legacy rows the m002
+    backfill skipped (e.g. tables without source_url at all)."""
+    with engine.begin() as conn:
+        # Snapshots with source_id pointing at a non-existent source.
+        orphan = conn.execute(
+            select(func.count())
+            .select_from(source_snapshots)
+            .where(
+                source_snapshots.c.source_id.isnot(None),
+                ~source_snapshots.c.source_id.in_(
+                    select(sources.c.source_id)
+                ),
+            )
+        ).scalar() or 0
+        if orphan:
+            return [(
+                "error",
+                f"{orphan} source_snapshots row(s) have source_id pointing "
+                f"at a non-existent sources row. SQL: "
+                f"select snapshot_id, source_id from source_snapshots "
+                f"where source_id is not null and source_id not in "
+                f"(select source_id from sources)",
+            )]
+        # Snapshots with source_url but no source_id (post-Slice-18b
+        # writes should populate it; legacy writes have m002 backfill).
+        unstamped = conn.execute(
+            select(func.count())
+            .select_from(source_snapshots)
+            .where(
+                source_snapshots.c.source_id.is_(None),
+                source_snapshots.c.source_url.isnot(None),
+            )
+        ).scalar() or 0
+        if unstamped:
+            return [(
+                "warn",
+                f"{unstamped} source_snapshots row(s) have source_url but "
+                f"NULL source_id (m002 backfill should have populated "
+                f"these; re-running get_engine on this DB should fix it). "
+                f"SQL: select snapshot_id, source_url from source_snapshots "
+                f"where source_id is null and source_url is not null",
+            )]
+    return []
+
+
+def _check_override_events_consistency(engine) -> list[tuple[Severity, str]]:
+    """Slice 18a: manual_override_events.partner_id should point at an
+    existing partner. The FK declares ON DELETE CASCADE; an orphan
+    here means the FK wasn't enforced on the original write (legacy
+    DBs that pre-date the constraint)."""
+    with engine.begin() as conn:
+        orphan = conn.execute(
+            select(func.count())
+            .select_from(manual_override_events)
+            .where(
+                ~manual_override_events.c.partner_id.in_(
+                    select(partners.c.partner_id)
+                ),
+            )
+        ).scalar() or 0
+        if orphan:
+            return [(
+                "error",
+                f"{orphan} manual_override_events row(s) reference a "
+                f"partner_id that no longer exists. SQL: "
+                f"select event_id, partner_id from manual_override_events "
+                f"where partner_id not in (select partner_id from partners)",
+            )]
+        # Kind must be one of score | rec | warm; action must be set | clear.
+        bad_kind = conn.execute(
+            select(func.count())
+            .select_from(manual_override_events)
+            .where(~manual_override_events.c.kind.in_(("score", "rec", "warm")))
+        ).scalar() or 0
+        bad_action = conn.execute(
+            select(func.count())
+            .select_from(manual_override_events)
+            .where(~manual_override_events.c.action.in_(("set", "clear")))
+        ).scalar() or 0
+        if bad_kind or bad_action:
+            return [(
+                "error",
+                f"manual_override_events has {bad_kind} unknown-kind + "
+                f"{bad_action} unknown-action row(s). Kind must be "
+                f"score|rec|warm; action must be set|clear.",
+            )]
+    return []
+
+
 CHECKS = [
     _check_orphan_summaries,
     _check_partners_have_funds,
@@ -499,6 +659,10 @@ CHECKS = [
     _check_orphan_snapshots,
     _check_orphan_outcomes,
     _check_placeholders_in_recommended_drafts,
+    # Slice 17 / 18a / 18b invariants.
+    _check_draft_history_invariants,
+    _check_sources_registry_consistency,
+    _check_override_events_consistency,
 ]
 
 
