@@ -1,0 +1,42 @@
+# Fly.io deployment config for the operator web UI.
+#
+# `app` is the unique Fly app name -- change before first `fly launch`
+# / `fly deploy` so it doesn't collide with someone else's.
+#
+# The persistent SQLite workspace lives on a volume mounted at /data
+# so the DB survives restarts and deploys. INVESTOR_WORKSPACE points
+# the UI at /data/workspace, which the operator seeds via `fly ssh`
+# (see web/README.md).
+#
+# Free tier sizing: shared-cpu-1x / 256 MB / 3 GB volume is within
+# the Fly free allotment. Bump the VM if Stage 7 / Stage 8 needs
+# more memory.
+
+app = "investor-outreach-ui"  # CHANGE ME before first deploy
+primary_region = "iad"
+
+[build]
+dockerfile = "Dockerfile"
+
+[env]
+INVESTOR_WORKSPACE = "/data/workspace"
+APP_OPERATOR = "web-operator"
+# APP_PASSWORD is set via `fly secrets set APP_PASSWORD=...` (NOT here).
+# Same for ANTHROPIC_API_KEY, ATTIO_API_KEY, etc.
+
+[mounts]
+source = "investor_workspace"
+destination = "/data"
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 0
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"
+cpu_kind = "shared"
+cpus = 1

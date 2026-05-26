@@ -19,6 +19,12 @@ dependencies = [
     "feedparser>=6.0",
 ]
 
+[project.optional-dependencies]
+# Web operator UI (Streamlit). Install with: uv sync --extra web
+web = [
+    "streamlit>=1.40",
+]
+
 [tool.uv]
 package = false
 dev-dependencies = [
