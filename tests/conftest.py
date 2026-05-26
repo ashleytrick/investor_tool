@@ -24,6 +24,33 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _reset_request_contextvars():
+    """Phase 2a: clear the per-request user_id contextvar between
+    tests so a unit test that directly calls `current_principal`
+    doesn't leak its user_id into the next test's
+    `_engine_and_ws()` lookup.
+
+    Production FastAPI requests get per-request task isolation for
+    contextvars automatically; pytest functions all run in the
+    same task, which is why we reset by hand here.
+    """
+    try:
+        from web import deps as _deps
+    except ImportError:
+        yield
+        return
+    var = getattr(_deps, "_CURRENT_USER_ID_VAR", None)
+    if var is None:
+        yield
+        return
+    token = var.set(None)
+    try:
+        yield
+    finally:
+        var.reset(token)
+
+
 def run_script(script: str, *args: str, cwd: Path | None = None,
                check: bool = True, timeout: int = 120,
                env_overrides: dict[str, str] | None = None,
