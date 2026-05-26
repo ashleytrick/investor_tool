@@ -59,9 +59,18 @@ class AdminCompany(BaseModel):
     created_at: Optional[str] = None
 
 
+class SkippedTenant(BaseModel):
+    """Review item #22: surface per-tenant load failures so admins
+    can see WHICH workspaces are broken and why, instead of admin
+    endpoints silently dropping bad tenants from the result."""
+    user_id: str
+    error: str
+
+
 class AdminCompaniesResult(BaseModel):
     companies: list[AdminCompany] = Field(default_factory=list)
     count: int = 0
+    skipped: list[SkippedTenant] = Field(default_factory=list)
 
 
 class AdminInvestor(BaseModel):
@@ -82,6 +91,7 @@ class AdminInvestor(BaseModel):
 class AdminInvestorsResult(BaseModel):
     investors: list[AdminInvestor] = Field(default_factory=list)
     count: int = 0
+    skipped: list[SkippedTenant] = Field(default_factory=list)
 
 
 class AdminTenant(BaseModel):
@@ -96,6 +106,7 @@ class AdminTenant(BaseModel):
 class AdminTenantsResult(BaseModel):
     tenants: list[AdminTenant] = Field(default_factory=list)
     count: int = 0
+    skipped: list[SkippedTenant] = Field(default_factory=list)
 
 
 # ---------- helpers ----------
@@ -162,32 +173,42 @@ def admin_companies(
     _principal: dict = Depends(require_admin),
 ) -> AdminCompaniesResult:
     out: list[AdminCompany] = []
+    skipped: list[SkippedTenant] = []
     for ws_dir in _iter_tenant_workspaces():
-        yaml_path = ws_dir / "config" / "company.yaml"
-        company = _read_company_block(yaml_path)
-        sectors = company.get("sectors") or []
-        if not isinstance(sectors, list):
-            sectors = []
-        out.append(AdminCompany(
-            user_id=ws_dir.name,
-            user_email=_ws_email_from_company(company),
-            name=company.get("name") or None,
-            one_liner=company.get("one_liner") or None,
-            stage=company.get("stage") or None,
-            sectors=[str(s) for s in sectors],
-            business_model=company.get("business_model") or None,
-            # Use the company.yaml file mtime as a stable "created"
-            # signal for now -- the wizard's PUT bumps mtime each
-            # time the operator saves, so this is closer to
-            # "last updated" until we add a real created_at column.
-            created_at=(
-                datetime.fromtimestamp(
-                    yaml_path.stat().st_mtime,
-                ).isoformat()
-                if yaml_path.exists() else None
-            ),
-        ))
-    return AdminCompaniesResult(companies=out, count=len(out))
+        try:
+            yaml_path = ws_dir / "config" / "company.yaml"
+            company = _read_company_block(yaml_path)
+            sectors = company.get("sectors") or []
+            if not isinstance(sectors, list):
+                sectors = []
+            out.append(AdminCompany(
+                user_id=ws_dir.name,
+                user_email=_ws_email_from_company(company),
+                name=company.get("name") or None,
+                one_liner=company.get("one_liner") or None,
+                stage=company.get("stage") or None,
+                sectors=[str(s) for s in sectors],
+                business_model=company.get("business_model") or None,
+                # Use the company.yaml file mtime as a stable "created"
+                # signal for now -- the wizard's PUT bumps mtime each
+                # time the operator saves, so this is closer to
+                # "last updated" until we add a real created_at column.
+                created_at=(
+                    datetime.fromtimestamp(
+                        yaml_path.stat().st_mtime,
+                    ).isoformat()
+                    if yaml_path.exists() else None
+                ),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            # Review #22: report broken tenants instead of silent
+            # skip, so admins can see WHICH workspaces are bad.
+            skipped.append(SkippedTenant(
+                user_id=ws_dir.name, error=str(exc),
+            ))
+    return AdminCompaniesResult(
+        companies=out, count=len(out), skipped=skipped,
+    )
 
 
 @router.get(
@@ -240,6 +261,7 @@ def admin_investors(
             since_dt = None
 
     out: list[AdminInvestor] = []
+    skipped: list[SkippedTenant] = []
     for ws_dir in _iter_tenant_workspaces():
         uid = ws_dir.name
         if tenant and uid != tenant:
@@ -264,7 +286,9 @@ def admin_investors(
                         )
                     )
                 ))
-        except Exception:  # noqa: BLE001 - bad tenant DB -> skip
+        except Exception as exc:  # noqa: BLE001 - bad tenant DB
+            # Review #22: surface skipped tenants in the response.
+            skipped.append(SkippedTenant(user_id=uid, error=str(exc)))
             continue
 
         for r in rows:
@@ -354,7 +378,9 @@ def admin_investors(
         if len(out) >= limit:
             break
 
-    return AdminInvestorsResult(investors=out, count=len(out))
+    return AdminInvestorsResult(
+        investors=out, count=len(out), skipped=skipped,
+    )
 
 
 @router.get(
@@ -366,6 +392,7 @@ def admin_tenants(
     _principal: dict = Depends(require_admin),
 ) -> AdminTenantsResult:
     out: list[AdminTenant] = []
+    skipped: list[SkippedTenant] = []
     for ws_dir in _iter_tenant_workspaces():
         uid = ws_dir.name
         yaml_path = ws_dir / "config" / "company.yaml"
@@ -399,8 +426,13 @@ def admin_tenants(
                     ).scalar()
                     if isinstance(latest_run_completed, datetime):
                         last_active = latest_run_completed
-            except Exception:  # noqa: BLE001 - bad tenant DB -> show zeros
-                pass
+            except Exception as exc:  # noqa: BLE001 - bad tenant DB
+                # Review #22: still emit the tenant row with zero
+                # counts, but ALSO surface the error so admins know
+                # the numbers are stale / broken.
+                skipped.append(SkippedTenant(
+                    user_id=uid, error=str(exc),
+                ))
 
         if last_active is None and yaml_path.exists():
             # Fall back to company.yaml mtime so a tenant that
@@ -423,4 +455,6 @@ def admin_tenants(
                 last_active.isoformat() if last_active else None
             ),
         ))
-    return AdminTenantsResult(tenants=out, count=len(out))
+    return AdminTenantsResult(
+        tenants=out, count=len(out), skipped=skipped,
+    )

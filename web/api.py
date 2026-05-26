@@ -2224,6 +2224,13 @@ class ExtractionResponse(BaseModel):
     missing_required_fields: list[str] = Field(default_factory=list)
     needs_review_fields: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # Review item #21: surface a structured `extraction_failed`
+    # flag separate from the freeform warnings list so the
+    # frontend can render an unmissable banner ("we couldn't
+    # auto-extract; please fill the form manually") on LLM
+    # failure -- distinct from the milder "low-confidence field
+    # X" warnings that share the warnings list.
+    extraction_failed: bool = False
     source_filename: str = ""
     text_preview: str = ""
 
@@ -2279,7 +2286,7 @@ async def extract_from_deck(
     # response with warnings rather than blowing up. The operator
     # falls back to manual entry; PUT /config/company still works.
     if not extracted.text.strip():
-        return _build_extraction_response(
+        empty_response = _build_extraction_response(
             filename=file.filename or "",
             extracted_text=extracted,
             llm_output=__import__(
@@ -2288,6 +2295,11 @@ async def extract_from_deck(
             ).DeckLLMOutput(extracted_fields=[]),
             llm_warnings=[],
         )
+        # Review #21: same banner signal as LLM-failure -- the
+        # operator needs to know auto-extract didn't yield
+        # anything actionable before they start editing.
+        empty_response.extraction_failed = True
+        return empty_response
 
     _, ws = _engine_and_ws()
     llm = LLMClient(workspace=ws)
@@ -2296,22 +2308,30 @@ async def extract_from_deck(
         llm_output = extract_profile_draft(
             llm=llm, deck_text=extracted.text, stub_response=stub,
         )
+        extraction_failed = False
     except Exception as exc:  # noqa: BLE001 - surface as response, not 500
         # An LLM failure during extraction shouldn't 500 the whole
         # onboarding flow -- return what we got from the text layer
         # plus a warning so the operator can continue manually.
+        # Review #21: also stamp extraction_failed=True so the
+        # frontend can render an unmissable "fill the form
+        # manually" banner instead of silently showing an empty
+        # profile.
         from schemas.deck_extraction import DeckLLMOutput
         llm_output = DeckLLMOutput(
             extracted_fields=[],
             warnings=[f"LLM extraction failed: {exc}"],
         )
+        extraction_failed = True
 
-    return _build_extraction_response(
+    response = _build_extraction_response(
         filename=file.filename or "",
         extracted_text=extracted,
         llm_output=llm_output,
         llm_warnings=list(llm_output.warnings),
     )
+    response.extraction_failed = extraction_failed
+    return response
 
 
 def _deck_stub_response() -> dict:
