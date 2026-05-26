@@ -185,3 +185,100 @@ def is_admin(user_id: Optional[str]) -> bool:
     if not user_id:
         return False
     return get_user_role(user_id) == "admin"
+
+
+# ---------- Phase 6: Google identity fetch ----------
+
+@dataclass(frozen=True)
+class GoogleIdentity:
+    """The bits of a user's Google identity the Gmail bootstrap
+    needs: the provider tokens + the granted scope set + the
+    user's Google email. All optional because Supabase may have
+    a row for the user but not the Google identity (e.g. they
+    signed up with email/password)."""
+    email: Optional[str]
+    provider_access_token: Optional[str]
+    provider_refresh_token: Optional[str]
+    scopes: list[str]
+
+
+def _parse_scopes(scope_value: object) -> list[str]:
+    """Supabase's identity_data.provider_token surface stores
+    granted scopes as a single space-delimited string; some SDKs
+    return a list. Normalize to a list."""
+    if isinstance(scope_value, list):
+        return [str(s) for s in scope_value if isinstance(s, str)]
+    if isinstance(scope_value, str):
+        return [s for s in scope_value.split() if s]
+    return []
+
+
+def fetch_google_identity(user_id: str) -> Optional[GoogleIdentity]:
+    """GET the Supabase user via the admin API, pluck out the
+    Google identity row's provider tokens + scopes + email.
+
+    Returns None when:
+      - Supabase is unconfigured (no URL / no service-role key)
+      - the user doesn't exist
+      - the user has no Google identity
+
+    Errors collapse to None on purpose -- the caller decides whether
+    to 409 (no refresh token) vs 403 (insufficient scope) vs 5xx,
+    and we don't want a transient network blip to look like a
+    permanent state change.
+    """
+    if not user_id:
+        return None
+    url, key = _supabase_env()
+    if not url or not key:
+        return None
+    try:
+        import httpx
+    except ImportError:
+        return None
+    endpoint = f"{url.rstrip('/')}/auth/v1/admin/users/{user_id}"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+        "Accept": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(endpoint, headers=headers)
+    except Exception:  # noqa: BLE001 - network failure -> None
+        return None
+    if resp.status_code >= 400:
+        return None
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(body, dict):
+        return None
+    identities = body.get("identities") or []
+    if not isinstance(identities, list):
+        return None
+    for identity in identities:
+        if not isinstance(identity, dict):
+            continue
+        if identity.get("provider") != "google":
+            continue
+        idata = identity.get("identity_data") or {}
+        if not isinstance(idata, dict):
+            idata = {}
+        return GoogleIdentity(
+            email=(
+                (idata.get("email") if isinstance(idata.get("email"), str) else None)
+                or (body.get("email") if isinstance(body.get("email"), str) else None)
+            ),
+            provider_access_token=(
+                idata.get("provider_token")
+                if isinstance(idata.get("provider_token"), str) else None
+            ),
+            provider_refresh_token=(
+                idata.get("provider_refresh_token")
+                if isinstance(idata.get("provider_refresh_token"), str) else None
+            ),
+            scopes=_parse_scopes(idata.get("scopes") or idata.get("scope")),
+        )
+    return None
