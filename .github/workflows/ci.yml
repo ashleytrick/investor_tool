@@ -8,9 +8,9 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    # Full suite takes ~6.5 minutes locally; 15 gives headroom for
-    # GHA cold starts + the e2e tests that subprocess-spawn the
-    # pipeline. Bumped from 5 (which cancelled every recent run).
+    # Suite runs in ~3-4 min on GHA's 2-core runner with xdist -n auto;
+    # 15 still gives headroom for cold cache + the e2e tests that
+    # subprocess-spawn the pipeline.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,17 @@ jobs:
           ANTHROPIC_API_KEY: ""
         run: |
           set +e
-          uv run pytest tests/ -v --tb=short -ra 2>&1 | tee pytest.log
+          # `-n auto` -- pytest-xdist fans the suite out across
+          # available CPU cores. On GHA's 2-core runners that's ~1.7x
+          # speedup; on a 4+ core developer machine 3x+. Each worker
+          # gets its own subprocess + tmp_path; tests are already
+          # isolated, so no extra orchestration is needed.
+          #
+          # `--tb=short -ra` keeps the same failure-output verbosity
+          # as before. `-q` replaces `-v` because xdist's per-worker
+          # output makes -v unreadable; the durations + failure tail
+          # are what reviewers actually scan.
+          uv run pytest tests/ -n auto -q --tb=short -ra --durations=15 2>&1 | tee pytest.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
             echo "::error::pytest exited $rc"

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REPO_ROOT, run_pipeline_through_stage_6, run_script
+from tests.conftest import REPO_ROOT, run_script
 
 # --- direct unit tests on schemas -------------------------------------
 
@@ -134,19 +134,25 @@ def test_render_framing_brief_full_shape() -> None:
 # --- integration: build via prep_brief.py through stub LLM ------------
 
 @pytest.fixture
-def scored_workspace(workspace: Path) -> Path:
-    """Run stages 1-6 so the workspace has partners + signals + scores
-    -- the surface area meeting_prep needs."""
-    run_pipeline_through_stage_6(workspace)
-    # Seed an outcome row so prep_brief auto-includes the LLM
-    # sections without explicit flags. We don't need the full Stage 7
-    # path; the script only reads outcomes.outreach_status.
+def scored_workspace(_scored_workspace_source: Path, tmp_path: Path) -> Path:
+    """Per-test copy of the session-cached post-stage-6 workspace,
+    with an outcome row pre-seeded for the meeting-prep auto-include
+    branch.
+
+    Was running stages 1-6 per-test until CI-perf landed; the
+    pipeline now runs ONCE per session (in conftest's
+    `_scored_workspace_source`), each test copytree's from that
+    cache, and only the per-test outcome seed runs here.
+    """
+    import shutil  # noqa: PLC0415 - module-level shutil already imported
+    dst = tmp_path / "test_workspace"
+    shutil.copytree(_scored_workspace_source, dst)
     _seed_outcome(
-        workspace / "data" / "pipeline.db",
+        dst / "data" / "pipeline.db",
         partner_id="northbeam.example_priya_anand",
         outreach_status="meeting_booked",
     )
-    return workspace
+    return dst
 
 
 def _seed_outcome(db: Path, *, partner_id: str, outreach_status: str) -> None:

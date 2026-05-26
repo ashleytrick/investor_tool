@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.conftest import REPO_ROOT, run_pipeline_through_stage_6, run_script
+from tests.conftest import REPO_ROOT, run_script
 
 
 # --- pure unit: filename --------------------------------------------------
@@ -289,19 +289,18 @@ def _seed_outcome(db: Path, *, partner_id: str, outreach_status: str) -> None:
 
 
 def test_prep_brief_renders_drive_sync_footer_when_scope_missing(
-    workspace: Path,
+    scored_workspace: Path,
 ) -> None:
     """End-to-end smoke: prep_brief.py must surface the Drive sync
     status even when the operator hasn't connected Google -- silent
     skips would hide the missing config from the operator."""
-    run_pipeline_through_stage_6(workspace)
     pid = "northbeam.example_priya_anand"
     _seed_outcome(
-        workspace / "data" / "pipeline.db",
+        scored_workspace / "data" / "pipeline.db",
         partner_id=pid, outreach_status="meeting_booked",
     )
     res = run_script(
-        "prep_brief.py", "--workspace", str(workspace),
+        "prep_brief.py", "--workspace", str(scored_workspace),
         "--partner-id", pid,
         cwd=REPO_ROOT,
     )
@@ -314,18 +313,17 @@ def test_prep_brief_renders_drive_sync_footer_when_scope_missing(
 
 
 def test_prep_brief_no_drive_push_flag_suppresses_footer(
-    workspace: Path,
+    scored_workspace: Path,
 ) -> None:
     """--no-drive-push opts out of the auto-push entirely; no Drive
     section appears in the brief."""
-    run_pipeline_through_stage_6(workspace)
     pid = "northbeam.example_priya_anand"
     _seed_outcome(
-        workspace / "data" / "pipeline.db",
+        scored_workspace / "data" / "pipeline.db",
         partner_id=pid, outreach_status="meeting_booked",
     )
     res = run_script(
-        "prep_brief.py", "--workspace", str(workspace),
+        "prep_brief.py", "--workspace", str(scored_workspace),
         "--partner-id", pid, "--no-drive-push",
         cwd=REPO_ROOT,
     )

@@ -35,4 +35,9 @@ api = [
 package = false
 dev-dependencies = [
     "pytest>=8.0",
+    # pytest-xdist parallelizes the smoke suite across CPU cores.
+    # On GHA's standard 2-core runner this is roughly 1.7x; locally
+    # on a 4+ core machine it's 3x+. Tests are already
+    # tmp_path-isolated so per-worker collisions don't happen.
+    "pytest-xdist>=3.6",
 ]
