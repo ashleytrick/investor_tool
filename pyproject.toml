@@ -58,3 +58,10 @@ dev-dependencies = [
     # tmp_path-isolated so per-worker collisions don't happen.
     "pytest-xdist>=3.6",
 ]
+
+[tool.pytest.ini_options]
+# -n auto: distribute tests across all CPU cores. The suite is
+# already tmp_path-isolated, so per-worker collisions don't happen.
+# Serial run is ~15 min on 805 tests; xdist drops it to a few min
+# on a multi-core host (and ~1.7x on GHA's 2-core runners).
+addopts = "-n auto"
