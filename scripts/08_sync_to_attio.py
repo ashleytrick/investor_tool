@@ -91,16 +91,61 @@ from core.attio.preserve import (  # noqa: E402,F401
 )
 
 
+def _record_company_record_ids(record: dict) -> list[str]:
+    """Extract target_record_id(s) from an Attio person record's
+    `company` field. The shape varies (single ref, list of refs,
+    nested under `value`); normalize to a list of strings."""
+    values = record.get("values") or {}
+    company_field = values.get("company") or record.get("company") or []
+    if isinstance(company_field, dict):
+        company_field = [company_field]
+    out: list[str] = []
+    for entry in company_field or []:
+        if not isinstance(entry, dict):
+            continue
+        # Common Attio shapes: {"target_record_id": "..."} OR
+        # {"value": {"target_record_id": "..."}}.
+        rid = entry.get("target_record_id")
+        if rid is None:
+            inner = entry.get("value") or {}
+            if isinstance(inner, dict):
+                rid = inner.get("target_record_id")
+        if rid:
+            out.append(str(rid))
+    return out
+
+
 def find_partner_record(client: AttioClient, person_object: str, *, email: str | None,
                         linkedin_url: str | None, name: str | None,
                         company_record_id: str | None) -> dict | None:
-    """Return existing person record by email -> linkedin_url -> name+company."""
+    """Return existing person record by email -> linkedin_url -> name+company.
+
+    The email step is scoped to `company_record_id` when one is
+    known: if the matched Attio Person belongs to a DIFFERENT
+    company, treat it as a non-match and fall through to the next
+    strategy. Without this scoping, an operator's personal Gmail
+    reused across funds would cross-link a partner row to the wrong
+    Attio Person.
+    """
     if email:
         results = client.query_records(person_object, {
             "email_addresses": email
-        }, limit=1)
+        }, limit=5)
         if results:
-            return results[0]
+            if company_record_id is None:
+                # No company context to scope -- accept the first hit
+                # (pre-fix behavior, used only when we have no fund
+                # context for the partner).
+                return results[0]
+            for r in results:
+                rec_companies = _record_company_record_ids(r)
+                if not rec_companies or company_record_id in rec_companies:
+                    # Either Attio hasn't linked a company yet
+                    # (we can claim it) or the linked company
+                    # matches -- safe to accept.
+                    return r
+            # Every hit belongs to a different company; fall through
+            # to linkedin / name+company so we don't cross-link.
     if linkedin_url:
         results = client.query_records(person_object, {
             "linkedin_url": linkedin_url
