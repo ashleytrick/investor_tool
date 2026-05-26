@@ -5,6 +5,11 @@ Domain: {DOMAIN}
 
 Below is content fetched from this fund's website. Extract the listed fields. Use only information present in the content. If a field is not present, return null. Do not infer from training data. Do not invent URLs.
 
+Important distinction for `current_partners`:
+- Include only people who appear to work at the fund or investment firm today: partners, investors, principals, associates, investment team, leadership, operating partners, platform/team members when the page presents them as fund staff.
+- Exclude portfolio-company founders/executives, advisors, mentors, LPs, customers, event speakers, quoted people, and author names unless the content explicitly identifies them as current fund staff.
+- If a page mixes fund staff and portfolio founders, keep portfolio founders in `portfolio_companies` context only; do not list them as `current_partners`.
+
 Return JSON matching this schema:
 {
   "thesis_summary": "one sentence in the fund's own language, or null",
