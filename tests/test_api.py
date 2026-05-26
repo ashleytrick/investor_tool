@@ -902,20 +902,21 @@ def test_sources_upload_is_idempotent_on_same_filename(
     assert len(hits) == 1
 
 
-def test_sources_upload_rejects_non_csv_extension(
+def test_sources_upload_rejects_non_csv_non_xlsx_extension(
     client: TestClient,
 ) -> None:
-    """A .xlsx or .json upload returns 400 -- Stage 1 only reads CSV
-    and silently saving a different format would leave the
-    operator wondering why no funds showed up."""
+    """A .json (or other unsupported) upload returns 400. .xlsx is
+    accepted via openpyxl conversion -- see
+    test_sources_upload_accepts_xlsx_and_converts_to_csv below."""
     res = client.post(
         "/pipeline/sources",
         headers=_auth_headers(),
-        files={"file": ("investors.xlsx", b"PK\x03\x04binary", "application/octet-stream")},
+        files={"file": ("investors.json", b'{"x":1}', "application/json")},
     )
     assert res.status_code == 400
     detail = res.json()["detail"]
-    assert ".csv" in detail["error"].lower()
+    # The error message references the supported extensions.
+    assert "csv" in detail["error"].lower() or "xlsx" in detail["error"].lower()
 
 
 def test_sources_upload_rejects_empty_file(client: TestClient) -> None:

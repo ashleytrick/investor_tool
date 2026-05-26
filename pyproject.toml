@@ -45,6 +45,11 @@ api = [
     # minimal library; python-jose adds JWS/JWE machinery we don't
     # need for symmetric-secret tokens.
     "PyJWT>=2.8",
+    # Symmetric encryption for CRM api_keys at rest (Fernet from
+    # core/crm_secrets.py). Pulled in transitively by google-auth
+    # today, but we depend on it directly -- declare explicitly so
+    # a future upstream drop doesn't silently break /crm/connect.
+    "cryptography>=42.0",
     "uvicorn[standard]>=0.30",
 ]
 

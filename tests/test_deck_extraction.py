@@ -221,7 +221,7 @@ def test_extract_endpoint_returns_documented_shape_for_pdf(
     res = client.post(
         "/config/company/extract-from-deck",
         headers=_auth_headers(),
-        files={"deck": ("acme.pdf", pdf_bytes, "application/pdf")},
+        files={"file": ("acme.pdf", pdf_bytes, "application/pdf")},
     )
     assert res.status_code == 200, res.text
     body = res.json()
@@ -261,7 +261,7 @@ def test_extract_endpoint_does_not_mutate_company_yaml(
     res = client.post(
         "/config/company/extract-from-deck",
         headers=_auth_headers(),
-        files={"deck": (
+        files={"file": (
             "acme.pptx", pptx_bytes,
             "application/vnd.openxmlformats-officedocument."
             "presentationml.presentation",
@@ -284,7 +284,7 @@ def test_extract_endpoint_then_manual_put_persists(
     ext = client.post(
         "/config/company/extract-from-deck",
         headers=_auth_headers(),
-        files={"deck": ("acme.pdf", pdf_bytes, "application/pdf")},
+        files={"file": ("acme.pdf", pdf_bytes, "application/pdf")},
     ).json()
     # Operator reviews + edits: fill in the required fields the
     # extraction didn't get to.
@@ -317,7 +317,7 @@ def test_extract_endpoint_unsupported_file_returns_clean_warnings(
     res = client.post(
         "/config/company/extract-from-deck",
         headers=_auth_headers(),
-        files={"deck": ("notes.docx", b"not a deck", "application/octet-stream")},
+        files={"file": ("notes.docx", b"not a deck", "application/octet-stream")},
     )
     assert res.status_code == 200, res.text
     body = res.json()
@@ -335,7 +335,7 @@ def test_extract_endpoint_empty_upload_returns_400(
     res = client.post(
         "/config/company/extract-from-deck",
         headers=_auth_headers(),
-        files={"deck": ("empty.pdf", b"", "application/pdf")},
+        files={"file": ("empty.pdf", b"", "application/pdf")},
     )
     assert res.status_code == 400, res.text
 
@@ -354,7 +354,7 @@ def test_extract_endpoint_requires_auth() -> None:
     cli = TestClient(api_mod.app)
     res = cli.post(
         "/config/company/extract-from-deck",
-        files={"deck": ("x.pdf", b"%PDF-1.4\n", "application/pdf")},
+        files={"file": ("x.pdf", b"%PDF-1.4\n", "application/pdf")},
     )
     assert res.status_code == 401
 
