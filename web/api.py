@@ -315,8 +315,10 @@ app.add_middleware(
 # pipeline-runner clusters into their own routers using the same
 # pattern. Endpoints not yet extracted remain inline below.
 from web.routers.google import router as google_router  # noqa: E402
+from web.routers.admin import router as admin_router  # noqa: E402
 
 app.include_router(google_router)
+app.include_router(admin_router)
 
 
 @app.get("/", include_in_schema=False)
