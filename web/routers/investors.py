@@ -460,6 +460,14 @@ def capture_investor(
             last_updated=now,
         ))
 
+        # FR-3: seed the sequence row so the daily build loop has
+        # something to advance. body.cadence_key is currently
+        # informational (FR-3 only tracks ONE active sequence per
+        # partner regardless of warm/cold path; the per-key cadence
+        # config is FR-7's parallel-channel work).
+        from web.routers.sequences import seed_sequence_for_partner
+        seed_sequence_for_partner(conn, partner_id=partner_id)
+
     return InvestorCaptureResult(
         status="created",
         partner_id=partner_id,
