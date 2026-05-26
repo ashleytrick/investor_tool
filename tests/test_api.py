@@ -273,6 +273,61 @@ def test_cors_preflight_responds_to_configured_origin(client: TestClient) -> Non
     )
 
 
+def test_cors_regex_matches_ephemeral_preview_origin(
+    workspace_with_one_pending_draft: Path, monkeypatch,
+) -> None:
+    """Use case: a frontend host like Lovable rotates preview URLs
+    per session (e.g. https://abcd--<project>.lovableproject.com).
+    CORS_ORIGIN_REGEX should let those through without an env-var
+    update each time, while a different-shape origin still gets
+    refused so the regex isn't an effective wildcard.
+    """
+    import importlib
+
+    monkeypatch.setenv("API_KEY", "test-api-key")
+    monkeypatch.setenv(
+        "INVESTOR_WORKSPACE", str(workspace_with_one_pending_draft),
+    )
+    # Empty exact-list + a regex that matches Lovable's pattern.
+    monkeypatch.setenv("CORS_ORIGINS", "")
+    monkeypatch.setenv(
+        "CORS_ORIGIN_REGEX",
+        r"https://([a-z0-9-]+--)?abc123\.(lovable\.app|lovableproject\.com)",
+    )
+    import web.api as api_mod
+    importlib.reload(api_mod)
+    cli = TestClient(api_mod.app)
+
+    # An ephemeral preview origin matching the project id.
+    res = cli.options(
+        "/review/pending",
+        headers={
+            "Origin": "https://session-id-99--abc123.lovableproject.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Authorization",
+        },
+    )
+    assert res.status_code in (200, 204)
+    assert (
+        res.headers.get("access-control-allow-origin")
+        == "https://session-id-99--abc123.lovableproject.com"
+    )
+
+    # A different project id at the same host shape must NOT pass.
+    res = cli.options(
+        "/review/pending",
+        headers={
+            "Origin": "https://different-project.lovableproject.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Authorization",
+        },
+    )
+    # Starlette returns 400 (or no allow-origin header) on a CORS
+    # preflight that doesn't match. Either shape is a refusal.
+    if res.status_code in (200, 204):
+        assert res.headers.get("access-control-allow-origin") is None
+
+
 # ---------- OpenAPI spec for Lovable ----------
 
 def test_openapi_spec_lists_all_8_documented_endpoints(client: TestClient) -> None:

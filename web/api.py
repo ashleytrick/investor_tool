@@ -227,12 +227,32 @@ app = FastAPI(
     ),
 )
 
-# CORS: comma-separated origins via env, default "*" for local dev.
-# Production should set CORS_ORIGINS to the exact frontend origin.
-_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")]
+# CORS allow-list. Two env vars, used together:
+#
+#   CORS_ORIGINS         comma-separated exact origins.
+#   CORS_ORIGIN_REGEX    optional regex matched against the Origin
+#                        header. Use when the frontend host generates
+#                        ephemeral preview URLs (e.g. Lovable spawns
+#                        a new `*--<project-id>.lovableproject.com`
+#                        per session). Browser-sent origin = scheme
+#                        + host only -- regex must NOT include path.
+#
+# starlette OR's the two: a request matches if its origin is in the
+# explicit list OR matches the regex.
+#
+# Wildcard fallback ("*") fires ONLY when neither env var is set --
+# typical local-dev shape. Production must pin one or both; a regex
+# combined with an empty explicit list is the right pattern for a
+# host like Lovable.
+_origins_raw = os.environ.get("CORS_ORIGINS", "")
+_origins = [o.strip() for o in _origins_raw.split(",") if o.strip()]
+_origin_regex = os.environ.get("CORS_ORIGIN_REGEX") or None
+if not _origins and not _origin_regex:
+    _origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
+    allow_origin_regex=_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
