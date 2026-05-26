@@ -30,7 +30,7 @@ from typing import Any, Iterator
 
 from sqlalchemy.engine import Engine
 
-from core.backups import backup_before_stage
+from core.backups import backup_before_stage, pre_migration_backup
 from core.banner import print_banner
 from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
@@ -97,14 +97,21 @@ def operator_command_run(
     ws = load_workspace(getattr(args, "workspace", None))
     if not skip_banner:
         print_banner(ws, stage=stage)
-    engine = get_engine(ws.db_url)
-
+    # Acquire the workspace lock BEFORE get_engine() so two operator
+    # commands can't race against the same ALTER TABLE / migration
+    # backfill on a real workspace DB.
     try:
         _lock_cm = workspace_lock(ws.path, stage=stage)
         _lock_cm.__enter__()
     except RunLockBusy as exc:
         print(f"[{stage}] REFUSED: {exc}")
         raise SystemExit(int(StageResult.OPERATIONAL_FAILURE))
+
+    # Snapshot the DB before get_engine() runs migrations. No-op on
+    # a fresh workspace; gives operator-upgraded workspaces a tagged
+    # pre_migration backup. Must be inside the lock.
+    pre_migration_backup(ws.path, db_path=ws.db_path)
+    engine = get_engine(ws.db_url)
 
     if not skip_backup:
         backup_before_stage(ws.path, stage=stage, db_path=ws.db_path)

@@ -126,6 +126,44 @@ def backup_before_stage(
     return out
 
 
+def pre_migration_backup(ws_path: Path, *, db_path: Path) -> Path | None:
+    """Snapshot the DB before get_engine() runs migrations / ALTER
+    TABLE / backfill statements. Returns the backup path on success,
+    None when there's nothing to back up (fresh workspace, no DB on
+    disk yet) or the copy failed.
+
+    Distinct from `backup_before_stage` because:
+      - it must happen BEFORE the workspace lock is acquired in a
+        way that's safe for the migration step that runs inside
+        get_engine() -- callers take the lock, then call this, then
+        call get_engine();
+      - the tag ("pre_migration") is unique so the restore CLI can
+        list "what did the DB look like immediately before today's
+        migrations touched it?"
+
+    A backup failure here prints a loud WARN but does NOT block.
+    Migrations on a tiny SQLite are inherently low-risk; the value
+    is operator confidence in a recovery story, not preventing the
+    failure.
+    """
+    if not Path(db_path).exists():
+        return None
+    backups_dir = _backups_dir(ws_path)
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    out = backup_path_for(ws_path, "pre_migration", _ts())
+    try:
+        shutil.copy2(db_path, out)
+    except OSError as exc:
+        print(
+            f"[backups] WARN: pre-migration backup failed: {exc}. "
+            f"Continuing; the operator can hand-copy the DB before "
+            f"re-running if they want."
+        )
+        return None
+    _rotate(ws_path, "pre_migration")
+    return out
+
+
 def _rotate(ws_path: Path, stage: str) -> int:
     """Drop oldest backups for this (workspace, stage) so we keep at
     most BACKUP_KEEP_PER_STAGE. Returns count removed."""

@@ -361,20 +361,43 @@ def main() -> int:
                     run.fail(f.fund_id, "AttioError", str(exc))
 
         # ---- 2) Sync partners as people, top-N by send_now_priority ----
+        # Selection policy:
+        #   * In --require-ready-to-send mode (= production), the
+        #     useful top N is the top N **approved live drafts** by
+        #     score -- a workspace where only 5 of the top 25 by raw
+        #     score are approved should still sync the actual N
+        #     approved partners, not just whichever of the top 25
+        #     happened to be approved.
+        #   * Outside that mode (operator-explicit override / dev
+        #     fixtures), keep the historical "top N by score then
+        #     filter later" shape so a workspace with no approvals
+        #     still gets a CRM picture.
         with engine.begin() as conn:
-            partner_rows = list(conn.execute(
-                select(
-                    partner_score_summaries,
-                    partners.c.name.label("partner_name"),
-                    partners.c.title,
-                    partners.c.linkedin_url,
-                    partners.c.warm_path_available,
-                    partners.c.warm_path_contact,
-                    partners.c.fund_id,
-                    partners.c.email.label("partner_email"),
-                    partners.c.attio_record_id.label("known_attio_id"),
+            base_select = select(
+                partner_score_summaries,
+                partners.c.name.label("partner_name"),
+                partners.c.title,
+                partners.c.linkedin_url,
+                partners.c.warm_path_available,
+                partners.c.warm_path_contact,
+                partners.c.fund_id,
+                partners.c.email.label("partner_email"),
+                partners.c.attio_record_id.label("known_attio_id"),
+            ).join(
+                partners,
+                partners.c.partner_id == partner_score_summaries.c.partner_id,
+            )
+            if require_ready_to_send:
+                base_select = base_select.join(
+                    email_drafts,
+                    email_drafts.c.partner_id == partners.c.partner_id,
+                ).where(
+                    email_drafts.c.is_recommended.is_(True),
+                    email_drafts.c.approval_status == "approved_to_send",
+                    email_drafts.c.superseded_at.is_(None),
                 )
-                .join(partners, partners.c.partner_id == partner_score_summaries.c.partner_id)
+            partner_rows = list(conn.execute(
+                base_select
                 .order_by(partner_score_summaries.c.send_now_priority.desc())
                 .limit(args.top)
             ))

@@ -60,7 +60,7 @@ from typing import Any, Iterator, Optional
 
 from sqlalchemy.engine import Engine
 
-from core.backups import backup_before_stage
+from core.backups import backup_before_stage, pre_migration_backup
 from core.banner import print_banner
 from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
@@ -159,12 +159,10 @@ def stage_run(
     """
     ws = load_workspace(getattr(args, "workspace", None))
     print_banner(ws, stage=stage)
-    engine = get_engine(ws.db_url)
-    # Slice 4: workspace run-lock. Refuse to start a stage when
-    # another stage is already running against the same workspace --
-    # prevents SQLite races + corrupted exports. Read-only / status
-    # callers skip via skip_preflight (those use `Workspace` without
-    # opening RunLogger / writing).
+    # Slice 4 + post-PR-28 migration-safety review: acquire the
+    # workspace lock BEFORE get_engine() so two stages can't race
+    # against the same SQLite ALTER TABLE / migration backfill.
+    # Read-only callers skip via skip_preflight.
     if not skip_preflight:
         try:
             _lock_cm = workspace_lock(ws.path, stage=stage)
@@ -176,6 +174,14 @@ def stage_run(
             raise SystemExit(int(StageResult.OPERATIONAL_FAILURE))
     else:
         _lock_cm = None
+    # Snapshot the DB BEFORE get_engine() can run migrations against
+    # a real workspace. On a fresh workspace this is a no-op (no DB
+    # file yet); on an upgraded workspace it gives the operator a
+    # tagged pre_migration snapshot to restore from. Must run inside
+    # the workspace lock so we don't race a concurrent writer.
+    if not skip_preflight:
+        pre_migration_backup(ws.path, db_path=ws.db_path)
+    engine = get_engine(ws.db_url)
     # Slice 5: pre-stage SQLite backup for destructive stages. The
     # whitelist lives in core.backups.stages_needing_backup; a
     # backup failure prints a WARN and continues (backups are
