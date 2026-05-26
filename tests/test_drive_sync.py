@@ -304,11 +304,11 @@ def test_prep_brief_renders_drive_sync_footer_when_scope_missing(
         "--partner-id", pid,
         cwd=REPO_ROOT,
     )
-    # The footer surfaces both attempted artifacts with their skip
-    # reason. Operator sees exactly why no docs were pushed.
+    # The footer surfaces the dossier push attempt with its skip
+    # reason. (Build Session 16 collapsed objection_map +
+    # framing_brief into the dossier; only one artifact remains.)
     assert "## Drive sync" in res.stdout
-    assert "objection_map: skipped" in res.stdout
-    assert "framing_brief: skipped" in res.stdout
+    assert "investor_dossier: skipped" in res.stdout
     assert "drive scope" in res.stdout.lower()
 
 
