@@ -90,13 +90,17 @@ def main() -> int:
                 email_drafts.c.is_recommended.is_(True),
             ).order_by(desc(email_drafts.c.draft_id)).limit(1)
         ).first()
+        # Slice 17 follow-up (#17): live (non-superseded) row only.
         followup = conn.execute(
-            select(followup_drafts).where(followup_drafts.c.partner_id == pid)
-            .order_by(desc(followup_drafts.c.followup_id)).limit(1)
+            select(followup_drafts).where(
+                followup_drafts.c.partner_id == pid,
+                followup_drafts.c.superseded_at.is_(None),
+            ).order_by(desc(followup_drafts.c.followup_id)).limit(1)
         ).first()
         deck = conn.execute(
             select(deck_request_responses).where(
-                deck_request_responses.c.partner_id == pid
+                deck_request_responses.c.partner_id == pid,
+                deck_request_responses.c.superseded_at.is_(None),
             ).order_by(desc(deck_request_responses.c.response_id)).limit(1)
         ).first()
 

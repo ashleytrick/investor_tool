@@ -128,35 +128,34 @@ def test_full_pipeline_end_to_end():
         _run("07_generate_emails.py", "--workspace", ws, "--top", "5", cwd=REPO_ROOT)
 
         new_counts = _counts(db)
-        # email_drafts is excluded from raw-count idempotency: Slice 17
-        # preserves prior generations (superseded_at IS NOT NULL) instead
-        # of deleting them, so the row total doubles on each Stage 7
-        # re-run by design. The LIVE row count (superseded_at IS NULL)
-        # IS still idempotent and is checked separately below.
+        # email_drafts / followup_drafts / deck_request_responses are
+        # excluded from raw-count idempotency: Slice 17 + #17 follow-up
+        # preserve prior generations (superseded_at IS NOT NULL) instead
+        # of deleting them, so each of those totals doubles on every
+        # Stage 7 re-run by design. The LIVE row count (superseded_at IS
+        # NULL) IS still idempotent and is checked separately below.
         for table in ("funds", "partners", "signals", "deal_attributions",
-                      "partner_score_summaries", "source_snapshots",
-                      "followup_drafts", "deck_request_responses"):
+                      "partner_score_summaries", "source_snapshots"):
             assert new_counts[table] == counts[table], (
                 f"idempotency broken on {table}: was {counts[table]}, now {new_counts[table]}"
             )
         c = sqlite3.connect(db)
-        live_drafts = c.execute(
-            "select count(*) from email_drafts where superseded_at is null"
-        ).fetchone()[0]
-        superseded_drafts = c.execute(
-            "select count(*) from email_drafts where superseded_at is not null"
-        ).fetchone()[0]
+        for table in ("email_drafts", "followup_drafts", "deck_request_responses"):
+            live = c.execute(
+                f"select count(*) from {table} where superseded_at is null"
+            ).fetchone()[0]
+            superseded = c.execute(
+                f"select count(*) from {table} where superseded_at is not null"
+            ).fetchone()[0]
+            assert live == counts[table], (
+                f"live {table} changed across runs: "
+                f"first={counts[table]} now_live={live}"
+            )
+            assert superseded == counts[table], (
+                f"superseded {table} count != prior live count: "
+                f"superseded={superseded} prior_live={counts[table]}"
+            )
         c.close()
-        # Live count matches the original (the new generation replaces
-        # the prior live set); the original 10 drafts are now superseded.
-        assert live_drafts == counts["email_drafts"], (
-            f"live email_drafts changed across runs: "
-            f"first={counts['email_drafts']} now_live={live_drafts}"
-        )
-        assert superseded_drafts == counts["email_drafts"], (
-            f"superseded count != prior live count: "
-            f"superseded={superseded_drafts} prior_live={counts['email_drafts']}"
-        )
 
 
 

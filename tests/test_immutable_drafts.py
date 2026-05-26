@@ -185,3 +185,49 @@ def test_list_draft_history_shows_all_versions():
         max_super = max(r["version"] for r in super_)
         min_live = min(r["version"] for r in live)
         assert min_live > max_super
+
+
+def test_followup_and_deck_supersede_on_stage7_rerun():
+    """Slice 17 follow-up (#17): followup_drafts and
+    deck_request_responses are now also versioned -- Stage 7 re-runs
+    supersede instead of delete, preserving the prior generation for
+    audit."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+        _stage7(ws)
+        c = sqlite3.connect(db)
+        first_fu = c.execute("select count(*) from followup_drafts").fetchone()[0]
+        first_dk = c.execute("select count(*) from deck_request_responses").fetchone()[0]
+        c.close()
+        assert first_fu > 0
+        assert first_dk > 0
+        _stage7(ws)
+        c = sqlite3.connect(db)
+        # Live count stays the same, total doubles.
+        fu_total = c.execute("select count(*) from followup_drafts").fetchone()[0]
+        fu_live = c.execute(
+            "select count(*) from followup_drafts where superseded_at is null"
+        ).fetchone()[0]
+        dk_total = c.execute("select count(*) from deck_request_responses").fetchone()[0]
+        dk_live = c.execute(
+            "select count(*) from deck_request_responses where superseded_at is null"
+        ).fetchone()[0]
+        # Version monotonicity: every live row's version > every
+        # superseded row's version for the same partner.
+        fu_violations = c.execute(
+            "select count(*) from followup_drafts a join followup_drafts b "
+            "on a.partner_id=b.partner_id "
+            "where a.superseded_at is not null and b.superseded_at is null "
+            "  and a.version >= b.version"
+        ).fetchone()[0]
+        c.close()
+        assert fu_total == first_fu * 2
+        assert fu_live == first_fu
+        assert dk_total == first_dk * 2
+        assert dk_live == first_dk
+        assert fu_violations == 0
