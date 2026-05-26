@@ -48,12 +48,23 @@ def _hook_secret_required(
     """Cron-hook auth: shared secret in X-Hook-Secret. Without
     `HOOK_SECRET` set in env, every request is refused (fail-
     closed; we don't want an unset secret to silently allow
-    anonymous polling)."""
+    anonymous polling).
+
+    Post-#5-fixup: both misconfiguration (env unset) and
+    auth-failure (wrong/missing header) return 401 -- the
+    previous differential status code (500 vs 401) let an
+    unauthenticated prober fingerprint operator config.
+    Misconfiguration still gets logged at warning so the
+    operator notices it in logs.
+    """
     expected = os.environ.get("HOOK_SECRET") or ""
     if not expected:
-        raise HTTPException(
-            500, "HOOK_SECRET env var unset; hook endpoints disabled",
+        import logging
+        logging.getLogger("uvicorn.error").warning(
+            "HOOK_SECRET env var unset; rejecting cron-hook call "
+            "(set HOOK_SECRET on Fly to enable scheduled polling)"
         )
+        raise HTTPException(401, "invalid hook secret")
     if not x_hook_secret or not hmac.compare_digest(x_hook_secret, expected):
         raise HTTPException(401, "invalid hook secret")
 
@@ -110,18 +121,39 @@ class CRMPollHookResult(BaseModel):
 def _iter_tenants_for_hook() -> list[pathlib.Path]:
     """Per-user workspaces under WORKSPACES_ROOT, OR the single
     pinned workspace in legacy mode. Hook endpoints use this so
-    pre-Phase-2a deployments keep working unchanged."""
+    pre-Phase-2a deployments keep working unchanged.
+
+    Post-#2-fixup: returns [] cleanly on cold start. Previously
+    if neither WORKSPACE_PER_USER was on (or it was but the
+    directory hadn't been created yet) AND INVESTOR_WORKSPACE
+    was unset, `_ws_path()` raised HTTPException(500) and the
+    cron hook 500'd the scheduler instead of doing a quiet
+    no-op poll.
+    """
     from web.routers.admin import _iter_tenant_workspaces
     tenants = _iter_tenant_workspaces()
-    if not tenants:
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            return [ws_dir]
-    return tenants
+    if tenants:
+        return tenants
+    # Legacy single-workspace fallback. _ws_path() raises 500
+    # when the env var is unset -- catch and degrade to "no
+    # tenants to poll" so a freshly-deployed app with no
+    # WORKSPACES_ROOT yet doesn't ring the operator's pager.
+    try:
+        legacy_path = _ws_path()
+    except HTTPException:
+        return []
+    ws_dir = pathlib.Path(legacy_path)
+    return [ws_dir] if ws_dir.exists() else []
 
 
 def _run_gmail_hook(poll_fn, result_cls):
-    """Shared body for poll-gmail-sent / poll-gmail-replies."""
+    """Shared body for poll-gmail-sent / poll-gmail-replies.
+
+    Post-#3-fixup: poll_fn itself is wrapped in try/except so a
+    bug or unexpected raise from the polling helper doesn't
+    tank the whole scatter-gather. One bad tenant lands as a
+    PollResult with an error string; the rest still poll.
+    """
     from core.config_loader import load_workspace as _load_workspace
     results: list[PollResult] = []
     total = 0
@@ -135,7 +167,15 @@ def _run_gmail_hook(poll_fn, result_cls):
                 error=f"load_workspace_failed: {exc}",
             ))
             continue
-        r = poll_fn(ws)
+        try:
+            r = poll_fn(ws)
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=str(ws_dir),
+                inserted=0,
+                error=f"poll_failed: {exc}",
+            ))
+            continue
         results.append(PollResult(
             workspace=r.workspace,
             inserted=r.inserted,
@@ -150,7 +190,12 @@ def _run_gmail_hook(poll_fn, result_cls):
 def _run_crm_hook(poll_fn) -> CRMPollHookResult:
     """Shared body for all five CRM hooks (B6/B7/B8). poll_fn
     returns a list of PollResult-shaped (workspace, provider,
-    inserted, error) per provider for the given tenant."""
+    inserted, error) per provider for the given tenant.
+
+    Post-#3-fixup: poll_fn is wrapped in try/except so a provider
+    client that raises (rather than returning a PollResult with
+    error set) doesn't 500 the entire scatter-gather.
+    """
     from core.config_loader import load_workspace as _load_workspace
     flat: list[CRMPollProviderResult] = []
     total = 0
@@ -164,7 +209,16 @@ def _run_crm_hook(poll_fn) -> CRMPollHookResult:
                 error=f"load_workspace_failed: {exc}",
             ))
             continue
-        for r in poll_fn(ws):
+        try:
+            poll_results = list(poll_fn(ws))
+        except Exception as exc:  # noqa: BLE001
+            flat.append(CRMPollProviderResult(
+                workspace=str(ws_dir), provider="(unknown)",
+                inserted=0,
+                error=f"poll_failed: {exc}",
+            ))
+            continue
+        for r in poll_results:
             flat.append(CRMPollProviderResult(
                 workspace=r.workspace, provider=r.provider,
                 inserted=r.inserted, error=r.error,

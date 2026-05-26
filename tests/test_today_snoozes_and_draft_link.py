@@ -103,6 +103,43 @@ def test_today_excludes_snoozed_drafts_added_after_picks_materialize(
     assert all(t["draft_id"] != victim["draft_id"] for t in today_after)
 
 
+def test_today_refills_when_every_pick_is_snoozed_but_more_drafts_exist(
+    workspace_with_drafts: Path, client,
+) -> None:
+    """Post-#1-fixup regression test: when the operator snoozes
+    every materialized today_pick, /today must fall through and
+    surface next-best non-snoozed reviewable drafts. Previously
+    (PR #85) `if raw_existing:` branching stranded the queue
+    empty for the rest of the day."""
+    # Force pace=1 so the materialization picks exactly 1 row.
+    res = client.post(
+        "/settings/send-pace", json={"value": 1}, headers=_auth(),
+    )
+    assert res.status_code == 200
+    initial = client.get("/today", headers=_auth()).json()
+    if len(initial) < 1:
+        pytest.skip("fixture didn't materialize a pick to snooze")
+    victim = initial[0]
+    # Confirm there are more reviewable drafts available than the 1
+    # we just materialized -- otherwise the test isn't exercising
+    # the "more drafts exist" case.
+    pending = client.get("/review/pending", headers=_auth()).json()
+    if len(pending) < 2:
+        pytest.skip("fixture has fewer than 2 reviewable drafts")
+    # Snooze the only picked one.
+    client.post(
+        f"/snoozes/{victim['draft_id']}",
+        json={"snoozed_until": _future_iso(48)},
+        headers=_auth(),
+    )
+    # Re-fetch /today with pace=1 -- the snoozed pick should be
+    # gone AND a fresh non-snoozed draft should take its place.
+    refill = client.get("/today", headers=_auth()).json()
+    assert all(p["draft_id"] != victim["draft_id"] for p in refill), (
+        "snoozed draft leaked back"
+    )
+
+
 def test_clearing_snooze_brings_draft_back_to_today(client) -> None:
     today_before = client.get("/today", headers=_auth()).json()
     if not today_before:

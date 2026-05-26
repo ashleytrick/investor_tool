@@ -262,7 +262,11 @@ def test_hook_rejects_wrong_secret(workspace, monkeypatch) -> None:
     assert res.status_code == 401
 
 
-def test_hook_returns_500_when_secret_env_unset(workspace, monkeypatch) -> None:
+def test_hook_returns_401_when_secret_env_unset(workspace, monkeypatch) -> None:
+    """Post-#5-fixup: missing HOOK_SECRET returns 401 (not 500) so
+    an unauthenticated prober can't fingerprint operator
+    misconfiguration via the differential status code. The
+    operator still notices via a warning log line."""
     monkeypatch.delenv("HOOK_SECRET", raising=False)
     client = _client_for_workspace(workspace, monkeypatch, hook_secret="")
     monkeypatch.delenv("HOOK_SECRET", raising=False)  # ensure unset
@@ -270,9 +274,9 @@ def test_hook_returns_500_when_secret_env_unset(workspace, monkeypatch) -> None:
         "/api/public/hooks/poll-gmail-sent",
         headers={"X-Hook-Secret": "anything"},
     )
-    # The auth path checks HOOK_SECRET at request time; without it
-    # the endpoint is intentionally disabled to fail closed.
-    assert res.status_code == 500
+    # 401 fail-closed; matches the wrong-secret path. Both 401 means
+    # the prober can't distinguish env-unset from wrong-key.
+    assert res.status_code == 401
 
 
 def test_hook_polls_single_workspace_in_legacy_mode(workspace, monkeypatch) -> None:
