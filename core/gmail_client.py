@@ -72,9 +72,6 @@ class GmailClient:
         token_path = ws.path / ".gmail_token.json"
         if not token_path.exists():
             raise FileNotFoundError(str(token_path))
-        # credentials_path is left pointing at the conventional spot
-        # so any future write-path that does need it gets a clear
-        # error rather than silently misbehaving.
         return cls(
             credentials_path=ws.path / ".gmail_credentials.json",
             token_path=token_path,
@@ -185,6 +182,81 @@ class GmailClient:
                 "recipient_email": recipient_email,
                 "subject": headers.get("subject"),
                 "body_snippet": full.get("snippet") or None,
+            })
+        return out
+
+    def list_replies_since(
+        self, after: "object", *, thread_ids: list[str] | None = None,
+    ) -> list[dict]:
+        """List Gmail INBOX messages with internalDate >= `after`,
+        optionally restricted to a known set of thread IDs (i.e.
+        only fetch replies in conversations we've sent into).
+
+        Returns the same dict shape as `list_sent_since` plus an
+        `is_reply` flag (always True here; preserved for symmetry)
+        and `unread` (Gmail's UNREAD label).
+        """
+        import datetime as _dt
+        if isinstance(after, _dt.datetime):
+            unix_ts = int(after.timestamp())
+        else:
+            unix_ts = int(after)
+        q = f"in:inbox after:{unix_ts}"
+        try:
+            list_resp = self.service.users().messages().list(
+                userId="me", q=q, maxResults=200,
+            ).execute()
+        except Exception as exc:  # noqa: BLE001
+            raise GmailError(f"messages.list failed: {exc}") from exc
+        msg_refs = list_resp.get("messages") or []
+        tracked: set[str] | None = (
+            set(thread_ids) if thread_ids else None
+        )
+        out: list[dict] = []
+        for ref in msg_refs:
+            msg_id = ref.get("id")
+            if not msg_id:
+                continue
+            try:
+                full = self.service.users().messages().get(
+                    userId="me", id=msg_id, format="metadata",
+                    metadataHeaders=[
+                        "Message-ID", "From", "To", "Subject",
+                        "Date", "In-Reply-To", "References",
+                    ],
+                ).execute()
+            except Exception:  # noqa: BLE001
+                continue
+            thread_id = full.get("threadId")
+            if tracked is not None and thread_id not in tracked:
+                continue
+            payload = full.get("payload") or {}
+            headers = {
+                (h.get("name") or "").lower(): (h.get("value") or "")
+                for h in (payload.get("headers") or [])
+            }
+            internal_ms = full.get("internalDate")
+            try:
+                occurred_at = _dt.datetime.fromtimestamp(
+                    int(internal_ms) / 1000, tz=_dt.timezone.utc,
+                )
+            except (TypeError, ValueError):
+                continue
+            external_id = headers.get("message-id") or msg_id
+            sender = _extract_first_email(headers.get("from") or "")
+            label_ids = set(full.get("labelIds") or [])
+            out.append({
+                "external_id": external_id,
+                "thread_id": thread_id,
+                "occurred_at": occurred_at,
+                # For replies, the partner is the *sender*. Store
+                # it in the same recipient_email field so callers
+                # don't have to branch on event_type.
+                "recipient_email": sender,
+                "subject": headers.get("subject"),
+                "body_snippet": full.get("snippet") or None,
+                "unread": "UNREAD" in label_ids,
+                "is_reply": True,
             })
         return out
 
