@@ -180,6 +180,14 @@ partners = Table(
     Column("linkedin_url", Text),
     Column("twitter_handle", Text),
     Column("bio", Text),
+    # Frontend Requirements #6 + §8: per-investor channel
+    # preference for outreach. Defaults to 'email'; the
+    # PUT /investors/{partner_id}/channel endpoint flips it.
+    # Valid values: 'email' | 'linkedin' | 'both'.
+    Column("channel_pref", Text, default="email"),
+    # Frontend Requirements #6: how this partner row was created.
+    # Values: 'qr' | 'manual' | 'import' | (NULL = legacy/stage 2).
+    Column("source", Text),
     Column("employment_status", Text, default="uncertain"),
     Column("employment_verification_source_urls", Text),
     Column("employment_verification_date", Date),
