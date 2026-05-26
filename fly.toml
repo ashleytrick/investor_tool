@@ -1,18 +1,27 @@
-# Fly.io deployment config for the operator web UI.
+# Fly.io deployment config for the Investor Outreach API backend
+# (the React frontend `awesome_investor_tool` calls into it).
 #
-# `app` is the unique Fly app name -- change before first `fly launch`
-# / `fly deploy` so it doesn't collide with someone else's.
+# `app` is the unique Fly app name -- change before first
+# `fly launch` / `fly deploy` so it doesn't collide with someone
+# else's. Then run `fly apps rename` if you've already created an
+# app under a different name.
 #
-# The persistent SQLite workspace lives on a volume mounted at /data
-# so the DB survives restarts and deploys. INVESTOR_WORKSPACE points
-# the UI at /data/workspace, which the operator seeds via `fly ssh`
-# (see web/README.md).
+# The persistent SQLite workspace lives on a volume mounted at
+# /data so the DB survives restarts and deploys. INVESTOR_WORKSPACE
+# points the API at /data/workspace, which the operator seeds via
+# `fly ssh` (see web/README.md).
+#
+# Secrets to set BEFORE `fly deploy`:
+#   fly secrets set API_KEY=$(openssl rand -hex 32)
+#   fly secrets set CORS_ORIGINS=https://app.your-domain.com
+#   fly secrets set ANTHROPIC_API_KEY=...   # if pipelines run here
+#   fly secrets set ATTIO_API_KEY=...       # if Stage 8 runs here
 #
 # Free tier sizing: shared-cpu-1x / 256 MB / 3 GB volume is within
 # the Fly free allotment. Bump the VM if Stage 7 / Stage 8 needs
 # more memory.
 
-app = "investor-outreach-ui"  # CHANGE ME before first deploy
+app = "investor-outreach-api"  # CHANGE ME before first deploy
 primary_region = "iad"
 
 [build]
@@ -20,9 +29,11 @@ dockerfile = "Dockerfile"
 
 [env]
 INVESTOR_WORKSPACE = "/data/workspace"
-APP_OPERATOR = "web-operator"
-# APP_PASSWORD is set via `fly secrets set APP_PASSWORD=...` (NOT here).
-# Same for ANTHROPIC_API_KEY, ATTIO_API_KEY, etc.
+API_OPERATOR = "api-client"
+# Note: API_KEY + CORS_ORIGINS are set via `fly secrets set` (NOT
+# here). Same for ANTHROPIC_API_KEY, ATTIO_API_KEY. Anything in
+# this [env] block is committed in plaintext, so secrets must NOT
+# live here.
 
 [mounts]
 source = "investor_workspace"
