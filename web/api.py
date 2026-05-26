@@ -1101,6 +1101,47 @@ def _sanitize_sources_filename(name: str) -> str:
     return f"{stem}.csv"
 
 
+def _xlsx_to_csv_bytes(content: bytes) -> bytes:
+    """Convert an uploaded .xlsx workbook to CSV bytes (UTF-8).
+
+    Reads the first worksheet only -- OpenVC and similar investor
+    exports use a single sheet; multi-sheet workbooks aren't a
+    documented input format. Headers are lowercased on the way out
+    so a sheet whose first row is "Name,Domain" lands as
+    "name,domain" -- which is what `scripts/01_aggregate_sources.py`
+    expects.
+    """
+    import csv  # noqa: PLC0415
+    import io
+    from openpyxl import load_workbook  # noqa: PLC0415
+
+    wb = load_workbook(
+        io.BytesIO(content), read_only=True, data_only=True,
+    )
+    ws = wb.active
+    if ws is None:
+        raise ValueError("xlsx workbook has no active worksheet")
+    out = io.StringIO()
+    writer = csv.writer(out)
+    first_row_written = False
+    for row in ws.iter_rows(values_only=True):
+        # Normalize cells: None -> "", non-strings -> str().
+        cells = ["" if v is None else str(v) for v in row]
+        # Drop trailing all-empty rows (Excel commonly pads with
+        # blank rows). A row of "" is content (preserving blanks
+        # for downstream tools); a row of nothing at all is noise.
+        if not any(c.strip() for c in cells):
+            continue
+        if not first_row_written:
+            # Lowercase the header row so Stage 1's case-sensitive
+            # `name` / `domain` lookup matches "Name" / "Domain" /
+            # "NAME" exports without per-tool aliases.
+            cells = [c.lower().strip() for c in cells]
+            first_row_written = True
+        writer.writerow(cells)
+    return out.getvalue().encode("utf-8")
+
+
 def _count_csv_rows(content: bytes) -> int:
     """Count data rows (header excluded). Used both to validate the
     CSV parses + to populate `row_count` in the response."""
@@ -1158,31 +1199,43 @@ def _link_sources_yaml(yaml_path: pathlib.Path, csv_relative: str,
 @app.post(
     "/pipeline/sources",
     response_model=SourcesUploadResult,
-    summary="Upload an investor-sources CSV; wires it into Stage 1",
+    summary="Upload an investor-sources CSV or XLSX; wires it into Stage 1",
     tags=["onboarding"],
 )
 async def upload_pipeline_sources(
     file: UploadFile = File(
-        ..., description="CSV of investor sources (25 MB max)",
+        ..., description="CSV or XLSX of investor sources (25 MB max)",
     ),
     _auth: None = Depends(require_auth),
 ) -> SourcesUploadResult:
-    """Accept the operator's investor-sources CSV, persist it under
+    """Accept the operator's investor-sources file, persist it under
     `clients/<ws>/data/raw/`, and prepend an entry to
     `config/sources.yaml` so the next Stage 1 run picks it up.
 
-    Non-destructive in the sense that running this endpoint doesn't
-    invoke any pipeline stage -- the wizard's next step is what kicks
-    off Stage 1. Idempotent on filename: re-uploading the same name
-    overwrites the file and leaves sources.yaml unchanged.
+    Accepts:
+      - `.csv` -- stored as-is.
+      - `.xlsx` -- converted to CSV in-memory via openpyxl. Header
+        row is lowercased on conversion so OpenVC's `Name`/`Domain`
+        columns map to Stage 1's case-sensitive lookup. The
+        sources.yaml entry always points at the resulting `.csv` so
+        Stage 1's parser doesn't need an xlsx code path.
+
+    Non-destructive: this endpoint never invokes a pipeline stage --
+    the wizard's next step is what kicks off Stage 1. Idempotent on
+    filename: re-uploading the same name overwrites the file and
+    leaves sources.yaml unchanged.
     """
     name = file.filename or ""
-    if not name.lower().endswith(".csv"):
+    lower = name.lower()
+    is_xlsx = lower.endswith(".xlsx")
+    is_csv = lower.endswith(".csv")
+    if not (is_csv or is_xlsx):
         raise HTTPException(
             400,
             detail={
                 "error": (
-                    f"sources upload must be a .csv file; got {name!r}"
+                    f"sources upload must be a .csv or .xlsx file; "
+                    f"got {name!r}"
                 ),
                 "stdout": "", "stderr": "", "returncode": 1,
             },
@@ -1208,6 +1261,25 @@ async def upload_pipeline_sources(
                 "stdout": "", "stderr": "", "returncode": 1,
             },
         )
+
+    # XLSX path: convert to CSV bytes in-memory before counting rows.
+    # From here on the CSV path is the only persistence shape;
+    # sources.yaml always points at `.csv`.
+    if is_xlsx:
+        try:
+            content = _xlsx_to_csv_bytes(content)
+        except Exception as exc:  # noqa: BLE001 - openpyxl raises diverse types
+            raise HTTPException(
+                400,
+                detail={
+                    "error": (
+                        f"could not parse xlsx: {exc}. Re-export as "
+                        f".csv or check the file isn't password-"
+                        f"protected / corrupt."
+                    ),
+                    "stdout": "", "stderr": "", "returncode": 1,
+                },
+            )
 
     try:
         row_count = _count_csv_rows(content)

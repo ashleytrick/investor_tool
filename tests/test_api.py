@@ -944,3 +944,94 @@ def test_sources_upload_requires_auth(client: TestClient) -> None:
         files={"file": ("x.csv", _VALID_SOURCES_CSV, "text/csv")},
     )
     assert res.status_code == 401
+
+
+def _make_xlsx_bytes(rows: list[list[str]]) -> bytes:
+    """Generate a minimal .xlsx in-memory for the xlsx upload tests.
+
+    Uses openpyxl to write the same structure an OpenVC export would
+    (a single active sheet with a header row and data rows). No
+    binary fixtures committed -- the test owns the bytes it
+    exercises so a future openpyxl change can't silently break the
+    upload path.
+    """
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_sources_upload_accepts_xlsx_and_converts_to_csv(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """OpenVC's investor export is .xlsx. The endpoint must accept it,
+    convert via openpyxl, save under data/raw/ as .csv, and point
+    sources.yaml at the .csv so Stage 1's CSV-only parser picks it up
+    without an xlsx code path."""
+    xlsx_bytes = _make_xlsx_bytes([
+        ["Name", "Domain"],
+        ["Northbeam Capital", "northbeam.example"],
+        ["Tidewater Ventures", "tidewater.example"],
+    ])
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": (
+            "openvc_export.xlsx", xlsx_bytes,
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet",
+        )},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["row_count"] == 2
+
+    # Persisted as .csv (NOT .xlsx) so the workspace contains only
+    # one canonical shape for Stage 1 to read.
+    raw_dir = workspace_with_one_pending_draft / "data" / "raw"
+    csv_files = list(raw_dir.glob("*.csv"))
+    xlsx_files = list(raw_dir.glob("*.xlsx"))
+    assert len(csv_files) >= 1
+    assert len(xlsx_files) == 0, (
+        "xlsx upload must be converted; no .xlsx should land in data/raw/"
+    )
+
+    # Header row was lowercased so Stage 1's case-sensitive `name` /
+    # `domain` lookup matches.
+    saved = csv_files[0].read_text(encoding="utf-8")
+    assert saved.splitlines()[0] == "name,domain"
+    assert "Northbeam Capital,northbeam.example" in saved
+
+    # sources.yaml entry points at the .csv result.
+    import yaml
+    sources_yaml = (
+        workspace_with_one_pending_draft / "config" / "sources.yaml"
+    )
+    data = yaml.safe_load(sources_yaml.read_text(encoding="utf-8"))
+    first = data["public_lists"][0]
+    assert first["path"].endswith(".csv")
+    assert first["parser"] == "csv"
+
+
+def test_sources_upload_xlsx_rejects_corrupt_workbook(
+    client: TestClient,
+) -> None:
+    """A malformed xlsx body must surface a clean 400 rather than
+    crashing the endpoint."""
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": (
+            "broken.xlsx", b"PK\x03\x04corrupt-not-a-real-zip",
+            "application/octet-stream",
+        )},
+    )
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert "xlsx" in detail["error"].lower()

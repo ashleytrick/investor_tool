@@ -30,6 +30,11 @@ api = [
     "fastapi>=0.115",
     "pypdf>=5.0",
     "python-pptx>=1.0",
+    # openpyxl is the canonical xlsx reader. Operators uploading
+    # investor lists from OpenVC get .xlsx exports today; the
+    # /pipeline/sources endpoint normalizes them to CSV server-side
+    # before Stage 1 consumes them.
+    "openpyxl>=3.1",
     "uvicorn[standard]>=0.30",
 ]
 
