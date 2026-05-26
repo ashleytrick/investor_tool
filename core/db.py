@@ -923,6 +923,57 @@ axis_weight_suggestions = Table(
 )
 
 
+# B1 (Coach Today flow): a stable daily batch of recommended drafts.
+# GET /today materializes a row per (pick_date, partner_id) the first
+# time it's called for a given date; subsequent calls within the same
+# day return the same picks even if `partner_score_summaries` would
+# now rank things differently. This is what "stable per day" means in
+# the spec -- the operator's queue doesn't reorder under them as
+# Stage 6 re-runs between sessions.
+today_picks = Table(
+    "today_picks", metadata,
+    Column("pick_date", Date, primary_key=True),
+    # CASCADE: removing a partner removes their pick rows. We do
+    # store partner_id directly (not draft_id) as the second PK
+    # column because the draft can be superseded by a Stage 7 rerun
+    # mid-day; we want the pick to follow the partner, not the
+    # particular draft that was live when the pick was made.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    # The draft_id captured at pick time, for traceability. May
+    # point at a now-superseded draft; consumers should look up the
+    # current live draft for the partner rather than blindly using
+    # this id.
+    Column("draft_id", Integer),
+    # Rank within today's batch (1 = top). Persisted so the order is
+    # stable across reads even if we change the ranking heuristic.
+    Column("rank", Integer),
+    # Snapshot of the rationale at pick time. Same caveat as
+    # draft_id: the partner's `recommendation_reasoning` may have
+    # changed; we keep the snapshot so the queue's "why" line is
+    # stable through the day.
+    Column("rationale", Text),
+    Column("created_at", DateTime),
+    Index("ix_today_picks_date_rank", "pick_date", "rank"),
+)
+
+
+# B1 (Coach Today flow): per-tenant key-value settings. Started with
+# `send_pace` (1-20 drafts per day) but built as a KV so future
+# settings (notification preferences, default templates, etc.) can
+# land without another migration. Lives in the tenant's workspace
+# DB so it's automatically scoped to the user.
+workspace_settings = Table(
+    "workspace_settings", metadata,
+    Column("key", Text, primary_key=True),
+    Column("value", Text),  # JSON-encoded so callers can stash typed values
+    Column("updated_at", DateTime),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
