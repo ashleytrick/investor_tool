@@ -55,6 +55,31 @@ class GmailClient:
             )
         return cls(credentials_path=creds_path, token_path=token_path)
 
+    @classmethod
+    def from_workspace_polling(cls, ws) -> "GmailClient":
+        """Read-only constructor for poll endpoints (B2 onwards).
+
+        Unlike `from_workspace`, this does NOT require
+        `.gmail_credentials.json` -- tokens minted by Phase 6's
+        `/gmail/bootstrap` carry the client_id + client_secret
+        inline (harvested from Supabase's Google OAuth client),
+        so refresh works without a separate credentials file.
+
+        Raises `FileNotFoundError` when the token itself is missing
+        -- pollers catch this and treat it as "tenant hasn't
+        connected Gmail yet, skip silently."
+        """
+        token_path = ws.path / ".gmail_token.json"
+        if not token_path.exists():
+            raise FileNotFoundError(str(token_path))
+        # credentials_path is left pointing at the conventional spot
+        # so any future write-path that does need it gets a clear
+        # error rather than silently misbehaving.
+        return cls(
+            credentials_path=ws.path / ".gmail_credentials.json",
+            token_path=token_path,
+        )
+
     @property
     def service(self):
         if self._service is not None:
@@ -85,6 +110,83 @@ class GmailClient:
             self.token_path.write_text(creds.to_json(), encoding="utf-8")
         self._service = build("gmail", "v1", credentials=creds)
         return self._service
+
+    def list_sent_since(self, after: "object") -> list[dict]:
+        """List Gmail Sent messages with internalDate >= `after`.
+
+        Returns a list of dicts the polling layer consumes (NOT
+        Gmail SDK types -- keeps tests fixturable without the
+        google libs installed):
+
+            {
+              "external_id": str,    # RFC 822 Message-ID header
+              "thread_id":   str,
+              "occurred_at": datetime (UTC),
+              "recipient_email": str | None,
+              "subject":     str | None,
+              "body_snippet": str | None,
+            }
+
+        Uses Gmail's `q=in:sent after:<unix_ts>` shape so we don't
+        page through unbounded history on a fresh workspace.
+        """
+        import datetime as _dt
+        if isinstance(after, _dt.datetime):
+            unix_ts = int(after.timestamp())
+        else:
+            unix_ts = int(after)
+        try:
+            list_resp = self.service.users().messages().list(
+                userId="me",
+                q=f"in:sent after:{unix_ts}",
+                maxResults=200,
+            ).execute()
+        except Exception as exc:  # noqa: BLE001
+            raise GmailError(f"messages.list failed: {exc}") from exc
+        msg_refs = list_resp.get("messages") or []
+        out: list[dict] = []
+        for ref in msg_refs:
+            msg_id = ref.get("id")
+            if not msg_id:
+                continue
+            try:
+                full = self.service.users().messages().get(
+                    userId="me",
+                    id=msg_id,
+                    format="metadata",
+                    metadataHeaders=[
+                        "Message-ID", "From", "To", "Cc",
+                        "Bcc", "Subject", "Date",
+                    ],
+                ).execute()
+            except Exception:  # noqa: BLE001
+                # Skip the one message; don't tank the whole pass.
+                continue
+            payload = full.get("payload") or {}
+            headers = {
+                (h.get("name") or "").lower(): (h.get("value") or "")
+                for h in (payload.get("headers") or [])
+            }
+            internal_ms = full.get("internalDate")
+            try:
+                occurred_at = _dt.datetime.fromtimestamp(
+                    int(internal_ms) / 1000, tz=_dt.timezone.utc,
+                )
+            except (TypeError, ValueError):
+                continue
+            external_id = headers.get("message-id") or msg_id
+            recipient_email = _extract_first_email(
+                headers.get("to") or ""
+            ) or _extract_first_email(headers.get("cc") or "")
+            out.append({
+                "external_id": external_id,
+                "thread_id": full.get("threadId"),
+                "occurred_at": occurred_at,
+                "recipient_email": recipient_email,
+                "subject": headers.get("subject"),
+                "body_snippet": full.get("snippet") or None,
+            })
+        return out
 
     def get_profile(self) -> dict:
         """Slice 15 Gmail discoverability check.
@@ -123,3 +225,14 @@ class GmailClient:
         draft_id = draft.get("id")
         url = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
         return draft_id, url
+
+
+def _extract_first_email(raw_header: str) -> Optional[str]:
+    """Pull the first `foo@bar.tld` substring out of a To/Cc header
+    value. Gmail returns these as `Display Name <foo@bar.tld>` or
+    comma-separated lists; we just want the address."""
+    import re
+    if not raw_header:
+        return None
+    m = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", raw_header)
+    return m.group(0).lower() if m else None
