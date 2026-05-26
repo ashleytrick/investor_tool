@@ -489,12 +489,14 @@ from web.routers.admin import router as admin_router  # noqa: E402
 from web.routers.hooks import router as hooks_router  # noqa: E402
 from web.routers.crm import router as crm_router  # noqa: E402
 from web.routers.investors import router as investors_router  # noqa: E402
+from web.routers.cadence import router as cadence_router  # noqa: E402
 
 app.include_router(google_router)
 app.include_router(admin_router)
 app.include_router(hooks_router)
 app.include_router(crm_router)
 app.include_router(investors_router)
+app.include_router(cadence_router)
 
 
 @app.get("/", include_in_schema=False)

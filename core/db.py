@@ -1182,6 +1182,44 @@ crm_deals = Table(
 )
 
 
+# FR-2: per-tenant follow-up cadence configuration. Each
+# workspace file IS the tenant so we don't need a user_id PK --
+# there's exactly one row with key='default'. Future per-investor
+# overrides would live in a separate sequence_overrides sidecar
+# (deferred per the spec §4).
+cadence_settings = Table(
+    "cadence_settings", metadata,
+    Column("key", Text, primary_key=True),  # always 'default' for now
+    Column("enabled", Boolean, default=True),
+    Column("paused", Boolean, default=False),
+    Column("max_touches", Integer, default=4),
+    # 0-100, share of today's queue spent on new outreach (the
+    # rest goes to follow-ups). The Today endpoint mixed-payload
+    # logic (FR-4) reads this.
+    Column("daily_mix_new_pct", Integer, default=60),
+    Column("auto_stop_on_reply", Boolean, default=True),
+    Column("auto_stop_on_pipeline_advance", Boolean, default=True),
+    Column("auto_stop_on_manual_pass", Boolean, default=True),
+    Column("auto_stop_on_fund_news", Boolean, default=False),
+    Column("updated_at", DateTime),
+)
+
+
+# FR-2: ordered follow-up touches (touch 1 = initial outreach;
+# rows here are touch 2..N). Position is the 1-indexed touch
+# number; gap_days is days after the PREVIOUS touch (cumulative
+# is the caller's problem). angle is the per-touch directive --
+# see spec §2.2 for the enum.
+cadence_touches = Table(
+    "cadence_touches", metadata,
+    Column("position", Integer, primary_key=True),  # 2, 3, 4...
+    Column("gap_days", Integer, nullable=False),
+    Column("angle", Text, nullable=False),
+    Column("custom_prompt", Text),
+    Column("updated_at", DateTime),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
