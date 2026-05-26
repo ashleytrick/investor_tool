@@ -1130,6 +1130,50 @@ draft_snoozes = Table(
 )
 
 
+# B8 (CRM hourly polling): per-tenant snapshot of which lists each
+# partner belongs to in the connected CRM. Refreshed every hour
+# by poll-crm-lists. Useful for the wizard to suggest "investors
+# in your 'warm intros' list" or filter the Today queue.
+#
+# A list is identified by (provider, list_name). One partner can
+# appear in many lists; one list can contain many partners.
+crm_list_memberships = Table(
+    "crm_list_memberships", metadata,
+    Column("provider", Text, primary_key=True),
+    Column("list_name", Text, primary_key=True),
+    # CASCADE: removing the partner removes their memberships.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("updated_at", DateTime, nullable=False),
+    Index("ix_crm_list_memberships_partner", "partner_id"),
+    Index("ix_crm_list_memberships_list", "provider", "list_name"),
+)
+
+
+# B8 (CRM hourly polling): per-tenant snapshot of deals from the
+# connected CRM. We don't try to merge with the local pipeline
+# stage (partner_pipeline is the canonical one); this is a
+# read-only mirror for richer pipeline views in the UI.
+crm_deals = Table(
+    "crm_deals", metadata,
+    Column("provider", Text, primary_key=True),
+    Column("deal_id", Text, primary_key=True),
+    # SET NULL: a deal can outlive the partner we mapped it to;
+    # keep the deal row but drop the dangling FK.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="SET NULL"),
+    ),
+    Column("stage", Text),
+    Column("amount", Float),
+    Column("updated_at", DateTime, nullable=False),
+    Index("ix_crm_deals_partner", "partner_id"),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
