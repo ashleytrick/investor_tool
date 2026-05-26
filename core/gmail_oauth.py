@@ -64,41 +64,65 @@ def is_configured(ws) -> bool:
     return (ws.path / ".gmail_credentials.json").exists()
 
 
-def is_connected(ws) -> bool:
-    """Truthy when a saved token can produce a usable Credentials.
+_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
-    Refreshes a stale-but-refreshable token transparently and rewrites
-    the token file so the next call sees a valid creds. Returns False
-    on any structural / network failure so the wizard treats an
-    unrefreshable token as "needs reconnect" rather than crashing.
-    """
+
+def _load_creds(ws):
+    """Return a usable Credentials object, refreshing if stale, or
+    None on any structural / refresh failure. Centralized so
+    is_connected, drive_connected, and any future per-scope check
+    share the same loading discipline."""
     token_path = ws.path / ".gmail_token.json"
     if not token_path.exists():
-        return False
+        return None
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
     except ImportError:
-        return False
+        return None
     try:
         creds = Credentials.from_authorized_user_file(
             str(token_path), SCOPES,
         )
     except Exception:  # noqa: BLE001 - bad token file -> treat as disconnected
-        return False
+        return None
     if creds.valid:
-        return True
+        return creds
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
         except Exception:  # noqa: BLE001 - refresh failure -> disconnected
-            return False
+            return None
         try:
             token_path.write_text(creds.to_json(), encoding="utf-8")
         except Exception:  # noqa: BLE001 - disk failure shouldn't poison the read
             pass
-        return True
-    return False
+        return creds
+    return None
+
+
+def is_connected(ws) -> bool:
+    """Truthy when a saved token can produce usable Credentials with
+    the Gmail scope granted."""
+    creds = _load_creds(ws)
+    if creds is None:
+        return False
+    granted = set(getattr(creds, "scopes", []) or [])
+    return _GMAIL_SCOPE in granted
+
+
+def drive_connected(ws) -> bool:
+    """Truthy when the same OAuth token also covers the Drive scope.
+    Separate from is_connected so the wizard can distinguish 'Gmail
+    works but Drive isn't consented yet' -- typically when an
+    operator linked Gmail BEFORE the Drive scope was added to SCOPES,
+    and needs to re-run /gmail/connect to extend consent."""
+    creds = _load_creds(ws)
+    if creds is None:
+        return False
+    granted = set(getattr(creds, "scopes", []) or [])
+    return _DRIVE_SCOPE in granted
 
 
 def start_flow(ws, redirect_uri: str) -> tuple[str, str]:

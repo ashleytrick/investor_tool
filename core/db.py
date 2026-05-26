@@ -711,6 +711,14 @@ meeting_prep_artifacts = Table(
     Column("insufficient_evidence", Boolean, nullable=False),
     Column("model_used", Text),
     Column("generated_at", DateTime),
+    # Build Session 13: Drive auto-push columns. drive_doc_id is the
+    # Google Doc id created on first successful upload; drive_doc_url
+    # is its webViewLink (cached so renderers can deep-link without a
+    # follow-up API call). Both stay NULL when Drive isn't connected,
+    # the upload failed, or the operator hasn't connected Google yet.
+    Column("drive_doc_id", Text),
+    Column("drive_doc_url", Text),
+    Column("drive_pushed_at", DateTime),
     # Index on (partner_id, artifact_type) so the lookup is O(1)
     # without scanning every row.
     Index(

@@ -355,6 +355,8 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         "/pipeline/generate",
         "/gmail/status",
         "/gmail/connect",
+        # Build Session 13: per-scope Google OAuth surface.
+        "/google/status",
     ):
         assert required in paths, (
             f"OpenAPI spec dropped {required}; "
@@ -373,9 +375,33 @@ def test_config_returns_fixture_mode_and_gmail_false(client: TestClient) -> None
     # token, so gmail_connected must be false.
     assert body["mode"] == "fixture"
     assert body["gmail_connected"] is False
+    # Build Session 13: per-scope Drive state. Same fixture has no
+    # token at all, so drive_connected is False and google_connected
+    # (= gmail && drive) must also be False.
+    assert body["drive_connected"] is False
+    assert body["google_connected"] is False
     # test_workspace's company.yaml has name="Tendril" + one_liner set,
     # so the wizard sees Step 1 as already complete on the fixture.
     assert body["company_configured"] is True
+
+
+def test_google_status_returns_per_scope_breakdown(client: TestClient) -> None:
+    """The dedicated /google/status endpoint surfaces gmail_connected
+    and drive_connected independently so the wizard can distinguish
+    'Gmail granted but Drive needs re-consent' from 'neither granted'."""
+    res = client.get("/google/status", headers=_auth_headers())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body == {
+        "gmail_connected": False,
+        "drive_connected": False,
+        "google_connected": False,
+    }
+
+
+def test_google_status_requires_auth(client: TestClient) -> None:
+    res = client.get("/google/status")
+    assert res.status_code == 401
 
 
 def test_set_mode_flips_company_yaml_and_round_trips(

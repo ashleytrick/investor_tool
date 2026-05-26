@@ -40,6 +40,9 @@ from core.db import (
 from core.llm.client import LLMClient
 from core.meeting_prep import framing_brief as fb
 from core.meeting_prep import objection_map as om
+from core.meeting_prep.cache import hash_signal_set
+from core.meeting_prep.drive_sync import push_if_needed
+from core.meeting_prep.evidence import load_evidence
 from core.meeting_prep.render import render_framing_brief, render_objection_map
 
 
@@ -78,6 +81,25 @@ def _stub_objection_map(partner_id: str) -> dict:
         "insufficient_evidence": True,
         "notes": "stub-mode response (no ANTHROPIC_API_KEY)",
     }
+
+
+def _record_drive(
+    pushed: list, skipped: list, artifact_type: str, res,
+) -> None:
+    """Sort a DrivePushResult into the right footer bucket. Skipped
+    pushes ARE recorded (with reason) so the operator sees why their
+    brief didn't make it to Drive -- silent skips would invite
+    'I clicked Connect Google -- why is nothing showing up?'"""
+    if res.pushed:
+        pushed.append((artifact_type, res.doc_url or "(no url)"))
+    elif res.doc_id:
+        # Already-pushed cache hit; show the existing url so the
+        # operator can jump straight to the doc.
+        pushed.append(
+            (f"{artifact_type} (already on Drive)", res.doc_url or "(no url)")
+        )
+    else:
+        skipped.append((artifact_type, res.skipped_reason or "(unknown)"))
 
 
 def _stub_framing_brief(partner_id: str) -> dict:
@@ -142,6 +164,14 @@ def main() -> int:
             "verified signal set is unchanged. Use after the operator "
             "manually edits a signal's verification or quality outside "
             "the normal Stage 5 path."
+        ),
+    )
+    parser.add_argument(
+        "--no-drive-push", action="store_true",
+        help=(
+            "Skip the auto-push to Google Drive even when the "
+            "workspace has Google connected. Useful for offline runs "
+            "or when iterating on the rendering layer."
         ),
     )
     args = parser.parse_args()
@@ -337,8 +367,14 @@ def main() -> int:
     want_objections = args.include_objections or auto_enable
     want_framing = args.include_framing or auto_enable
 
+    drive_results: list[tuple[str, str]] = []  # (artifact_type, url)
+    drive_skipped: list[tuple[str, str]] = []  # (artifact_type, reason)
     if want_objections or want_framing:
         llm = LLMClient(workspace=ws)
+        ev = load_evidence(engine, pid)
+        signal_hash = (
+            hash_signal_set(ev.quality_signal_ids) if ev else ""
+        )
         if want_objections:
             obj_stub = _stub_objection_map(pid) if llm.stub else None
             obj_out = om.build(
@@ -346,7 +382,16 @@ def main() -> int:
                 company_cfg=ws.company, force=args.force_rebuild,
                 stub_response=obj_stub,
             )
-            parts.append(render_objection_map(obj_out))
+            section = render_objection_map(obj_out)
+            parts.append(section)
+            if not args.no_drive_push and signal_hash:
+                res = push_if_needed(
+                    engine, ws, partner_id=pid,
+                    signal_set_hash=signal_hash,
+                    artifact_type="objection_map",
+                    markdown_text=section,
+                )
+                _record_drive(drive_results, drive_skipped, "objection_map", res)
         if want_framing:
             obj_stub = _stub_objection_map(pid) if llm.stub else None
             fram_stub = _stub_framing_brief(pid) if llm.stub else None
@@ -356,7 +401,28 @@ def main() -> int:
                 stub_response=fram_stub,
                 objection_map_stub=obj_stub,
             )
-            parts.append(render_framing_brief(fram_out))
+            section = render_framing_brief(fram_out)
+            parts.append(section)
+            if not args.no_drive_push and signal_hash:
+                res = push_if_needed(
+                    engine, ws, partner_id=pid,
+                    signal_set_hash=signal_hash,
+                    artifact_type="framing_brief",
+                    markdown_text=section,
+                )
+                _record_drive(drive_results, drive_skipped, "framing_brief", res)
+
+    # Surface the Drive outcome as a footer the operator can scan
+    # without scrolling back through the artifact bodies. Drive
+    # status changes between runs (e.g. operator just connected
+    # Google) are visible from the footer alone.
+    if drive_results or drive_skipped:
+        parts.append("## Drive sync")
+        for atype, url in drive_results:
+            parts.append(f"- {atype}: pushed -> {url}")
+        for atype, reason in drive_skipped:
+            parts.append(f"- {atype}: skipped ({reason})")
+        parts.append("")
 
     output = "\n".join(parts) + "\n"
     if args.out:
