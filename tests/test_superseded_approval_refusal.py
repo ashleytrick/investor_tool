@@ -128,10 +128,58 @@ def test_can_approve_draft_refuses_superseded(tmp_path: Path) -> None:
     )
 
 
+def test_soft_blocker_mentioning_superseded_stays_soft() -> None:
+    """Regression for the HARD_BLOCKER_SUBSTRINGS substring-collision
+    finding: a hypothetical soft blocker that just happens to contain
+    the word "superseded" (e.g. a future cross-batch similarity
+    warning "body close to a now-superseded sibling") must NOT be
+    reclassified as hard, because that would silently break
+    --override-blockers for that case.
+
+    The anchored marker "draft is superseded (draft_id=" is what
+    gate.py actually emits; only that exact prefix triggers HARD.
+    """
+    soft_with_word = (
+        "body similarity > 0.82 with a now-superseded sibling draft"
+    )
+    assert classify_blocker(soft_with_word) == "soft"
+
+
+def test_soft_blocker_mentioning_draft_id_stays_soft() -> None:
+    """Same protection for "draft_id=" -- a soft blocker that quotes
+    a draft id (e.g. a future "body close to draft_id=42" similarity
+    warning) must NOT be classified hard. Only the gate's own
+    "draft not found (draft_id=N)" message gets the HARD tag, because
+    the marker is anchored to that exact prefix.
+    """
+    soft_quoting_id = (
+        "body similarity > 0.82 with another draft_id=42 in this batch"
+    )
+    assert classify_blocker(soft_quoting_id) == "soft"
+
+
+def test_draft_not_found_blocker_is_classified_hard() -> None:
+    """Mirror of the superseded test: the gate's "draft not found"
+    refusal must classify HARD so --override-blockers can never
+    create an approval against a draft that doesn't exist."""
+    msg = "draft not found (draft_id=999)"
+    assert classify_blocker(msg) == "hard"
+
+
 def test_superseded_blocker_is_classified_hard() -> None:
     """The superseded refusal cannot be bypassed via
-    --override-blockers -- classify_blocker must return 'hard'."""
-    msg = "draft_id=99 is superseded (superseded_at=2026-01-01T00:00:00)"
+    --override-blockers -- classify_blocker must return 'hard'.
+
+    Phrasing intentionally matches what gate.py emits so the anchored
+    HARD_BLOCKER_SUBSTRINGS marker fires. A free-floating "superseded"
+    in some unrelated soft blocker would NOT trigger HARD -- see
+    test_soft_blocker_mentioning_superseded_stays_soft.
+    """
+    msg = (
+        "draft is superseded (draft_id=99, "
+        "superseded_at=2026-01-01T00:00:00); approve the latest "
+        "generation for this partner instead"
+    )
     assert classify_blocker(msg) == "hard"
 
 
