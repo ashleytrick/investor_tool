@@ -1443,6 +1443,127 @@ def hook_reconcile_drafts(
     )
 
 
+# ---------- B6: CRM fast polling (activity + pipeline) ----------
+
+class CRMPollProviderResult(BaseModel):
+    """One provider's outcome within one tenant's CRM poll. `error`
+    is None on success."""
+    workspace: str
+    provider: str
+    inserted: int
+    error: str | None = None
+
+
+class CRMPollHookResult(BaseModel):
+    """Response from the CRM poll hooks. Aggregated across all
+    tenants + all their connected providers."""
+    polled: int  # number of (tenant, provider) pairs processed
+    total_inserted: int
+    results: list[CRMPollProviderResult]
+
+
+@app.post(
+    "/api/public/hooks/poll-crm-activity",
+    response_model=CRMPollHookResult,
+    summary=(
+        "Cron-triggered poll of every tenant's connected CRMs for "
+        "new activity (notes, tasks, replies) -> outreach_events"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_crm_activity(
+    _hook: None = Depends(_hook_secret_required),
+) -> CRMPollHookResult:
+    """Schedule: every 15min per the Lovable spec. Iterates every
+    per-user workspace, then every connected CRM provider inside
+    it. Per-tenant + per-provider errors land in results[].error
+    so one bad tenant or provider doesn't tank the rest.
+    """
+    from core.config_loader import load_workspace as _load_workspace
+    from core.crm_polling import (
+        poll_crm_activity_for_workspace as _poll,
+    )
+    from web.routers.admin import _iter_tenant_workspaces
+
+    tenants = _iter_tenant_workspaces()
+    if not tenants:
+        ws_dir = pathlib.Path(_ws_path())
+        if ws_dir.exists():
+            tenants = [ws_dir]
+
+    flat: list[CRMPollProviderResult] = []
+    total = 0
+    for ws_dir in tenants:
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            flat.append(CRMPollProviderResult(
+                workspace=str(ws_dir), provider="(unknown)",
+                inserted=0,
+                error=f"load_workspace_failed: {exc}",
+            ))
+            continue
+        for r in _poll(ws):
+            flat.append(CRMPollProviderResult(
+                workspace=r.workspace, provider=r.provider,
+                inserted=r.inserted, error=r.error,
+            ))
+            total += r.inserted
+
+    return CRMPollHookResult(
+        polled=len(flat), total_inserted=total, results=flat,
+    )
+
+
+@app.post(
+    "/api/public/hooks/poll-crm-pipeline",
+    response_model=CRMPollHookResult,
+    summary=(
+        "Cron-triggered poll of every tenant's connected CRMs for "
+        "pipeline-stage changes -> partner_pipeline"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_crm_pipeline(
+    _hook: None = Depends(_hook_secret_required),
+) -> CRMPollHookResult:
+    """Schedule: every 30min per the Lovable spec."""
+    from core.config_loader import load_workspace as _load_workspace
+    from core.crm_polling import (
+        poll_crm_pipeline_for_workspace as _poll,
+    )
+    from web.routers.admin import _iter_tenant_workspaces
+
+    tenants = _iter_tenant_workspaces()
+    if not tenants:
+        ws_dir = pathlib.Path(_ws_path())
+        if ws_dir.exists():
+            tenants = [ws_dir]
+
+    flat: list[CRMPollProviderResult] = []
+    total = 0
+    for ws_dir in tenants:
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            flat.append(CRMPollProviderResult(
+                workspace=str(ws_dir), provider="(unknown)",
+                inserted=0,
+                error=f"load_workspace_failed: {exc}",
+            ))
+            continue
+        for r in _poll(ws):
+            flat.append(CRMPollProviderResult(
+                workspace=r.workspace, provider=r.provider,
+                inserted=r.inserted, error=r.error,
+            ))
+            total += r.inserted
+
+    return CRMPollHookResult(
+        polled=len(flat), total_inserted=total, results=flat,
+    )
+
+
 @app.get(
     "/replies",
     response_model=list[ReplyItem],
