@@ -194,8 +194,32 @@ def stage_run(
         # Import lazily so non-LLM stages don't pay the cost.
         from core.llm.client import LLMClient
         llm = LLMClient(workspace=ws)
+    # Issue #19: optional --pipeline-batch <id>. When present, validate
+    # against pipeline_batches + thread onto RunLogger so the runs row
+    # stamps pipeline_batch_id. Bad ids refuse before the run row
+    # commits so an orphan run isn't created.
+    pipeline_batch_id = getattr(args, "pipeline_batch", None)
+    if pipeline_batch_id:
+        from core.batch_ids import batch_exists
+        with engine.begin() as _conn:
+            if not batch_exists(_conn, pipeline_batch_id):
+                print(
+                    f"[{stage}] REFUSED: --pipeline-batch "
+                    f"{pipeline_batch_id!r} not found in pipeline_batches. "
+                    f"Mint one via scripts/new_pipeline_batch.py before "
+                    f"passing it."
+                )
+                if _lock_cm is not None:
+                    try:
+                        _lock_cm.__exit__(None, None, None)
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise SystemExit(int(StageResult.USAGE_ERROR))
     try:
-        with RunLogger(engine, ws.name, stage) as run:
+        with RunLogger(
+            engine, ws.name, stage,
+            pipeline_batch_id=pipeline_batch_id,
+        ) as run:
             if llm is not None:
                 run.attach_llm_usage(llm.usage)
             ctx = StageContext(

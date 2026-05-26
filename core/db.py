@@ -44,9 +44,36 @@ runs = Table(
     Column("estimated_cost_usd", Float),
     Column("elapsed_seconds", Integer),
     Column("error_summary", Text),
+    # Issue #19: optional pipeline-spanning batch id. Operators that
+    # want lineage ("every row this Tuesday's pipeline pass touched")
+    # mint a batch via scripts/new_pipeline_batch.py and pass
+    # --pipeline-batch <id> to each subsequent stage. Stages without
+    # the flag leave this NULL; nothing forces a batch.
+    Column("pipeline_batch_id", Text),
     # status.py orders by (workspace, stage, started_at desc) for "last run per
     # stage"; this index keeps that query bounded as runs grow into the 1000s.
     Index("ix_runs_workspace_stage_started", "workspace", "stage", "started_at"),
+    Index("ix_runs_pipeline_batch_id", "pipeline_batch_id"),
+)
+
+
+# Issue #19: pipeline-spanning batch lineage. Optional. An operator who
+# wants "every row this Tuesday's run touched" mints a batch row via
+# scripts/new_pipeline_batch.py, then passes --pipeline-batch <id> to
+# each stage. Every stage's `runs` row stamps pipeline_batch_id; future
+# slices will extend the stamp to source_snapshots, signals,
+# deal_attributions, etc. so the full sources → drafts → syncs →
+# outcomes join is one query.
+pipeline_batches = Table(
+    "pipeline_batches", metadata,
+    Column("batch_id", Text, primary_key=True),  # hex string from secrets.token_hex
+    Column("workspace", Text, nullable=False),
+    Column("started_at", DateTime, nullable=False),
+    Column("completed_at", DateTime),
+    Column("operator", Text),         # $USER fallback
+    Column("notes", Text),            # operator-supplied reason / context
+    Index("ix_pipeline_batches_workspace", "workspace"),
+    Index("ix_pipeline_batches_started_at", "started_at"),
 )
 
 run_errors = Table(
