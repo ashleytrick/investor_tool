@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import pytest
+import asyncio
 
 from core.http_client import FetchResult
 from core.stage2.discovery import (
@@ -57,8 +57,7 @@ def test_discover_fund_pages_categorizes_common_fund_links() -> None:
     assert by_url["https://fund.example/insights"].category == "news"
 
 
-@pytest.mark.asyncio
-async def test_gather_live_pages_fetches_discovered_team_page(monkeypatch) -> None:
+def test_gather_live_pages_fetches_discovered_team_page(monkeypatch) -> None:
     responses = {
         "https://fund.example/": FetchResult(
             url="https://fund.example/",
@@ -107,9 +106,9 @@ async def test_gather_live_pages_fetches_discovered_team_page(monkeypatch) -> No
 
     monkeypatch.setattr("core.http_client.HttpClient.fetch", fake_fetch)
 
-    pages, required_failures, optional_failures = await gather_live_pages({
+    pages, required_failures, optional_failures = asyncio.run(gather_live_pages({
         "domain": "fund.example",
-    })
+    }))
 
     assert required_failures == []
     assert "https://fund.example/people" in pages
