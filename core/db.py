@@ -1046,6 +1046,34 @@ outreach_events = Table(
 )
 
 
+# B5 (CRM foundation): per-tenant CRM provider connections. One row
+# per (provider) within a tenant's workspace; the api_key is stored
+# encrypted via core/crm_secrets.py (Fernet symmetric encryption,
+# key from CRM_ENCRYPTION_KEY env var). `key_suffix` is the last
+# four chars of the plaintext key kept for display ("***abcd") so
+# the operator can identify which credential is connected without
+# the server ever leaking the full key back through the API.
+#
+# Sync status is stamped by the CRM pollers (B6-B8 work). 'idle'
+# until the first poll, then 'syncing' during a pass, then 'ok' or
+# 'error' with last_sync_error populated on failure.
+crm_connections = Table(
+    "crm_connections", metadata,
+    # provider: 'attio' | 'salesforce' | 'hubspot' | ...
+    Column("provider", Text, primary_key=True),
+    # Base64-encoded Fernet ciphertext. Never returned to the
+    # browser; decrypted only inside the sync workers.
+    Column("encrypted_api_key", Text, nullable=False),
+    # Last 4 chars of the plaintext key for UI display.
+    Column("key_suffix", Text, nullable=False),
+    Column("connected_at", DateTime, nullable=False),
+    # Sync status fields, populated by the polling layer (B6-B8).
+    Column("last_sync_at", DateTime),
+    Column("last_sync_status", Text),  # 'idle' | 'syncing' | 'ok' | 'error'
+    Column("last_sync_error", Text),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
