@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from core.config_loader import add_workspace_arg
 from core.db import signals
@@ -66,6 +66,9 @@ def main() -> int:
         company_desc = ws.company["company"]["description"]
 
         with engine.begin() as conn:
+            total_signals = conn.execute(
+                select(func.count()).select_from(signals)
+            ).scalar_one()
             cond = (
                 (signals.c.verified.is_(False))
                 | (signals.c.signal_quality_score.is_(None))
@@ -77,9 +80,27 @@ def main() -> int:
                 stmt = stmt.where(cond)
             rows = list(conn.execute(stmt))
 
-        verified_count = 0
-        quality2_plus = 0
-        method_counts: dict[str, int] = {}
+        if not rows:
+            if total_signals == 0:
+                ctx.refuse(
+                    "FAIL: Stage 5 found 0 signal rows in the workspace. "
+                    "This usually means Stage 4 produced no partner "
+                    "evidence. Run Stage 4 first and inspect its run "
+                    "summary before scoring candidates."
+                )
+                print("[stage 5] REFUSED: no signals available to verify")
+                print(f"[stage 5] llm stub mode: {llm.stub}")
+                return ctx.exit_code
+            note = (
+                f"no unprocessed signals to verify; {total_signals} signal "
+                "row(s) already have verification/quality state. Pass "
+                "--force to re-verify everything."
+            )
+            print(f"[stage 5] {note}")
+            run.note(note)
+            print(f"[stage 5] llm stub mode: {llm.stub}")
+            return ctx.exit_code
+
         verified_count = 0
         quality2_plus = 0
         method_counts: dict[str, int] = {}
