@@ -1,25 +1,32 @@
 """FastAPI backend for the external React frontend.
 
 Mirrors the Streamlit operator UI's actions but exposed as JSON over
-HTTPS so the `awesome_investor_tool` frontend (or any client with the
-API key) can drive the pipeline from a browser. Like the Streamlit
-UI, every mutating action shells out to the matching `scripts/*.py`
-so the workspace lock + audit + backup story is unchanged.
+HTTPS so the frontend (or any authenticated client) can drive the
+pipeline from a browser. Every mutating action shells out to the
+matching `scripts/*.py` so the workspace lock + audit + backup story
+is unchanged.
 
-Auth: a single shared API key passed as `Authorization: Bearer <key>`.
-The key lives in the `API_KEY` env var; missing -> the server refuses
-to start. CORS allow-list lives in `CORS_ORIGINS` (comma-separated);
-default is `*` for local dev -- production should pin to the frontend's
-exact origin.
+Auth (resolved per request in `web/deps.py::require_auth`):
+  1. Supabase HS256 JWT signed with `SUPABASE_JWT_SECRET`, sent as
+     `Authorization: Bearer <jwt>`. Audience `authenticated`. The
+     verified claims surface as a Principal (user_id, email, role).
+  2. During the cutover window: the legacy shared `API_KEY` is also
+     accepted when `AUTH_ALLOW_API_KEY_FALLBACK=true` AND
+     `API_KEY_FALLBACK_USER_ID` is set (so the shared key gets
+     attributed to a real tenant rather than silently
+     mis-attributing traffic). Removed once the frontend stops
+     sending the legacy key.
 
-Workspace is pinned via `INVESTOR_WORKSPACE` (same env var the
-Streamlit UI uses). The API never lets a client pick a workspace at
-runtime -- multi-tenant is a future concern.
+Multi-tenant routing: when `WORKSPACE_PER_USER=true` is set, every
+request is scoped to the principal's workspace under
+`${WORKSPACES_ROOT}/{user_id}/` (provisioned from a template on
+first use). Legacy single-workspace deployments keep working by
+leaving the flag unset and pinning `INVESTOR_WORKSPACE` directly.
 
-Run locally:
-    API_KEY=dev-key \
-    INVESTOR_WORKSPACE=clients/test_workspace \
-    uv run --extra api uvicorn web.api:app --reload --port 8080
+CORS allow-list lives in `CORS_ORIGINS` (comma-separated) plus
+optional `CORS_ORIGIN_REGEX` for ephemeral preview origins (e.g.
+Lovable's `*--<project-id>.lovableproject.com`). The `Authorization`
+header is allow-listed so JWTs flow through unchanged.
 
 OpenAPI spec is auto-generated at /openapi.json (and used by the
 `web/openapi.json` dump script in CI for the frontend's type
