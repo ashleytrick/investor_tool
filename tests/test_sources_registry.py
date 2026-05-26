@@ -302,3 +302,84 @@ def test_m003_backfills_signals_on_legacy_workspace(tmp_path):
     assert all(r[1] is not None for r in rows)
     # Two distinct URLs -> two sources rows.
     assert src_count == 2
+
+
+def test_funds_source_ids_populated_after_fixture_pipeline(tmp_path):
+    """Slice 18b follow-up final: fresh fixture pipeline populates
+    funds.source_ids as a JSON list of integer source_ids that maps to
+    the registry."""
+    import json as _json
+    ws_src = REPO_ROOT / "clients" / "test_workspace"
+    ws_dst = tmp_path / "test_workspace"
+    shutil.copytree(ws_src, ws_dst)
+    db = ws_dst / "data" / "pipeline.db"
+    if db.exists():
+        db.unlink()
+    _run_pipeline_through_stage_6(ws_dst)
+    c = sqlite3.connect(db)
+    rows = c.execute(
+        "select fund_id, source_urls, source_ids from funds "
+        "where source_urls is not null and source_urls != ''"
+    ).fetchall()
+    assert rows, "expected fixture pipeline to produce enriched funds"
+    for fund_id, urls, sids_json in rows:
+        urls_list = [u.strip() for u in urls.split(";") if u.strip()]
+        assert sids_json, f"fund {fund_id} missing source_ids"
+        sids = _json.loads(sids_json)
+        assert isinstance(sids, list)
+        # Same number of distinct URLs as source_ids.
+        assert len(sids) == len(urls_list), (
+            f"fund {fund_id}: {len(urls_list)} urls vs {len(sids)} ids"
+        )
+        # Every source_id is registered.
+        valid = c.execute(
+            f"select count(*) from sources where source_id in "
+            f"({','.join('?' for _ in sids)})", sids,
+        ).fetchone()[0]
+        assert valid == len(sids), (
+            f"fund {fund_id} references unknown source_ids"
+        )
+    c.close()
+
+
+def test_m004_backfills_legacy_funds_source_urls(tmp_path):
+    """A legacy workspace with funds.source_urls but no source_ids
+    should be backfilled by m004 on first get_engine call."""
+    import json as _json
+    from sqlalchemy import create_engine
+    db_path = tmp_path / "legacy_funds.db"
+    raw_engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with raw_engine.begin() as conn:
+        # Minimal funds table without source_ids column. Mimic a
+        # pre-Slice-18b-final operator DB.
+        conn.exec_driver_sql(
+            "CREATE TABLE funds ("
+            "  fund_id TEXT PRIMARY KEY, "
+            "  name TEXT NOT NULL, "
+            "  source_urls TEXT "
+            ")"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO funds (fund_id, name, source_urls) VALUES "
+            "  ('f.a', 'A', 'https://a.example/team; https://a.example/portfolio'), "
+            "  ('f.b', 'B', 'https://b.example/'), "
+            "  ('f.empty', 'Empty', NULL)"
+        )
+    engine = get_engine(f"sqlite:///{db_path}")
+    c = sqlite3.connect(db_path)
+    rows = c.execute(
+        "select fund_id, source_ids from funds order by fund_id"
+    ).fetchall()
+    src_count = c.execute("select count(*) from sources").fetchone()[0]
+    c.close()
+    by_fund = {r[0]: r[1] for r in rows}
+    # f.a has 2 URLs -> JSON list of 2 ids.
+    assert by_fund["f.a"]
+    assert len(_json.loads(by_fund["f.a"])) == 2
+    # f.b has 1 URL.
+    assert by_fund["f.b"]
+    assert len(_json.loads(by_fund["f.b"])) == 1
+    # f.empty stays NULL (no urls to backfill).
+    assert by_fund["f.empty"] is None
+    # Sources registry got 3 distinct URLs.
+    assert src_count == 3
