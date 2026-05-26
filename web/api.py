@@ -486,9 +486,11 @@ async def _stamp_user_id_contextvar(request: Request, call_next):
 # pattern. Endpoints not yet extracted remain inline below.
 from web.routers.google import router as google_router  # noqa: E402
 from web.routers.admin import router as admin_router  # noqa: E402
+from web.routers.hooks import router as hooks_router  # noqa: E402
 
 app.include_router(google_router)
 app.include_router(admin_router)
+app.include_router(hooks_router)
 
 
 @app.get("/", include_in_schema=False)
@@ -692,7 +694,11 @@ def get_today(
         # path too -- if the operator snoozes a draft AFTER today's
         # picks were materialized, refreshing Today should drop it
         # rather than confusingly show the row they just snoozed.
-        now_dt = _dt.datetime.now(_dt.timezone.utc)
+        #
+        # SQLite stores DateTime tz-naive even when the python
+        # value was tz-aware, so compare against a naive UTC now
+        # to keep the SQL string-comparison honest.
+        now_dt = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         active_snooze_ids = {
             row.draft_id for row in conn.execute(
                 select(draft_snoozes.c.draft_id)
@@ -701,15 +707,20 @@ def get_today(
         }
 
         # 1) Existing picks for today -- return as-is (minus snoozes).
+        # Branch on whether any today_picks row exists (regardless
+        # of snooze) so a workspace whose entire materialized batch
+        # is snoozed doesn't re-trigger materialization (which
+        # would re-create the same rows the snooze just filtered).
+        raw_existing = list(conn.execute(
+            select(today_picks)
+            .where(today_picks.c.pick_date == today_iso)
+            .order_by(today_picks.c.rank)
+        ))
         existing = [
-            r for r in conn.execute(
-                select(today_picks)
-                .where(today_picks.c.pick_date == today_iso)
-                .order_by(today_picks.c.rank)
-            )
+            r for r in raw_existing
             if r.draft_id not in active_snooze_ids
         ]
-        if existing:
+        if raw_existing:
             picks_rows = existing[:effective_limit]
         else:
             # 2) Materialize today's picks from the reviewable queue
@@ -723,8 +734,9 @@ def get_today(
             # elapsed yet. The Today queue should match the
             # operator's mental "what should I work on right now"
             # filter; a draft they explicitly snoozed for tomorrow
-            # belongs to tomorrow, not today.
-            now_dt = _dt.datetime.now(_dt.timezone.utc)
+            # belongs to tomorrow, not today. tz-naive UTC -- see
+            # the earlier compare block for why.
+            now_dt = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
             snoozed_subq = (
                 select(draft_snoozes.c.draft_id)
                 .where(draft_snoozes.c.snoozed_until > now_dt)
@@ -1157,100 +1169,11 @@ class SentItem(BaseModel):
     occurred_at: str  # ISO datetime
 
 
-class PollResult(BaseModel):
-    workspace: str  # path or user_id of the tenant that was polled
-    inserted: int
-    error: str | None = None
-
-
-class PollGmailSentResult(BaseModel):
-    """Response from `POST /api/public/hooks/poll-gmail-sent`. The
-    hook caller (Fly cron / external scheduler) uses `total_inserted`
-    + the per-workspace `results` for logging / alerting."""
-    polled: int
-    total_inserted: int
-    results: list[PollResult]
-
-
-def _hook_secret_required(
-    x_hook_secret: str | None = Header(default=None, alias="X-Hook-Secret"),
-) -> None:
-    """Cron-hook auth: a shared secret in X-Hook-Secret. NOT JWT --
-    the scheduler hitting these endpoints is infrastructure, not a
-    user. Without `HOOK_SECRET` set in env, the endpoint refuses
-    every request (fail-closed; we don't want an unset secret to
-    silently allow anonymous polling)."""
-    expected = os.environ.get("HOOK_SECRET") or ""
-    if not expected:
-        raise HTTPException(
-            500, "HOOK_SECRET env var unset; hook endpoints disabled",
-        )
-    if not x_hook_secret or not hmac.compare_digest(x_hook_secret, expected):
-        raise HTTPException(401, "invalid hook secret")
-
-
-@app.post(
-    "/api/public/hooks/poll-gmail-sent",
-    response_model=PollGmailSentResult,
-    summary=(
-        "Cron-triggered poll of every tenant's Gmail Sent box -> "
-        "outreach_events"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_gmail_sent(
-    _hook: None = Depends(_hook_secret_required),
-) -> PollGmailSentResult:
-    """Iterates every per-user workspace and polls Gmail for new
-    Sent messages since the workspace's high-water mark. Failures
-    (gmail token missing, list call 5xx) are caught per-tenant so
-    one bad workspace doesn't stop the rest.
-
-    Schedule: every 10 minutes (per spec). External scheduler (Fly
-    cron, GHA, a tiny worker) is responsible for the cadence; this
-    endpoint just does one pass on each call.
-
-    Auth: X-Hook-Secret header == HOOK_SECRET env var. JWT-style
-    auth doesn't apply here -- the caller is infrastructure, not a
-    user.
-    """
-    from core.config_loader import load_workspace as _load_workspace
-    from core.outreach_events import (
-        poll_gmail_sent_for_workspace as _poll,
-    )
-    from web.routers.admin import _iter_tenant_workspaces
-
-    tenants = _iter_tenant_workspaces()
-    if not tenants:
-        # Legacy single-workspace mode (WORKSPACE_PER_USER off):
-        # poll the single configured workspace.
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            tenants = [ws_dir]
-
-    results: list[PollResult] = []
-    total = 0
-    for ws_dir in tenants:
-        try:
-            ws = _load_workspace(str(ws_dir))
-        except Exception as exc:  # noqa: BLE001
-            results.append(PollResult(
-                workspace=str(ws_dir),
-                inserted=0,
-                error=f"load_workspace_failed: {exc}",
-            ))
-            continue
-        r = _poll(ws)
-        results.append(PollResult(
-            workspace=r.workspace,
-            inserted=r.inserted,
-            error=r.error,
-        ))
-        total += r.inserted
-
-    return PollGmailSentResult(
-        polled=len(results), total_inserted=total, results=results,
-    )
+# Hook endpoints moved to web/routers/hooks.py (refactor #16);
+# the schemas (PollResult, PollGmailSentResult, ReconcileItem,
+# ReconcileDraftsResult, CRMPollProviderResult, CRMPollHookResult)
+# moved alongside them. SentItem + ReplyItem stay here because
+# the GET /sent + GET /replies endpoints still live in api.py.
 
 
 @app.get(
@@ -1312,372 +1235,6 @@ class ReplyItem(BaseModel):
     occurred_at: str
     classification: str | None = None  # 'meeting_booked' | 'interested' | 'pass' | 'unclear'
     unread: bool = False
-
-
-class PollGmailRepliesResult(BaseModel):
-    polled: int
-    total_inserted: int
-    results: list[PollResult]
-
-
-class ReconcileItem(BaseModel):
-    workspace: str
-    unread_replies: int
-    error: str | None = None
-
-
-class ReconcileDraftsResult(BaseModel):
-    polled: int
-    total_unread_replies: int
-    results: list[ReconcileItem]
-
-
-@app.post(
-    "/api/public/hooks/poll-gmail-replies",
-    response_model=PollGmailRepliesResult,
-    summary=(
-        "Cron-triggered poll of every tenant's Gmail Inbox -> "
-        "outreach_events (event_type='replied')"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_gmail_replies(
-    _hook: None = Depends(_hook_secret_required),
-) -> PollGmailRepliesResult:
-    """Same shape as the poll-gmail-sent hook but pulls replies in
-    threads we've sent into. Classification is auto-applied
-    (heuristic for now -- LLM later). Schedule: every 10min per
-    spec (paired with poll-gmail-sent).
-    """
-    from core.config_loader import load_workspace as _load_workspace
-    from core.outreach_events import (
-        poll_gmail_replies_for_workspace as _poll,
-    )
-    from web.routers.admin import _iter_tenant_workspaces
-
-    tenants = _iter_tenant_workspaces()
-    if not tenants:
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            tenants = [ws_dir]
-
-    results: list[PollResult] = []
-    total = 0
-    for ws_dir in tenants:
-        try:
-            ws = _load_workspace(str(ws_dir))
-        except Exception as exc:  # noqa: BLE001
-            results.append(PollResult(
-                workspace=str(ws_dir),
-                inserted=0,
-                error=f"load_workspace_failed: {exc}",
-            ))
-            continue
-        r = _poll(ws)
-        results.append(PollResult(
-            workspace=r.workspace,
-            inserted=r.inserted,
-            error=r.error,
-        ))
-        total += r.inserted
-
-    return PollGmailRepliesResult(
-        polled=len(results), total_inserted=total, results=results,
-    )
-
-
-@app.post(
-    "/api/public/hooks/reconcile-drafts",
-    response_model=ReconcileDraftsResult,
-    summary=(
-        "Cron-triggered reconciliation pass; currently surfaces "
-        "per-tenant unread-reply counts for monitoring"
-    ),
-    tags=["hooks"],
-)
-def hook_reconcile_drafts(
-    _hook: None = Depends(_hook_secret_required),
-) -> ReconcileDraftsResult:
-    """Schedule: every 30min per spec. Read-only for B3 -- a
-    future PR will define the mutation policy (does an unread
-    reply automatically supersede an approved_to_send draft? Or
-    surface a review task?). Wiring the hook now lets the
-    scheduler attach to a real endpoint.
-    """
-    from core.config_loader import load_workspace as _load_workspace
-    from core.outreach_events import (
-        reconcile_drafts_for_workspace as _reconcile,
-    )
-    from web.routers.admin import _iter_tenant_workspaces
-
-    tenants = _iter_tenant_workspaces()
-    if not tenants:
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            tenants = [ws_dir]
-
-    results: list[ReconcileItem] = []
-    total = 0
-    for ws_dir in tenants:
-        try:
-            ws = _load_workspace(str(ws_dir))
-        except Exception as exc:  # noqa: BLE001
-            results.append(ReconcileItem(
-                workspace=str(ws_dir),
-                unread_replies=0,
-                error=f"load_workspace_failed: {exc}",
-            ))
-            continue
-        r = _reconcile(ws)
-        results.append(ReconcileItem(
-            workspace=r.workspace,
-            unread_replies=r.unread_replies,
-            error=r.error,
-        ))
-        total += r.unread_replies
-
-    return ReconcileDraftsResult(
-        polled=len(results),
-        total_unread_replies=total,
-        results=results,
-    )
-
-
-# ---------- B6: CRM fast polling (activity + pipeline) ----------
-
-class CRMPollProviderResult(BaseModel):
-    """One provider's outcome within one tenant's CRM poll. `error`
-    is None on success."""
-    workspace: str
-    provider: str
-    inserted: int
-    error: str | None = None
-
-
-class CRMPollHookResult(BaseModel):
-    """Response from the CRM poll hooks. Aggregated across all
-    tenants + all their connected providers."""
-    polled: int  # number of (tenant, provider) pairs processed
-    total_inserted: int
-    results: list[CRMPollProviderResult]
-
-
-@app.post(
-    "/api/public/hooks/poll-crm-activity",
-    response_model=CRMPollHookResult,
-    summary=(
-        "Cron-triggered poll of every tenant's connected CRMs for "
-        "new activity (notes, tasks, replies) -> outreach_events"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_crm_activity(
-    _hook: None = Depends(_hook_secret_required),
-) -> CRMPollHookResult:
-    """Schedule: every 15min per the Lovable spec. Iterates every
-    per-user workspace, then every connected CRM provider inside
-    it. Per-tenant + per-provider errors land in results[].error
-    so one bad tenant or provider doesn't tank the rest.
-    """
-    from core.config_loader import load_workspace as _load_workspace
-    from core.crm_polling import (
-        poll_crm_activity_for_workspace as _poll,
-    )
-    from web.routers.admin import _iter_tenant_workspaces
-
-    tenants = _iter_tenant_workspaces()
-    if not tenants:
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            tenants = [ws_dir]
-
-    flat: list[CRMPollProviderResult] = []
-    total = 0
-    for ws_dir in tenants:
-        try:
-            ws = _load_workspace(str(ws_dir))
-        except Exception as exc:  # noqa: BLE001
-            flat.append(CRMPollProviderResult(
-                workspace=str(ws_dir), provider="(unknown)",
-                inserted=0,
-                error=f"load_workspace_failed: {exc}",
-            ))
-            continue
-        for r in _poll(ws):
-            flat.append(CRMPollProviderResult(
-                workspace=r.workspace, provider=r.provider,
-                inserted=r.inserted, error=r.error,
-            ))
-            total += r.inserted
-
-    return CRMPollHookResult(
-        polled=len(flat), total_inserted=total, results=flat,
-    )
-
-
-@app.post(
-    "/api/public/hooks/poll-crm-pipeline",
-    response_model=CRMPollHookResult,
-    summary=(
-        "Cron-triggered poll of every tenant's connected CRMs for "
-        "pipeline-stage changes -> partner_pipeline"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_crm_pipeline(
-    _hook: None = Depends(_hook_secret_required),
-) -> CRMPollHookResult:
-    """Schedule: every 30min per the Lovable spec."""
-    from core.config_loader import load_workspace as _load_workspace
-    from core.crm_polling import (
-        poll_crm_pipeline_for_workspace as _poll,
-    )
-    from web.routers.admin import _iter_tenant_workspaces
-
-    tenants = _iter_tenant_workspaces()
-    if not tenants:
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            tenants = [ws_dir]
-
-    flat: list[CRMPollProviderResult] = []
-    total = 0
-    for ws_dir in tenants:
-        try:
-            ws = _load_workspace(str(ws_dir))
-        except Exception as exc:  # noqa: BLE001
-            flat.append(CRMPollProviderResult(
-                workspace=str(ws_dir), provider="(unknown)",
-                inserted=0,
-                error=f"load_workspace_failed: {exc}",
-            ))
-            continue
-        for r in _poll(ws):
-            flat.append(CRMPollProviderResult(
-                workspace=r.workspace, provider=r.provider,
-                inserted=r.inserted, error=r.error,
-            ))
-            total += r.inserted
-
-    return CRMPollHookResult(
-        polled=len(flat), total_inserted=total, results=flat,
-    )
-
-
-# ---------- B7: CRM slow polling (investors + relationships, 6h) ----------
-
-def _run_crm_hook(
-    poll_fn,
-) -> CRMPollHookResult:
-    """Shared scatter-gather plumbing for all five CRM hooks (B6
-    activity / pipeline + B7 investors / relationships + B8 lists
-    / deals). Iterates every tenant + collects per-provider
-    results."""
-    from core.config_loader import load_workspace as _load_workspace
-    from web.routers.admin import _iter_tenant_workspaces
-
-    tenants = _iter_tenant_workspaces()
-    if not tenants:
-        ws_dir = pathlib.Path(_ws_path())
-        if ws_dir.exists():
-            tenants = [ws_dir]
-
-    flat: list[CRMPollProviderResult] = []
-    total = 0
-    for ws_dir in tenants:
-        try:
-            ws = _load_workspace(str(ws_dir))
-        except Exception as exc:  # noqa: BLE001
-            flat.append(CRMPollProviderResult(
-                workspace=str(ws_dir), provider="(unknown)",
-                inserted=0,
-                error=f"load_workspace_failed: {exc}",
-            ))
-            continue
-        for r in poll_fn(ws):
-            flat.append(CRMPollProviderResult(
-                workspace=r.workspace, provider=r.provider,
-                inserted=r.inserted, error=r.error,
-            ))
-            total += r.inserted
-
-    return CRMPollHookResult(
-        polled=len(flat), total_inserted=total, results=flat,
-    )
-
-
-@app.post(
-    "/api/public/hooks/poll-crm-investors",
-    response_model=CRMPollHookResult,
-    summary=(
-        "Cron-triggered pull of every connected CRM's investor list "
-        "-> local funds + partners (6h)"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_crm_investors(
-    _hook: None = Depends(_hook_secret_required),
-) -> CRMPollHookResult:
-    from core.crm_polling import (
-        poll_crm_investors_for_workspace as _poll,
-    )
-    return _run_crm_hook(_poll)
-
-
-@app.post(
-    "/api/public/hooks/poll-crm-relationships",
-    response_model=CRMPollHookResult,
-    summary=(
-        "Cron-triggered pull of CRM relationship events -> "
-        "outreach_events (6h)"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_crm_relationships(
-    _hook: None = Depends(_hook_secret_required),
-) -> CRMPollHookResult:
-    from core.crm_polling import (
-        poll_crm_relationships_for_workspace as _poll,
-    )
-    return _run_crm_hook(_poll)
-
-
-# ---------- B8: CRM hourly polling (lists + deals) ----------
-
-@app.post(
-    "/api/public/hooks/poll-crm-lists",
-    response_model=CRMPollHookResult,
-    summary=(
-        "Cron-triggered snapshot of CRM list-memberships -> "
-        "crm_list_memberships (1h)"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_crm_lists(
-    _hook: None = Depends(_hook_secret_required),
-) -> CRMPollHookResult:
-    from core.crm_polling import (
-        poll_crm_lists_for_workspace as _poll,
-    )
-    return _run_crm_hook(_poll)
-
-
-@app.post(
-    "/api/public/hooks/poll-crm-deals",
-    response_model=CRMPollHookResult,
-    summary=(
-        "Cron-triggered snapshot of CRM deal records -> "
-        "crm_deals (1h)"
-    ),
-    tags=["hooks"],
-)
-def hook_poll_crm_deals(
-    _hook: None = Depends(_hook_secret_required),
-) -> CRMPollHookResult:
-    from core.crm_polling import (
-        poll_crm_deals_for_workspace as _poll,
-    )
-    return _run_crm_hook(_poll)
 
 
 # ---------- B9: one-time bulk import on connect ----------
