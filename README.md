@@ -12,25 +12,26 @@ The product stance is intentionally conservative:
 - Warm-intro routing is not part of the product workflow.
 - Apollo is handled through CSV export/import, not a direct Apollo API.
 - Attio is CRM/context sync. Local approval state remains the source of truth.
+- Pitch-deck extraction is a setup assistant, not an automatic source of truth.
 
 ## Current Architecture
 
-This is currently a Python CLI and SQLite application with a static UI
-prototype. It is not yet a conventional hosted web app with a public backend
-API.
+This is a Python, SQLite, CLI, and FastAPI application organized around one
+workspace per raise/client.
 
 - `scripts/` contains pipeline stages and operator commands.
 - `core/` contains shared ingestion, scoring, approval, Attio, Gmail, migration,
   backup, locking, and operator-safety logic.
+- `web/api.py` exposes the browser/API surface for onboarding, review,
+  approvals, readiness checks, exports, Gmail OAuth, and pipeline actions.
 - `clients/{workspace}/` contains one workspace's config, raw inputs, exports,
   local `.env`, and SQLite database.
 - `clients/{workspace}/data/pipeline.db` is the workspace database.
-- `ui_prototype/index.html` is a mock-data operator console. It is useful for UI
-  design and workflow review, but it does not yet talk to SQLite or external
-  APIs.
+- `ui_prototype/index.html` is still useful for design review, but the real web
+  integration should use `web/api.py`, not direct SQLite writes.
 
-Longer term, the frontend should talk to a small local Python API that wraps the
-same core modules and scripts. It should not directly mutate SQLite.
+The browser frontend should treat the API as the only mutating surface. It
+should never edit SQLite directly.
 
 ## Quick Start
 
@@ -43,7 +44,7 @@ export INVESTOR_WORKSPACE=clients/my_raise
 uv run scripts/status.py
 ```
 
-Then edit the generated workspace files:
+Then configure the generated workspace:
 
 - `clients/my_raise/config/company.yaml` - company, raise, ICP, scheduling link,
   mode, deliverability settings.
@@ -55,6 +56,90 @@ Then edit the generated workspace files:
 
 Every script accepts `--workspace clients/my_raise`; if `INVESTOR_WORKSPACE` is
 set, the flag is optional.
+
+## Web API
+
+The FastAPI backend is intended for the external browser frontend.
+
+Run locally:
+
+```bash
+API_KEY=dev-key \
+INVESTOR_WORKSPACE=clients/test_workspace \
+uv run --extra api uvicorn web.api:app --reload --port 8080
+```
+
+Useful routes:
+
+| Route | Purpose |
+|---|---|
+| `GET /openapi.json` | Frontend type generation / route discovery |
+| `GET /config` | Onboarding snapshot: mode, Gmail, company-config status |
+| `GET /config/company` | Read editable company setup profile |
+| `PUT /config/company` | Save reviewed/edited company setup profile |
+| `POST /config/company/extract-from-deck` | Extract a draft profile from a PDF/PPT/PPTX deck upload |
+| `POST /config/mode` | Flip fixture/production mode from the browser |
+| `POST /pipeline/score` | Run Stage 6 from the browser |
+| `POST /pipeline/generate` | Run Stage 7 from the browser |
+| `GET /review/pending` | Drafts waiting for human review |
+| `POST /drafts/{draft_id}/approve` | Approve a draft through the audited CLI path |
+| `POST /drafts/{draft_id}/reject` | Reject a draft |
+| `POST /partners/{partner_id}/email` | Set partner email |
+| `GET /check_ready` | Review/send/Gmail/Attio readiness checks |
+| `GET /send_queue.csv` | Export approved outreach CSV |
+| `POST /gmail/connect` | Start Gmail OAuth |
+| `GET /gmail/status` | Check Gmail connection state |
+
+All protected routes require `Authorization: Bearer <API_KEY>`. The OAuth
+callback is intentionally public because Google redirects the browser there with
+a one-time state token.
+
+## Deck-First Onboarding
+
+The preferred setup flow starts with the founder's pitch deck.
+
+1. User uploads a PDF/PPT/PPTX deck.
+2. The API extracts a draft `CompanyProfile` from the deck.
+3. The frontend populates the normal editable company setup form.
+4. The frontend shows extracted-field confidence, evidence snippets, and
+   missing/needs-review fields.
+5. The user edits or confirms the profile.
+6. Only then does the frontend call `PUT /config/company` to write
+   `company.yaml`.
+7. Onboarding continues normally into sources, Apollo/email import, scoring,
+   draft generation, review, and Gmail/export readiness.
+
+Deck extraction must not write `company.yaml` by itself. If extraction fails, or
+if the deck is image-heavy and little text is available, the user can continue
+with manual entry.
+
+The extraction response is expected to include:
+
+- `profile`: the draft `CompanyProfile`.
+- `extracted_fields`: field, value, confidence, evidence, and source slide/page
+  when available.
+- `missing_required_fields`: required fields not found in the deck.
+- `needs_review_fields`: low-confidence extracted fields.
+- `warnings`: image-heavy deck, sparse text, unsupported content, etc.
+- `source_filename` and `text_preview` for operator/debug visibility.
+
+Fields the app should try to extract include company name, one-liner, website,
+founder name/title/email, stage, sectors, business model, problem, solution,
+differentiators, why now, traction, round amount, instrument, valuation, close
+target, target investor criteria, and scheduling link if actually present.
+
+Required setup fields before the user can finish onboarding:
+
+- Company name.
+- One-liner.
+- Founder name.
+- Founder email.
+- Stage/round.
+- Problem.
+- Solution.
+- Traction.
+- Target sectors.
+- Scheduling link.
 
 ## Workspace Modes
 
@@ -74,19 +159,23 @@ unsafe action runs.
 
 The normal workflow is:
 
-1. Scaffold and configure a workspace.
-2. Run Stages 1-7 to discover funds, enrich partners, mine evidence, score, and
+1. Create or select a workspace.
+2. Upload the pitch deck and review/edit extracted company setup fields.
+3. Configure fund sources and scoring axes.
+4. Run Stages 1-7 to discover funds, enrich partners, mine evidence, score, and
    generate drafts.
-3. Export partners for Apollo.
-4. Upload/import Apollo emails.
-5. Review draft emails.
-6. Approve or reject drafts.
-7. Run `check_ready.py` for the intended next action.
-8. Create Gmail drafts or export a send queue.
-9. Optionally sync approved context to Attio.
-10. Record outcomes and use them for future calibration.
+5. Export partners for Apollo.
+6. Upload/import Apollo emails.
+7. Review draft emails.
+8. Approve or reject drafts.
+9. Run `check_ready.py` for the intended next action.
+10. Create Gmail drafts or export a send queue.
+11. Optionally sync approved context to Attio.
+12. Record outcomes and use them for future calibration.
+13. For substantive replies or booked meetings, generate an investor dossier /
+    prep brief.
 
-A typical first run:
+A typical first CLI run after setup:
 
 ```bash
 uv run scripts/01_aggregate_sources.py
@@ -234,10 +323,12 @@ Stage 8 syncs companies and people, preserves Attio-owned fields when outreach
 has already started, and logs every attempted mutation in `attio_sync_log`.
 Draft bodies and subject lines are only sent to Attio after human approval.
 
-Attio outcome sync exists as a background/import path, but local outcome state is
-still explicit and auditable.
+Attio outcome sync exists as a background/import path. When a substantive reply
+or meeting signal arrives, the local workspace should hydrate relationship /
+outcome state and create the appropriate follow-up work item, such as an
+investor dossier task.
 
-## Outcomes and Learning
+## Outcomes, Dossiers, and Learning
 
 Record outcomes manually or by CSV:
 
@@ -255,6 +346,27 @@ uv run scripts/classify_reply.py --partner-id p_example --file reply.eml
 The classifier asks for operator confirmation before recording. Outcomes hydrate
 relationship/suppression fields and can stale approvals when outreach should no
 longer proceed.
+
+For substantive replies, active conversations, or booked meetings, use the
+meeting-prep path rather than stuffing extra detail into cold emails. The prep
+artifact should synthesize verified signals, company setup, Attio/outcome
+context, and optional live research into an investor dossier that helps the
+founder run a better meeting.
+
+The intended dossier structure is:
+
+- Profile summary.
+- How this investor thinks.
+- Firm snapshot.
+- Fit assessment.
+- Pitch framing.
+- Topics to handle carefully.
+- Anticipated objections/questions.
+- Closing posture.
+- Sources.
+
+Cold email should stay short. Dossier depth belongs after the investor replies
+or a meeting is booked.
 
 Calibration tools help keep scoring honest:
 
@@ -287,7 +399,7 @@ Common no-SQL commands:
 | `scripts/promote_provisional.py` | Promote or merge provisional funds from Stage 3 |
 | `scripts/bulk_reattribute.py` | Re-attribute deal rows after fund corrections |
 | `scripts/review_attribution.py` | Resolve ambiguous attribution review items |
-| `scripts/prep_brief.py` | Generate a partner meeting/reply brief |
+| `scripts/prep_brief.py` | Generate a partner meeting/reply brief or dossier |
 | `scripts/connect_gmail.py` | Link Gmail OAuth for a workspace |
 | `scripts/create_gmail_drafts.py` | Create Gmail drafts for approved outreach |
 | `scripts/export_send_queue.py` | Export approved outreach to CSV |
@@ -309,19 +421,6 @@ Important safety systems:
   deleting them.
 - Pipeline batch IDs connect sources, signals, scores, drafts, approvals, syncs,
   and outcomes.
-
-## UI Prototype
-
-Open:
-
-```bash
-open ui_prototype/index.html
-```
-
-The prototype covers setup, runbook/status, partner review, Apollo email import,
-draft approval, partner detail, and readiness workflows. It is currently static
-mock data. A real frontend should use a local API wrapper around existing core
-logic rather than direct DB writes.
 
 ## Test Workspace
 
@@ -348,8 +447,8 @@ uv run pytest tests/ -q
 
 The suite covers stage behavior, operator CLIs, migrations, run locking,
 approval gates, stale approval invalidation, Apollo import/export, Attio payload
-and sync behavior, Gmail readiness gates, immutable history, and dry-run E2E
-paths.
+and sync behavior, Gmail readiness gates, immutable history, API onboarding, and
+dry-run E2E paths.
 
 ## Configuration Reference
 
@@ -364,6 +463,7 @@ Minimum live workspace needs:
 
 Optional:
 
+- Pitch deck upload through the web onboarding flow to prefill company setup.
 - `attio.yaml` plus `ATTIO_API_KEY` for Attio sync.
 - Gmail OAuth credentials/token for Gmail draft creation.
 - Apollo CSV exports/imports for partner emails.
@@ -375,72 +475,10 @@ Optional:
 - It does not guarantee partner emails without Apollo/manual import.
 - It does not use Attio as the approval source of truth.
 - It does not require Attio or Gmail unless you choose those paths.
-- It does not live-research during meeting brief generation; brief output should
-  synthesize existing verified signals.
-
-## Planned Extension: Meeting Prep
-
-The next planned extension is meeting prep after a substantive reply or booked
-meeting. This should extend `scripts/prep_brief.py`; it should not add a new
-pipeline stage and should not affect cold-outreach email generation.
-
-Goal: for partners with `outreach_status IN ('replied', 'meeting_booked')`,
-produce two additional artifacts:
-
-- Objection map: 5-7 likely objections grounded in verified quality>=2 signals,
-  fund kill signals, deal attribution patterns, and clearly labeled sector norms.
-- Framing brief: how to tell the story in the actual meeting, including what to
-  lead with, amplify, address unprompted, avoid leading with, and ask them.
-
-Proposed files:
-
-```text
-core/meeting_prep/
-  __init__.py
-  objection_map.py
-  framing_brief.py
-schemas/
-  objection_map.py
-  framing_brief.py
-prompts/
-  objection_map.txt
-  framing_brief.txt
-scripts/prep_brief.py
-core/db.py                # meeting_prep_artifacts cache table
-```
-
-Hard rules for that build:
-
-- Every non-generic objection must cite at least one verified quality>=2
-  `signal_id`.
-- Partners with fewer than two quality>=2 signals should return
-  `insufficient_evidence=True` and a short note rather than fabricated analysis.
-- Cache by `(partner_id, signal_set_hash)` so reruns are free unless evidence
-  changed.
-- Do not run on every partner. Default only for replied/booked-meeting partners;
-  require explicit opt-in otherwise.
-- Do not perform live web research at brief time.
-- Do not add portfolio-overlap analysis until Stage 2 persists structured
-  `portfolio_companies`.
-
-Proposed CLI:
-
-```bash
-uv run scripts/prep_brief.py \
-  --partner-id p_acme_partner_jane \
-  --include-objections --include-framing \
-  --out clients/my_raise/exports/briefs/jane.md
-```
-
-The output should keep the existing prep brief sections at the top and append:
-
-- `Objections to prepare for`
-- `How to tell your story today`
-
-This is the natural first place to consume richer `company.yaml` fields like
-`problem`, `solution`, `differentiators`, `why_now`, `desired_traits`,
-`excluded_sectors`, and `do_not_contact`, because meeting prep has enough
-context for that nuance. Cold email should stay short.
+- It does not treat deck extraction as confirmed company truth until the user
+  reviews and saves the profile.
+- It should not run investor dossiers for every cold prospect; dossier depth is
+  for replies, active conversations, or booked meetings.
 
 ## Launch Checklist
 
@@ -449,16 +487,20 @@ Before using this on a real raise:
 1. Confirm all open safety PRs are merged or intentionally closed.
 2. Run `uv run pytest tests/ -q` on current `main`.
 3. Create a fresh non-fixture workspace.
-4. Set `mode: dry_run` and run Stages 1-7.
-5. Export partners for Apollo and import emails.
-6. Review and approve a small number of drafts.
-7. Run `check_ready.py --for send`.
-8. Connect Gmail and run `check_ready.py --for gmail`.
-9. Create Gmail drafts for a tiny batch and inspect them manually.
-10. Switch to `mode: production` only after the dry run is clean.
+4. Upload the pitch deck, review extracted setup fields, and save the confirmed
+   company profile.
+5. Set `mode: dry_run` and run Stages 1-7.
+6. Export partners for Apollo and import emails.
+7. Review and approve a small number of drafts.
+8. Run `check_ready.py --for send`.
+9. Connect Gmail and run `check_ready.py --for gmail`.
+10. Create Gmail drafts for a tiny batch and inspect them manually.
+11. Switch to `mode: production` only after the dry run is clean.
 
 ## Known Limitations
 
+- Deck extraction depends on readable text. Image-heavy decks can require manual
+  setup edits.
 - Live fund websites vary widely. Stage 2 has homepage link discovery and fixed
   fallback paths, but some sites will still require manual source correction.
 - Partner employment status is only as good as the available fund/team evidence
@@ -466,5 +508,5 @@ Before using this on a real raise:
 - Partner emails require Apollo/manual import.
 - Attio matching can still need operator review when CRM records are ambiguous.
 - Gmail OAuth must be validated in the operator's real environment.
-- Meeting-prep objection/framing artifacts are planned, not yet current runtime
-  behavior.
+- Investor dossiers are only as good as verified local evidence plus any
+  explicitly enabled and cited research.
