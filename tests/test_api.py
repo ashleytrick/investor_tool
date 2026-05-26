@@ -54,6 +54,10 @@ def client(workspace_with_one_pending_draft: Path, monkeypatch) -> TestClient:
         "INVESTOR_WORKSPACE", str(workspace_with_one_pending_draft),
     )
     monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com")
+    # Fixture workspaces intentionally use .example domains. The hosted API
+    # defaults this bypass off; tests opt in explicitly so API happy paths can
+    # exercise approval/export without weakening production defaults.
+    monkeypatch.setenv("API_ALLOW_EXAMPLE_DOMAINS", "true")
     # Import lazily so the CORS middleware picks up our env var.
     import importlib
     import web.api as api_mod
@@ -414,6 +418,23 @@ def test_set_mode_flips_company_yaml_and_round_trips(
     )
     assert res.status_code == 200
     assert "mode: fixture" in yaml_path.read_text(encoding="utf-8")
+
+
+def test_set_mode_accepts_dry_run(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    yaml_path = workspace_with_one_pending_draft / "config" / "company.yaml"
+
+    res = client.post(
+        "/config/mode",
+        headers=_auth_headers(),
+        json={"mode": "dry_run"},
+    )
+    assert res.status_code == 200, res.text
+    assert "mode: dry_run" in yaml_path.read_text(encoding="utf-8")
+
+    snap = client.get("/config", headers=_auth_headers()).json()
+    assert snap["mode"] == "dry_run"
 
 
 def test_set_mode_rejects_unknown_value(client: TestClient) -> None:
