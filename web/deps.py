@@ -19,7 +19,114 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.config_loader import load_workspace  # noqa: E402
-from core.db import get_engine  # noqa: E402
+from core.db import get_engine, partner_score_summaries  # noqa: E402
+from sqlalchemy import select as _select  # noqa: E402
+
+
+# ---------- shared response shapes ----------
+#
+# Hoisted here (refactor #16) so per-feature routers under
+# web/routers/ can return them without importing back into
+# web/api.py and creating circular imports. DraftView in
+# particular is shared by /review/pending (still in api.py)
+# and /today (coach router).
+
+from pydantic import BaseModel as _BaseModel  # noqa: E402
+
+
+class BlockerInfo(_BaseModel):
+    text: str
+    severity: str  # "hard" or "soft"
+
+
+class GateInfo(_BaseModel):
+    ok: bool
+    blockers: list[BlockerInfo]
+    overridden: list[str]
+
+
+class DraftView(_BaseModel):
+    """Operator-facing view of a draft. B1 added the `rationale`
+    field, sourced from `partner_score_summaries.recommendation_reasoning`."""
+    draft_id: int
+    partner_id: str
+    strategy: str | None = None
+    subject: str | None = None
+    body: str | None = None
+    approval_status: str | None = None
+    qa_status: str | None = None
+    template_smell: str | None = None
+    partner_email: str | None = None
+    gate: GateInfo | None = None
+    rationale: str | None = None
+
+
+class CommandResult(_BaseModel):
+    ok: bool
+    stdout: str
+    stderr: str = ""
+    returncode: int = 0
+
+
+def gate_to_dict(gate) -> GateInfo:
+    """Convert an `ApprovalGate` to a GateInfo response model.
+    Lazy import so this module doesn't pull approval-gate
+    machinery at boot."""
+    from core.approval.gate import split_blockers
+    hard, soft = split_blockers(gate.blockers)
+    blockers: list[BlockerInfo] = []
+    for b in hard:
+        blockers.append(BlockerInfo(text=b, severity="hard"))
+    for b in soft:
+        blockers.append(BlockerInfo(text=b, severity="soft"))
+    return GateInfo(
+        ok=gate.ok, blockers=blockers, overridden=list(gate.overridden),
+    )
+
+
+def serialize_draft(
+    d, *,
+    partner_email: str | None,
+    gate: GateInfo | None,
+    rationale: str | None = None,
+) -> DraftView:
+    """Project an `email_drafts` row into a DraftView. Shared
+    between coach router (/today) and api.py (/review/pending,
+    /drafts/approved)."""
+    return DraftView(
+        draft_id=int(d.draft_id),
+        partner_id=str(d.partner_id),
+        strategy=getattr(d, "strategy", None) or getattr(d, "email_strategy_used", None),
+        subject=d.subject,
+        body=d.body,
+        approval_status=d.approval_status,
+        qa_status=d.qa_status,
+        template_smell=d.template_smell,
+        partner_email=partner_email,
+        gate=gate,
+        rationale=rationale,
+    )
+
+
+def rationale_by_partner(conn) -> dict[str, str]:
+    """Map partner_id -> Stage 6 recommendation_reasoning.
+
+    Returns an empty dict for workspaces that have never run Stage 6
+    (the table exists from `metadata.create_all` but is empty); the
+    caller treats missing entries as `rationale=None` rather than
+    as an error.
+    """
+    rows = conn.execute(
+        _select(
+            partner_score_summaries.c.partner_id,
+            partner_score_summaries.c.recommendation_reasoning,
+        )
+    )
+    return {
+        r.partner_id: r.recommendation_reasoning
+        for r in rows
+        if r.recommendation_reasoning
+    }
 
 
 # ---------- request-time env checks ----------
