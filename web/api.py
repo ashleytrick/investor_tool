@@ -68,9 +68,11 @@ from core import gmail_oauth  # noqa: E402
 from core.config_loader import load_workspace  # noqa: E402
 from core.db import (  # noqa: E402
     crm_connections,
+    draft_snoozes,
     email_drafts,
     get_engine,
     outreach_events,
+    partner_pipeline,
     partner_score_summaries,
     partners,
     runs,
@@ -748,6 +750,231 @@ def set_send_pace(
     engine, _ = _engine_and_ws()
     with engine.begin() as conn:
         return SendPaceView(value=_write_send_pace(conn, body.value))
+
+
+# ---------- B4: pipeline + snoozes ----------
+
+class PipelineView(BaseModel):
+    partner_id: str
+    stage: str | None = None  # null when no row yet (default state)
+    notes: str | None = None
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class PipelineBody(BaseModel):
+    stage: str = Field(min_length=1, max_length=64)
+    notes: str | None = None
+
+
+class SnoozeView(BaseModel):
+    draft_id: int
+    snoozed_until: str | None = None  # ISO; null when not snoozed
+    reason: str | None = None
+    created_at: str | None = None
+
+
+class SnoozeBody(BaseModel):
+    snoozed_until: str = Field(
+        description=(
+            "ISO datetime in the future. Server compares against "
+            "now(UTC); past values are rejected."
+        ),
+    )
+    reason: str | None = None
+
+
+@app.get(
+    "/partners/{partner_id}/pipeline",
+    response_model=PipelineView,
+    summary="Get the partner's pipeline stage + notes",
+    tags=["coach"],
+)
+def get_pipeline(
+    partner_id: str,
+    _auth: None = Depends(require_auth),
+) -> PipelineView:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(partner_pipeline).where(
+                partner_pipeline.c.partner_id == partner_id,
+            )
+        ).first()
+    if row is None:
+        # Default-empty view; the frontend renders this as "not in
+        # pipeline yet". We don't 404 because the Today/review
+        # pages call this for every partner card and 404 noise in
+        # the network panel is unhelpful.
+        return PipelineView(partner_id=partner_id)
+    return PipelineView(
+        partner_id=row.partner_id,
+        stage=row.stage,
+        notes=row.notes,
+        updated_at=row.updated_at.isoformat() if row.updated_at else None,
+        updated_by=row.updated_by,
+    )
+
+
+@app.post(
+    "/partners/{partner_id}/pipeline",
+    response_model=PipelineView,
+    summary="Set the partner's pipeline stage (and optional notes)",
+    tags=["coach"],
+)
+def set_pipeline(
+    partner_id: str,
+    body: PipelineBody,
+    _auth: None = Depends(require_auth),
+) -> PipelineView:
+    import datetime as _dt
+    engine, _ = _engine_and_ws()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    with engine.begin() as conn:
+        # Verify the partner exists -- 404 if not, so the frontend
+        # doesn't create orphan pipeline rows from a stale id.
+        partner_row = conn.execute(
+            select(partners.c.partner_id).where(
+                partners.c.partner_id == partner_id,
+            )
+        ).first()
+        if partner_row is None:
+            raise HTTPException(404, f"unknown partner_id: {partner_id}")
+        from core.db import upsert as _upsert
+        _upsert(
+            conn, partner_pipeline, ["partner_id"],
+            {
+                "partner_id": partner_id,
+                "stage": body.stage,
+                "notes": body.notes,
+                "updated_at": now,
+                "updated_by": None,  # TODO B7+: stamp from principal
+            },
+        )
+    return PipelineView(
+        partner_id=partner_id,
+        stage=body.stage,
+        notes=body.notes,
+        updated_at=now.isoformat(),
+    )
+
+
+@app.get(
+    "/snoozes/{draft_id}",
+    response_model=SnoozeView,
+    summary="Get the snooze for a draft (or empty view if not snoozed)",
+    tags=["coach"],
+)
+def get_snooze(
+    draft_id: int,
+    _auth: None = Depends(require_auth),
+) -> SnoozeView:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(draft_snoozes).where(
+                draft_snoozes.c.draft_id == draft_id,
+            )
+        ).first()
+    if row is None:
+        return SnoozeView(draft_id=draft_id)
+    return SnoozeView(
+        draft_id=row.draft_id,
+        snoozed_until=(
+            row.snoozed_until.isoformat() if row.snoozed_until else None
+        ),
+        reason=row.reason,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+    )
+
+
+def _parse_future_iso(value: str) -> "object":
+    """Parse an ISO datetime and require it's in the future.
+    Returns a tz-aware datetime in UTC."""
+    import datetime as _dt
+    try:
+        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            422, f"snoozed_until must be ISO 8601: {exc}",
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    else:
+        dt = dt.astimezone(_dt.timezone.utc)
+    if dt <= _dt.datetime.now(_dt.timezone.utc):
+        raise HTTPException(
+            422, "snoozed_until must be in the future",
+        )
+    return dt
+
+
+@app.post(
+    "/snoozes/{draft_id}",
+    response_model=SnoozeView,
+    summary="Snooze a draft until the specified ISO datetime",
+    tags=["coach"],
+)
+def set_snooze(
+    draft_id: int,
+    body: SnoozeBody,
+    _auth: None = Depends(require_auth),
+) -> SnoozeView:
+    import datetime as _dt
+    engine, _ = _engine_and_ws()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    snoozed_until = _parse_future_iso(body.snoozed_until)
+    with engine.begin() as conn:
+        # 404 if the draft doesn't exist so we don't orphan snooze
+        # rows.
+        draft_row = conn.execute(
+            select(email_drafts.c.draft_id).where(
+                email_drafts.c.draft_id == draft_id,
+            )
+        ).first()
+        if draft_row is None:
+            raise HTTPException(404, f"unknown draft_id: {draft_id}")
+        from core.db import upsert as _upsert
+        _upsert(
+            conn, draft_snoozes, ["draft_id"],
+            {
+                "draft_id": draft_id,
+                "snoozed_until": snoozed_until,
+                "reason": body.reason,
+                "created_at": now,
+                "created_by": None,  # TODO B7+: stamp from principal
+            },
+        )
+    return SnoozeView(
+        draft_id=draft_id,
+        snoozed_until=snoozed_until.isoformat(),
+        reason=body.reason,
+        created_at=now.isoformat(),
+    )
+
+
+@app.delete(
+    "/snoozes/{draft_id}",
+    response_model=CommandResult,
+    summary="Clear a snooze (so the draft becomes eligible again)",
+    tags=["coach"],
+)
+def clear_snooze(
+    draft_id: int,
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        res = conn.execute(
+            draft_snoozes.delete().where(
+                draft_snoozes.c.draft_id == draft_id,
+            )
+        )
+    if (res.rowcount or 0) == 0:
+        raise HTTPException(
+            404, f"no snooze on file for draft_id={draft_id}",
+        )
+    return CommandResult(ok=True, stdout="snooze cleared")
 
 
 # ---------- B2: outreach events (Gmail Sent poll + read) ----------
