@@ -216,6 +216,17 @@ def add_workspace_arg(parser) -> None:
         help="Path to the workspace dir, e.g. clients/test_workspace. "
              "Falls back to the INVESTOR_WORKSPACE env var if omitted.",
     )
+    # Issue #19: pipeline-spanning batch lineage. Optional. Operators
+    # mint a batch via scripts/new_pipeline_batch.py and pass the id
+    # here so every stage's `runs` row stamps pipeline_batch_id.
+    parser.add_argument(
+        "--pipeline-batch",
+        default=None,
+        help="Pipeline-batch id to stamp on the runs row. Mint a new id "
+             "via scripts/new_pipeline_batch.py and pass it to each stage "
+             "in the same run for cross-stage lineage. Omit to skip "
+             "(stage runs without a batch link).",
+    )
 
 
 def load_workspace(workspace_arg: str | None) -> Workspace:

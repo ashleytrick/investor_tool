@@ -26,10 +26,15 @@ def _now() -> datetime:
 
 
 class RunLogger:
-    def __init__(self, engine: Engine, workspace_name: str, stage: str):
+    def __init__(self, engine: Engine, workspace_name: str, stage: str,
+                 *, pipeline_batch_id: str | None = None):
         self.engine = engine
         self.workspace_name = workspace_name
         self.stage = stage
+        # Issue #19: optional pipeline-spanning batch id. Threaded
+        # from stage_run / operator_command_run when the operator
+        # passed --pipeline-batch. NULL on stages without the flag.
+        self.pipeline_batch_id = pipeline_batch_id
         self.run_id: int | None = None
         self.processed = 0
         self.succeeded = 0
@@ -48,6 +53,7 @@ class RunLogger:
                     workspace=self.workspace_name,
                     stage=self.stage,
                     started_at=_now(),
+                    pipeline_batch_id=self.pipeline_batch_id,
                 )
             )
             self.run_id = int(result.inserted_primary_key[0])
