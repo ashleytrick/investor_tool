@@ -67,6 +67,7 @@ from core.approval.persistence import (  # noqa: E402
 from core import gmail_oauth  # noqa: E402
 from core.config_loader import load_workspace  # noqa: E402
 from core.db import (  # noqa: E402
+    crm_connections,
     email_drafts,
     get_engine,
     outreach_events,
@@ -903,6 +904,168 @@ def get_sent(
             occurred_at=occurred_iso,
         ))
     return out
+
+
+# ---------- B5: CRM foundation (connect / disconnect / status) ----------
+
+_SUPPORTED_CRM_PROVIDERS = {"attio", "salesforce", "hubspot"}
+
+
+class CRMConnectionView(BaseModel):
+    """Operator-facing view of a CRM connection. Never includes the
+    plaintext api_key -- only the last 4 chars (`***abcd` shape on
+    the frontend) so the operator can identify which credential is
+    on file without the server ever leaking the full key back."""
+    provider: str
+    key_suffix: str
+    connected_at: str
+    last_sync_at: str | None = None
+    last_sync_status: str | None = None  # 'idle' | 'syncing' | 'ok' | 'error'
+    last_sync_error: str | None = None
+
+
+class CRMConnectBody(BaseModel):
+    provider: str = Field(
+        description="CRM provider id. One of: attio | salesforce | hubspot",
+    )
+    api_key: str = Field(
+        min_length=8,
+        description=(
+            "Provider's API key / personal access token. Encrypted "
+            "with CRM_ENCRYPTION_KEY (Fernet) at rest; the server "
+            "never returns the plaintext."
+        ),
+    )
+
+
+def _validate_provider(provider: str) -> str:
+    p = provider.strip().lower()
+    if p not in _SUPPORTED_CRM_PROVIDERS:
+        raise HTTPException(
+            422,
+            f"unsupported CRM provider {provider!r}; supported: "
+            f"{sorted(_SUPPORTED_CRM_PROVIDERS)}",
+        )
+    return p
+
+
+def _row_to_connection_view(row: Any) -> CRMConnectionView:
+    return CRMConnectionView(
+        provider=row.provider,
+        key_suffix=row.key_suffix,
+        connected_at=row.connected_at.isoformat() if row.connected_at else "",
+        last_sync_at=(
+            row.last_sync_at.isoformat() if row.last_sync_at else None
+        ),
+        last_sync_status=row.last_sync_status,
+        last_sync_error=row.last_sync_error,
+    )
+
+
+@app.get(
+    "/crm/connection",
+    response_model=list[CRMConnectionView],
+    summary="List the workspace's CRM connections (no api_keys returned)",
+    tags=["crm"],
+)
+def get_crm_connections(
+    _auth: None = Depends(require_auth),
+) -> list[CRMConnectionView]:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        rows = list(conn.execute(select(crm_connections)))
+    return [_row_to_connection_view(r) for r in rows]
+
+
+@app.post(
+    "/crm/connect",
+    response_model=CRMConnectionView,
+    summary="Save a CRM api_key (encrypted at rest)",
+    tags=["crm"],
+)
+def crm_connect(
+    body: CRMConnectBody,
+    _auth: None = Depends(require_auth),
+) -> CRMConnectionView:
+    """Encrypts the api_key with `CRM_ENCRYPTION_KEY` and upserts
+    a connection row. Re-connecting the same provider overwrites
+    (rotates) the stored key.
+
+    Returns the operator-facing view -- no plaintext key, just the
+    `key_suffix` for display.
+
+    Errors:
+      - 422 unsupported provider
+      - 500 CRM_ENCRYPTION_KEY env var unset / malformed
+    """
+    import datetime as _dt
+    from core.crm_secrets import (
+        CRMSecretsMisconfigured, encrypt_api_key, key_suffix,
+    )
+
+    provider = _validate_provider(body.provider)
+    api_key = body.api_key.strip()
+    if not api_key:
+        raise HTTPException(422, "api_key is empty after trim")
+
+    try:
+        ciphertext = encrypt_api_key(api_key)
+    except CRMSecretsMisconfigured as exc:
+        raise HTTPException(500, str(exc))
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    suffix = key_suffix(api_key)
+
+    engine, _ = _engine_and_ws()
+    from core.db import upsert as _upsert
+    with engine.begin() as conn:
+        _upsert(
+            conn, crm_connections, ["provider"],
+            {
+                "provider": provider,
+                "encrypted_api_key": ciphertext,
+                "key_suffix": suffix,
+                "connected_at": now,
+                # Reset sync status on re-connect -- a new key
+                # means the prior sync history doesn't apply.
+                "last_sync_at": None,
+                "last_sync_status": "idle",
+                "last_sync_error": None,
+            },
+        )
+        row = conn.execute(
+            select(crm_connections).where(
+                crm_connections.c.provider == provider,
+            )
+        ).first()
+    return _row_to_connection_view(row)
+
+
+@app.delete(
+    "/crm/connection",
+    response_model=CommandResult,
+    summary="Remove a CRM connection",
+    tags=["crm"],
+)
+def crm_disconnect(
+    provider: str = Query(
+        description="Provider to disconnect (attio / salesforce / hubspot)",
+    ),
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    p = _validate_provider(provider)
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        res = conn.execute(
+            crm_connections.delete().where(
+                crm_connections.c.provider == p,
+            )
+        )
+    if (res.rowcount or 0) == 0:
+        raise HTTPException(
+            404, f"no connection on file for provider={p}",
+        )
+    return CommandResult(ok=True, stdout=f"disconnected {p}")
 
 
 # ---------- partner mutations ----------
