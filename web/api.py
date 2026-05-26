@@ -145,14 +145,9 @@ class ConfigInfo(BaseModel):
     company_configured: bool
 
 
-class GoogleStatus(BaseModel):
-    """Full per-scope OAuth status. Returned by /google/status -- the
-    wizard polls this after the operator finishes consent so it can
-    tell 'Gmail and Drive both granted' from 'Gmail granted but
-    Drive needs a re-consent'."""
-    gmail_connected: bool
-    drive_connected: bool
-    google_connected: bool
+# NOTE: GoogleStatus / GmailStatus / GmailConnectResponse moved to
+# web/routers/google.py (Build Session 17). They are not imported
+# back here because nothing else in this module references them.
 
 
 class CompanyProfile(BaseModel):
@@ -205,14 +200,6 @@ class SetModeBody(BaseModel):
     mode: Literal["fixture", "dry_run", "production"]
 
 
-class GmailStatus(BaseModel):
-    connected: bool
-
-
-class GmailConnectResponse(BaseModel):
-    auth_url: str
-
-
 class RunRow(BaseModel):
     run_id: int
     stage: str | None
@@ -226,75 +213,23 @@ class RunRow(BaseModel):
 
 
 # ---------- helpers ----------
+#
+# Build Session 17: the shared helpers (require_auth, _engine_and_ws,
+# _ws_path, _api_key, _actor, _allow_example_domains_args, _run_cli)
+# moved to web/deps.py so per-feature routers under web/routers/
+# can import them without creating a circular import back to this
+# module. The names are re-exported below so existing callers in
+# this file keep working unchanged.
 
-def _api_key() -> str:
-    """Fail-fast on missing API_KEY at request time. We defer the
-    check (rather than failing at import) so test clients can monkey
-    the env var before each request."""
-    key = os.environ.get("API_KEY")
-    if not key:
-        raise HTTPException(
-            500,
-            "server misconfigured: API_KEY env var is not set",
-        )
-    return key
-
-
-def require_auth(authorization: str | None = Header(default=None)) -> None:
-    """Bearer-token gate. Compares constant-time so the secret can't
-    leak via timing. The frontend sends:
-        Authorization: Bearer <API_KEY>
-    """
-    expected = _api_key()
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "missing bearer token")
-    provided = authorization.split(" ", 1)[1].strip()
-    if not hmac.compare_digest(provided, expected):
-        raise HTTPException(401, "invalid api key")
-
-
-def _ws_path() -> str:
-    ws = os.environ.get("INVESTOR_WORKSPACE")
-    if not ws:
-        raise HTTPException(
-            500,
-            "server misconfigured: INVESTOR_WORKSPACE env var is not set",
-        )
-    return ws
-
-
-def _engine_and_ws():
-    """Load workspace + engine. Not cached -- engine creation is
-    cheap; caching across requests risks stale config when files
-    on disk change out-of-band (e.g. operator edits YAML)."""
-    ws = load_workspace(_ws_path())
-    return get_engine(ws.db_url), ws
-
-
-def _actor() -> str:
-    return os.environ.get("API_OPERATOR", "api-client")
-
-
-def _allow_example_domains_args() -> list[str]:
-    """Expose fixture-domain bypass only when the API operator opts in.
-
-    The CLI flag is useful for local/fixture demos, but the hosted API should
-    not silently weaken production guards for browser clients.
-    """
-    raw = os.environ.get("API_ALLOW_EXAMPLE_DOMAINS", "")
-    if raw.lower() in {"1", "true", "yes", "on"}:
-        return ["--allow-example-domains"]
-    return []
-
-
-def _run_cli(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
-    cmd = [sys.executable, str(REPO_ROOT / "scripts" / args[0]), *args[1:]]
-    return subprocess.run(
-        cmd, capture_output=True, text=True,
-        env={**os.environ, "USER": _actor()},
-        cwd=str(REPO_ROOT),
-        timeout=timeout,
-    )
+from web.deps import (  # noqa: E402
+    _actor,
+    _allow_example_domains_args,
+    _api_key,
+    _engine_and_ws,
+    _run_cli,
+    _ws_path,
+    require_auth,
+)
 
 
 def _gate_to_dict(gate: ApprovalGate) -> GateInfo:
@@ -369,6 +304,18 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+# ---------- routers ----------
+#
+# Per-feature routers live under web/routers/. Build Session 17
+# started the migration with the Google OAuth surface (4 endpoints);
+# future PRs can extract the onboarding-wizard, review-queue, and
+# pipeline-runner clusters into their own routers using the same
+# pattern. Endpoints not yet extracted remain inline below.
+from web.routers.google import router as google_router  # noqa: E402
+
+app.include_router(google_router)
 
 
 @app.get("/", include_in_schema=False)
@@ -1593,123 +1540,3 @@ async def upload_pipeline_sources(
         ok=True, row_count=row_count, stdout=stdout,
     )
 
-
-@app.get(
-    "/gmail/status",
-    response_model=GmailStatus,
-    summary="Is Gmail OAuth completed for the pinned workspace?",
-    tags=["onboarding"],
-)
-def gmail_status(_auth: None = Depends(require_auth)) -> GmailStatus:
-    _, ws = _engine_and_ws()
-    return GmailStatus(connected=gmail_oauth.is_connected(ws))
-
-
-@app.get(
-    "/google/status",
-    response_model=GoogleStatus,
-    summary="Per-scope OAuth status (Gmail + Drive)",
-    tags=["onboarding"],
-)
-def google_status(_auth: None = Depends(require_auth)) -> GoogleStatus:
-    """Build Session 13: the wizard renames the connect button to
-    'Connect Google' because the OAuth flow now grants both Gmail
-    (gmail.compose) and Drive (drive.file) scopes. This endpoint
-    surfaces per-scope state so the wizard can distinguish 'fully
-    connected' from 'Gmail granted, Drive needs re-consent' (the
-    case where an operator linked Gmail before drive.file was added
-    to SCOPES)."""
-    _, ws = _engine_and_ws()
-    gmail_ok = gmail_oauth.is_connected(ws)
-    drive_ok = gmail_oauth.drive_connected(ws)
-    return GoogleStatus(
-        gmail_connected=gmail_ok,
-        drive_connected=drive_ok,
-        google_connected=gmail_ok and drive_ok,
-    )
-
-
-@app.post(
-    "/gmail/connect",
-    response_model=GmailConnectResponse,
-    summary="Start Gmail OAuth; returns Google's auth URL",
-    tags=["onboarding"],
-)
-def gmail_connect(
-    request: Request, _auth: None = Depends(require_auth),
-) -> GmailConnectResponse:
-    _, ws = _engine_and_ws()
-    redirect_uri = str(request.url_for("gmail_oauth_callback"))
-    try:
-        auth_url, _state = gmail_oauth.start_flow(ws, redirect_uri)
-    except FileNotFoundError as exc:
-        raise HTTPException(
-            400,
-            detail={
-                "error": str(exc),
-                "stdout": "",
-                "stderr": "",
-                "returncode": 1,
-            },
-        )
-    return GmailConnectResponse(auth_url=auth_url)
-
-
-@app.get(
-    "/oauth/gmail/callback",
-    include_in_schema=False,
-    name="gmail_oauth_callback",
-)
-def gmail_oauth_callback(
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-) -> HTMLResponse:
-    """Google redirects the operator's browser here after consent.
-
-    Auth model: NO Bearer header (browsers can't attach custom headers
-    to a cross-origin redirect from accounts.google.com). The `state`
-    parameter -- minted server-side inside an authenticated
-    /gmail/connect call -- works as a single-use bearer because it's
-    cryptographically random and we delete it on first use. This is the
-    standard OAuth CSRF / auth pattern, not a missing auth check.
-    """
-    if error:
-        return HTMLResponse(
-            f"<!doctype html><meta charset='utf-8'>"
-            f"<title>Gmail OAuth failed</title>"
-            f"<h1>Gmail OAuth failed</h1><pre>{error}</pre>",
-            status_code=400,
-        )
-    if not code or not state:
-        return HTMLResponse(
-            "<!doctype html><meta charset='utf-8'>"
-            "<title>Gmail OAuth error</title>"
-            "<h1>Missing code or state on OAuth redirect</h1>",
-            status_code=400,
-        )
-    _, ws = _engine_and_ws()
-    try:
-        profile = gmail_oauth.complete_flow(state, code, ws)
-    except ValueError as exc:
-        return HTMLResponse(
-            f"<!doctype html><meta charset='utf-8'>"
-            f"<title>Gmail OAuth error</title>"
-            f"<h1>OAuth callback rejected</h1><pre>{exc}</pre>",
-            status_code=400,
-        )
-    except Exception as exc:  # noqa: BLE001 - Google SDK throws diverse types
-        return HTMLResponse(
-            f"<!doctype html><meta charset='utf-8'>"
-            f"<title>Gmail OAuth error</title>"
-            f"<h1>Token exchange failed</h1><pre>{exc}</pre>",
-            status_code=400,
-        )
-    email = profile.get("emailAddress", "(unknown)")
-    return HTMLResponse(
-        f"<!doctype html><meta charset='utf-8'>"
-        f"<title>Gmail linked</title>"
-        f"<h1>Gmail linked</h1>"
-        f"<p>Connected as <b>{email}</b>. "
-        f"You can close this tab and return to the dashboard.</p>"
-    )
