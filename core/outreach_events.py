@@ -302,11 +302,12 @@ _PASS_HINTS = (
 )
 
 
-def classify_reply(body_snippet: str | None) -> str:
-    """Returns one of 'meeting_booked' | 'interested' | 'pass' |
-    'unclear' from a Gmail snippet. Lowercase substring match; the
-    operator-facing UI should let humans override the auto-label.
-    """
+_VALID_CLASSES = ("meeting_booked", "interested", "pass", "unclear")
+
+
+def _classify_reply_heuristic(body_snippet: str | None) -> str:
+    """Cheap lowercase-substring classifier. Same precedence as the
+    docstring on `classify_reply`. Always returns a label."""
     if not body_snippet:
         return "unclear"
     text = body_snippet.lower()
@@ -320,6 +321,89 @@ def classify_reply(body_snippet: str | None) -> str:
         if hint in text:
             return "pass"
     return "unclear"
+
+
+def classify_reply(
+    body_snippet: str | None, *, llm: Any = None,
+) -> str:
+    """Returns one of 'meeting_booked' | 'interested' | 'pass' |
+    'unclear' from a Gmail snippet.
+
+    Two-stage classifier (review item #19):
+      1. Cheap heuristic via lowercase substring match. If it
+         resolves to a non-unclear label, return immediately --
+         the obvious cases don't need an LLM round-trip.
+      2. When the heuristic says 'unclear' AND a live LLM client
+         is provided, ask Claude. Falls back to 'unclear' on any
+         model error (we never block the polling pipeline on
+         classification flake).
+
+    The two-stage shape keeps cost / latency low for typical
+    inboxes (most replies are obvious) and reserves the LLM for
+    the genuinely ambiguous cases the operator would otherwise
+    have to read by hand.
+
+    Operator-facing UI should still let humans override the
+    auto-label; classification is a hint, not ground truth.
+    """
+    heuristic_label = _classify_reply_heuristic(body_snippet)
+    if heuristic_label != "unclear":
+        return heuristic_label
+    if llm is None or not body_snippet:
+        return "unclear"
+    # Stub mode: the LLM client raises if no stub_response is
+    # provided. Wrap in try / except so unexpected stub-mode
+    # invocation falls back to the heuristic label rather than
+    # crashing the whole poll pass.
+    try:
+        return _classify_reply_via_llm(llm, body_snippet)
+    except Exception:  # noqa: BLE001 - classification flake -> heuristic
+        return "unclear"
+
+
+def _classify_reply_via_llm(llm: Any, body_snippet: str) -> str:
+    """Single Claude call. Returns one of the four valid labels;
+    anything unexpected collapses to 'unclear'."""
+    from pydantic import BaseModel, Field
+
+    class _ReplyClassification(BaseModel):
+        label: str = Field(
+            description=(
+                "One of: meeting_booked, interested, pass, "
+                "unclear (lowercase, underscored)."
+            ),
+        )
+
+    prompt = (
+        "You are classifying a single email reply from a VC "
+        "partner to a founder's cold outreach. Return strict "
+        "JSON: {\"label\": \"<one_of>\"}\n"
+        "\n"
+        "Labels (use exactly one):\n"
+        "  - meeting_booked: the partner agreed to a meeting "
+        "or shared a calendar link.\n"
+        "  - interested: the partner asked for more info, the "
+        "deck, intros, or signaled curiosity.\n"
+        "  - pass: the partner declined, said not a fit, "
+        "or asked to be removed from outreach.\n"
+        "  - unclear: anything else (autoresponders, OOO, "
+        "ambiguous polite responses).\n"
+        "\n"
+        f"Reply snippet:\n{body_snippet[:1500]}\n"
+        "\n"
+        "Return the JSON object only."
+    )
+    # Stub mode behavior: caller must provide stub_response.
+    # We pass the heuristic's fallback so tests in stub mode
+    # exercise the classifier path without a real model.
+    result = llm.complete_json(
+        prompt=prompt,
+        schema=_ReplyClassification,
+        max_tokens=64,
+        stub_response={"label": "unclear"},
+    )
+    label = (result.label or "").strip().lower()
+    return label if label in _VALID_CLASSES else "unclear"
 
 
 def record_gmail_reply(
@@ -408,13 +492,29 @@ def _partner_by_sent_thread(engine: Any) -> dict[str, str]:
         return {r.thread_id: r.partner_id for r in rows if r.thread_id}
 
 
-def poll_gmail_replies_for_workspace(ws, gmail_client_factory=None) -> PollResult:
+def poll_gmail_replies_for_workspace(
+    ws, gmail_client_factory=None, llm_factory=None,
+) -> PollResult:
     """Poll one workspace's inbox for replies in threads we've sent
     into. Mirrors poll_gmail_sent_for_workspace -- same factory
-    contract, same idempotency, same per-tenant error capture."""
+    contract, same idempotency, same per-tenant error capture.
+
+    `llm_factory` is injected for tests (review item #19). When
+    omitted, defaults to `LLMClient(workspace=ws)`. In stub mode
+    (no ANTHROPIC_API_KEY) the classifier falls back to the
+    heuristic, which is the same behavior as pre-#19.
+    """
     if gmail_client_factory is None:
         from core.gmail_client import GmailClient
         gmail_client_factory = GmailClient.from_workspace_polling
+    if llm_factory is None:
+        def _default_llm_factory(workspace):
+            try:
+                from core.llm.client import LLMClient
+                return LLMClient(workspace=workspace)
+            except Exception:  # noqa: BLE001 - never fail the poll on LLM
+                return None
+        llm_factory = _default_llm_factory
 
     ws_path_str = str(getattr(ws, "path", ws))
 
@@ -459,6 +559,14 @@ def poll_gmail_replies_for_workspace(ws, gmail_client_factory=None) -> PollResul
 
     partner_by_email = partner_by_email_lookup(engine)
     partner_by_thread = _partner_by_sent_thread(engine)
+    # Build the LLM client once per poll pass (one auth + one
+    # stub-check, then reused across every reply). Best-effort:
+    # any failure here -> llm stays None -> classifier falls
+    # back to the heuristic.
+    try:
+        llm = llm_factory(ws)
+    except Exception:  # noqa: BLE001
+        llm = None
     inserted = 0
     for msg in messages:
         sender = (msg.get("recipient_email") or "").strip().lower()
@@ -466,7 +574,9 @@ def poll_gmail_replies_for_workspace(ws, gmail_client_factory=None) -> PollResul
         partner_id = (
             partner_by_email.get(sender) if sender else None
         ) or partner_by_thread.get(thread_id)
-        classification = classify_reply(msg.get("body_snippet"))
+        classification = classify_reply(
+            msg.get("body_snippet"), llm=llm,
+        )
         ok = record_gmail_reply(
             engine,
             external_id=msg["external_id"],
