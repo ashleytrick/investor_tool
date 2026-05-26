@@ -109,7 +109,44 @@ def persist_outcome_event(engine: Any, event: OutcomeEvent) -> int | None:
     # gate re-check (which mark_stale runs) sees the new hydrated
     # state. mark_stale opens its own engine.begin().
     _stale_approvals_if_suppressed(engine, event.partner_id)
+    # Build Session 14: when this outcome flips the partner into
+    # dossier-eligible territory (substantive reply or meeting
+    # booked), spawn an `investor_dossier_needed` review task. The
+    # ensure_review_task helper dedupes against existing open tasks
+    # so attio_outcome_sync's retry / replay cycles don't pile up
+    # duplicate work for the operator.
+    _maybe_create_dossier_task(engine, event)
     return outcome_id
+
+
+def _maybe_create_dossier_task(engine: Any, event: OutcomeEvent) -> None:
+    """Local import + try/except so this hook can never break the
+    outcome write itself. If the meeting-prep module has an issue
+    (bad migration, broken eligibility query), we still want the
+    outcome row + relationship hydration to land."""
+    try:
+        from core.meeting_prep.eligibility import (
+            ensure_review_task,
+            is_dossier_eligible,
+        )
+    except ImportError:
+        return
+    try:
+        result = is_dossier_eligible(engine, event.partner_id)
+        if not result.eligible:
+            return
+        ensure_review_task(
+            engine,
+            partner_id=event.partner_id,
+            source=event.source or "outcome_sync",
+            reason=result.reason,
+        )
+    except Exception:  # noqa: BLE001 - dossier task is best-effort
+        # An unexpected failure in this hook MUST NOT undo the
+        # outcome insert that triggered it. The operator can still
+        # generate a dossier manually; the task creation is a
+        # convenience, not a correctness requirement.
+        pass
 
 
 def _stale_approvals_if_suppressed(engine: Any, partner_id: str) -> None:

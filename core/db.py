@@ -719,8 +719,29 @@ meeting_prep_artifacts = Table(
     Column("drive_doc_id", Text),
     Column("drive_doc_url", Text),
     Column("drive_pushed_at", DateTime),
-    # Index on (partner_id, artifact_type) so the lookup is O(1)
-    # without scanning every row.
+    # Build Session 14: extended cache keys + content + audit.
+    # company_profile_hash captures the operator's company.yaml block;
+    # a re-pitched company evolves its problem/solution and the
+    # dossier should regenerate. live_research_hash + style_sample_hash
+    # stay NULL when the corresponding flag isn't passed.
+    Column("company_profile_hash", Text),
+    Column("live_research_hash", Text),
+    Column("style_sample_hash", Text),
+    # Rendered markdown alongside payload_json. Lets dossier
+    # consumers read the artifact without re-rendering (markdown
+    # rendering is cheap but the operator wants byte-exact stability
+    # for downstream Drive uploads + Docx exports).
+    Column("content_markdown", Text),
+    # JSON summary of the sources the LLM saw at build time --
+    # verified signal ids, live-research urls, style-sample digest.
+    # Surfaced in the Sources section of the dossier.
+    Column("source_summary_json", Text),
+    Column("created_by", Text),
+    # An artifact is superseded when a newer build with the same
+    # (partner, type) but different hash key set replaces it. Latest
+    # row by artifact_id desc remains the canonical lookup; this
+    # column is for audit-trail filtering.
+    Column("superseded_at", DateTime),
     Index(
         "ix_meeting_prep_artifacts_partner_type",
         "partner_id", "artifact_type",
