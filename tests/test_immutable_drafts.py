@@ -19,6 +19,22 @@ def _stage7(ws: str) -> None:
     )
 
 
+def _force_hash_drift(db: Path) -> None:
+    """Stage 7's identical-hash re-run is now a no-op (PR A fix). The
+    stub LLM is deterministic, so any test that wants to assert the
+    supersede + stale path runs MUST drift the prior recommended
+    rows' draft_hash to a sentinel before re-running Stage 7. That
+    flips the no-op check to "real regeneration" and the supersede
+    UPDATE + mark_stale_using_conn fire as before."""
+    c = sqlite3.connect(db)
+    c.execute(
+        "update email_drafts set draft_hash='_force_drift_' "
+        "where is_recommended=1 and superseded_at is null"
+    )
+    c.commit()
+    c.close()
+
+
 def test_stage7_rerun_supersedes_prior_drafts_does_not_delete():
     """A second Stage 7 run on the same workspace must NOT remove the
     prior drafts; it should mark them superseded_at + clear
@@ -47,6 +63,9 @@ def test_stage7_rerun_supersedes_prior_drafts_does_not_delete():
 
         # Re-run Stage 7 -- prior drafts should be superseded, NOT
         # deleted. Total row count grows; live count stays the same.
+        # Force hash drift first so the no-op check doesn't short-
+        # circuit (stub LLM is deterministic).
+        _force_hash_drift(db)
         _stage7(ws)
         c = sqlite3.connect(db)
         second_count = c.execute(
@@ -129,6 +148,9 @@ def test_approved_draft_supersede_runs_state_machine_stale():
 
         # Re-run Stage 7 -- the approved draft gets superseded, which
         # must trigger the body_regenerated state-machine event.
+        # Force hash drift so the no-op check fires the supersede
+        # path (deterministic stub LLM otherwise no-ops the rerun).
+        _force_hash_drift(db)
         _stage7(ws)
 
         c = sqlite3.connect(db)
@@ -157,9 +179,10 @@ def test_list_draft_history_shows_all_versions():
         shutil.copytree(ws_src, ws_dst)
         ws = str(ws_dst)
         _run_pipeline_through_stage_6(ws_dst)
-        _stage7(ws)
-        _stage7(ws)  # two generations
         db = ws_dst / "data" / "pipeline.db"
+        _stage7(ws)
+        _force_hash_drift(db)  # avoid the identical-hash no-op
+        _stage7(ws)  # two generations
         c = sqlite3.connect(db)
         pid = c.execute(
             "select partner_id from email_drafts limit 1"
@@ -187,6 +210,167 @@ def test_list_draft_history_shows_all_versions():
         assert min_live > max_super
 
 
+def test_stage7_identical_regen_is_noop_and_does_not_stale_approval():
+    """Regression: an idempotent Stage 7 re-run on the same workspace
+    (deterministic stub LLM -> identical (subject, body) per partner)
+    must NOT supersede the prior recommended drafts, must NOT insert
+    new email_drafts rows, and must NOT flip an existing
+    approved_to_send approval to stale_after_approval.
+
+    Pre-PR-A behavior was: every Stage 7 re-run supersedes the prior
+    live rows unconditionally + runs mark_stale on any approved row.
+    Operators got "phantom" stale events on a no-op re-run.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+
+        _stage7(ws)
+        # Approve a draft so we can prove the approval survives the
+        # idempotent re-run.
+        c = sqlite3.connect(db)
+        draft_id, pid = c.execute(
+            "select draft_id, partner_id from email_drafts "
+            "where is_recommended=1 limit 1"
+        ).fetchone()
+        c.execute(
+            "update partners set email='op@operator.com', "
+            "email_verification_status='valid' where partner_id=?",
+            (pid,),
+        )
+        c.commit()
+        first_total = c.execute(
+            "select count(*) from email_drafts"
+        ).fetchone()[0]
+        first_super = c.execute(
+            "select count(*) from email_drafts where superseded_at is not null"
+        ).fetchone()[0]
+        first_events = c.execute(
+            "select count(*) from draft_approvals where draft_id=?",
+            (draft_id,),
+        ).fetchone()[0]
+        c.close()
+        subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
+             "--workspace", ws, "--draft-id", str(draft_id),
+             "--allow-example-domains"],
+            check=True, capture_output=True,
+            env={**os.environ, "USER": "tester"}, timeout=60,
+        )
+        # Re-run Stage 7 with NO hash drift -- the stub LLM is
+        # deterministic so every variant body matches its prior live
+        # row exactly. The no-op fix should kick in.
+        _stage7(ws)
+        c = sqlite3.connect(db)
+        # No new rows.
+        second_total = c.execute(
+            "select count(*) from email_drafts"
+        ).fetchone()[0]
+        second_super = c.execute(
+            "select count(*) from email_drafts where superseded_at is not null"
+        ).fetchone()[0]
+        # Approval still approved (no phantom stale event).
+        status = c.execute(
+            "select approval_status from email_drafts where draft_id=?",
+            (draft_id,),
+        ).fetchone()[0]
+        # No new draft_approvals events for that draft beyond the
+        # approval we made.
+        second_events = c.execute(
+            "select count(*) from draft_approvals where draft_id=?",
+            (draft_id,),
+        ).fetchone()[0]
+        c.close()
+        assert second_total == first_total, (
+            f"identical regen inserted new rows: was {first_total}, "
+            f"now {second_total}"
+        )
+        assert second_super == first_super, (
+            f"identical regen superseded a row: was {first_super}, "
+            f"now {second_super}"
+        )
+        assert status == "approved_to_send", (
+            f"phantom stale: approval flipped to {status} despite "
+            f"identical-body re-run"
+        )
+        # 1 new event from the approve call itself (+1 from initial
+        # needs_review seed). No body_regenerated event.
+        assert second_events == first_events + 1, (
+            f"unexpected new draft_approvals event(s) on idempotent "
+            f"re-run: was {first_events}, now {second_events}"
+        )
+
+
+def test_stage7_real_regen_stales_approval_in_same_txn():
+    """Mirror of the no-op test: when the new recommended body DOES
+    differ from the prior live row (forced via hash drift here), the
+    supersede + mark_stale MUST fire, and they must land in the same
+    transaction so a crash between can't leave superseded_at IS NOT
+    NULL with approval_status='approved_to_send' and no event row.
+
+    We can't directly observe atomicity, but we can assert that on a
+    successful run the supersede + stale_after_approval event + the
+    pointer flip all show up together for the approved draft.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        db = ws_dst / "data" / "pipeline.db"
+
+        _stage7(ws)
+        c = sqlite3.connect(db)
+        draft_id, pid = c.execute(
+            "select draft_id, partner_id from email_drafts "
+            "where is_recommended=1 limit 1"
+        ).fetchone()
+        c.execute(
+            "update partners set email='op@operator.com', "
+            "email_verification_status='valid' where partner_id=?",
+            (pid,),
+        )
+        c.commit()
+        c.close()
+        subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "approve_draft.py"),
+             "--workspace", ws, "--draft-id", str(draft_id),
+             "--allow-example-domains"],
+            check=True, capture_output=True,
+            env={**os.environ, "USER": "tester"}, timeout=60,
+        )
+        # Force hash drift so the second Stage 7 takes the "real
+        # regeneration" path.
+        _force_hash_drift(db)
+        _stage7(ws)
+        c = sqlite3.connect(db)
+        status, superseded_at = c.execute(
+            "select approval_status, superseded_at from email_drafts "
+            "where draft_id=?", (draft_id,),
+        ).fetchone()
+        latest_event = c.execute(
+            "select event_type, notes from draft_approvals "
+            "where draft_id=? order by event_id desc limit 1",
+            (draft_id,),
+        ).fetchone()
+        c.close()
+        assert superseded_at is not None, (
+            "supersede UPDATE should have stamped superseded_at"
+        )
+        assert status == "stale_after_approval", (
+            f"pointer should flip to stale_after_approval, got {status}"
+        )
+        assert latest_event[0] == "stale_after_approval", (
+            f"latest event should be stale_after_approval, got {latest_event[0]}"
+        )
+        assert "body_regenerated" in (latest_event[1] or "")
+
+
 def test_followup_and_deck_supersede_on_stage7_rerun():
     """Slice 17 follow-up (#17): followup_drafts and
     deck_request_responses are now also versioned -- Stage 7 re-runs
@@ -206,6 +390,10 @@ def test_followup_and_deck_supersede_on_stage7_rerun():
         c.close()
         assert first_fu > 0
         assert first_dk > 0
+        # Force hash drift so the email_drafts no-op check doesn't
+        # short-circuit. Followups + decks always supersede when their
+        # parent email_drafts is re-generated.
+        _force_hash_drift(db)
         _stage7(ws)
         c = sqlite3.connect(db)
         # Live count stays the same, total doubles.

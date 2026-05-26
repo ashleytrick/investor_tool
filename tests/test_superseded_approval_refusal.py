@@ -46,7 +46,15 @@ def _stage7(ws: str) -> None:
 
 def _setup_with_superseded(tmp_path: Path) -> tuple[Path, str, int, str]:
     """Build a fixture workspace with a superseded draft. Returns
-    (db_path, workspace_str, superseded_draft_id, partner_id)."""
+    (db_path, workspace_str, superseded_draft_id, partner_id).
+
+    Post-PR-A fix to Stage 7: an identical-hash re-run is now a
+    no-op (no supersede / no new insert). The stub LLM is
+    deterministic, so to force the second Stage 7 to supersede we
+    drift the prior live recommended drafts' draft_hash to a sentinel
+    before the second run. The new run sees prior_hash != new_hash
+    and goes through the full supersede + stale + insert path.
+    """
     ws_src = REPO_ROOT / "clients" / "test_workspace"
     ws_dst = tmp_path / "test_workspace"
     shutil.copytree(ws_src, ws_dst)
@@ -56,7 +64,15 @@ def _setup_with_superseded(tmp_path: Path) -> tuple[Path, str, int, str]:
     ws = str(ws_dst)
     _run_pipeline_through_stage_6(ws_dst)
     _stage7(ws)
-    # Re-run Stage 7 so the original generation gets superseded.
+    # Drift prior recommended-row hashes so the second run treats
+    # them as "real regeneration" rather than a no-op.
+    c = sqlite3.connect(db)
+    c.execute(
+        "update email_drafts set draft_hash='_force_drift_' "
+        "where is_recommended=1 and superseded_at is null"
+    )
+    c.commit()
+    c.close()
     _stage7(ws)
     c = sqlite3.connect(db)
     super_id, pid = c.execute(

@@ -128,32 +128,30 @@ def test_full_pipeline_end_to_end():
         _run("07_generate_emails.py", "--workspace", ws, "--top", "5", cwd=REPO_ROOT)
 
         new_counts = _counts(db)
-        # email_drafts / followup_drafts / deck_request_responses are
-        # excluded from raw-count idempotency: Slice 17 + #17 follow-up
-        # preserve prior generations (superseded_at IS NOT NULL) instead
-        # of deleting them, so each of those totals doubles on every
-        # Stage 7 re-run by design. The LIVE row count (superseded_at IS
-        # NULL) IS still idempotent and is checked separately below.
+        # Post-PR-A: an idempotent Stage 7 re-run is now a true no-op
+        # for email_drafts when the new recommended variant's hash
+        # matches the prior live row (deterministic stub LLM ->
+        # identical bodies -> zero new rows + zero supersedes). The
+        # follow-up + deck supersede is gated on the email_drafts
+        # supersede firing, so those are also no-ops on an
+        # identical-hash re-run. Net result: every table count is
+        # unchanged after a second Stage 7 run with the same inputs.
         for table in ("funds", "partners", "signals", "deal_attributions",
-                      "partner_score_summaries", "source_snapshots"):
+                      "partner_score_summaries", "source_snapshots",
+                      "email_drafts", "followup_drafts",
+                      "deck_request_responses"):
             assert new_counts[table] == counts[table], (
-                f"idempotency broken on {table}: was {counts[table]}, now {new_counts[table]}"
+                f"idempotency broken on {table}: was {counts[table]}, "
+                f"now {new_counts[table]}"
             )
         c = sqlite3.connect(db)
         for table in ("email_drafts", "followup_drafts", "deck_request_responses"):
-            live = c.execute(
-                f"select count(*) from {table} where superseded_at is null"
-            ).fetchone()[0]
             superseded = c.execute(
                 f"select count(*) from {table} where superseded_at is not null"
             ).fetchone()[0]
-            assert live == counts[table], (
-                f"live {table} changed across runs: "
-                f"first={counts[table]} now_live={live}"
-            )
-            assert superseded == counts[table], (
-                f"superseded {table} count != prior live count: "
-                f"superseded={superseded} prior_live={counts[table]}"
+            assert superseded == 0, (
+                f"identical-hash Stage 7 re-run should not supersede "
+                f"any {table} row; got {superseded}"
             )
         c.close()
 

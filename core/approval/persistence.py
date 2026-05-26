@@ -153,6 +153,62 @@ def seed_draft(
         )
 
 
+def _transition_using_conn(
+    conn: Any,
+    *,
+    draft_id: int,
+    partner_id: str,
+    to_state: str,
+    actor: str,
+    source: str,
+    draft_hash: str | None = None,
+    notes: str | None = None,
+    overridden_blockers: list[str] | None = None,
+) -> None:
+    """Inner transition writer that reuses an open connection. Used by
+    callers that already hold an engine.begin() block (Stage 7's
+    supersede pass) so the event + pointer update land in the SAME
+    transaction as the surrounding work. The wrapping `transition()`
+    function opens its own engine.begin() and delegates here."""
+    row = conn.execute(
+        select(
+            email_drafts.c.approval_status,
+            email_drafts.c.draft_hash,
+        ).where(email_drafts.c.draft_id == draft_id)
+    ).first()
+    if row is None:
+        raise ValueError(
+            f"transition called on unknown draft_id={draft_id!r}",
+        )
+    current = row.approval_status
+    # Validate edge BEFORE writing anything.
+    assert_can_transition(current, to_state, source=source)
+    effective_hash = draft_hash if draft_hash is not None else row.draft_hash
+    conn.execute(draft_approvals.insert().values(
+        draft_id=draft_id,
+        partner_id=partner_id,
+        event_type=to_state,
+        actor=actor,
+        at=_now(),
+        draft_hash=effective_hash,
+        notes=notes,
+        overridden_blockers=(
+            json.dumps(list(overridden_blockers))
+            if overridden_blockers else None
+        ),
+    ))
+    conn.execute(
+        update(email_drafts)
+        .where(email_drafts.c.draft_id == draft_id)
+        .values(
+            approval_status=to_state,
+            # Refresh the pointer's hash too when an explicit
+            # hash was passed (regeneration / human edit cases).
+            draft_hash=effective_hash,
+        )
+    )
+
+
 def transition(
     engine: Any,
     *,
@@ -180,42 +236,11 @@ def transition(
     triggered by a regeneration).
     """
     with engine.begin() as conn:
-        row = conn.execute(
-            select(
-                email_drafts.c.approval_status,
-                email_drafts.c.draft_hash,
-            ).where(email_drafts.c.draft_id == draft_id)
-        ).first()
-        if row is None:
-            raise ValueError(
-                f"transition called on unknown draft_id={draft_id!r}",
-            )
-        current = row.approval_status
-        # Validate edge BEFORE writing anything.
-        assert_can_transition(current, to_state, source=source)
-        effective_hash = draft_hash if draft_hash is not None else row.draft_hash
-        conn.execute(draft_approvals.insert().values(
-            draft_id=draft_id,
-            partner_id=partner_id,
-            event_type=to_state,
-            actor=actor,
-            at=_now(),
-            draft_hash=effective_hash,
-            notes=notes,
-            overridden_blockers=(
-                json.dumps(list(overridden_blockers))
-                if overridden_blockers else None
-            ),
-        ))
-        conn.execute(
-            update(email_drafts)
-            .where(email_drafts.c.draft_id == draft_id)
-            .values(
-                approval_status=to_state,
-                # Refresh the pointer's hash too when an explicit
-                # hash was passed (regeneration / human edit cases).
-                draft_hash=effective_hash,
-            )
+        _transition_using_conn(
+            conn, draft_id=draft_id, partner_id=partner_id,
+            to_state=to_state, actor=actor, source=source,
+            draft_hash=draft_hash, notes=notes,
+            overridden_blockers=overridden_blockers,
         )
 
 
@@ -320,6 +345,27 @@ def mark_stale(
     full_notes = trigger if notes is None else f"{trigger}: {notes}"
     transition(
         engine, draft_id=draft_id, partner_id=partner_id,
+        to_state="stale_after_approval", actor="system", source="system",
+        notes=full_notes,
+    )
+
+
+def mark_stale_using_conn(
+    conn: Any, *, draft_id: int, partner_id: str,
+    trigger: str, notes: str | None = None,
+) -> None:
+    """Same as `mark_stale` but reuses an open connection so the
+    stale_after_approval event lands in the SAME transaction as the
+    surrounding work. Used by Stage 7's supersede pass to guarantee
+    that "draft superseded" and "approval invalidated" commit
+    atomically -- a process death between the two would otherwise
+    leave a draft with superseded_at IS NOT NULL but
+    approval_status='approved_to_send', and the draft_approvals
+    event log would never see the invalidation.
+    """
+    full_notes = trigger if notes is None else f"{trigger}: {notes}"
+    _transition_using_conn(
+        conn, draft_id=draft_id, partner_id=partner_id,
         to_state="stale_after_approval", actor="system", source="system",
         notes=full_notes,
     )

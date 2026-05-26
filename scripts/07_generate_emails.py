@@ -768,12 +768,44 @@ def main() -> int:
         # DELETE (their re-run semantics haven't been extended).
         # Pre-compute the next version per-partner so the INSERTed
         # new rows know what version to use.
-        from core.approval.persistence import mark_stale
+        #
+        # Post-PR-29 review fix (no phantom staling): compute the new
+        # RECOMMENDED variant's draft_hash per partner BEFORE the
+        # supersede block. If it equals the prior live recommended
+        # row's hash, the regeneration is a true no-op for that
+        # partner -- skip the supersede UPDATE, skip the stale
+        # transition, and skip the new INSERT (recorded in
+        # `unchanged_partners` and consumed by the insert loop
+        # below). This prevents idempotent Stage 7 re-runs from
+        # invalidating a still-good approval.
+        #
+        # Post-PR-29 review fix (atomic stale + supersede): the
+        # stale_after_approval transition now runs INSIDE the
+        # supersede transaction via mark_stale_using_conn. The prior
+        # shape committed the supersede, then opened a NEW
+        # engine.begin() for mark_stale -- process death between
+        # them left superseded_at IS NOT NULL with
+        # approval_status='approved_to_send' and no event row.
+        from core.approval.persistence import (
+            compute_draft_hash, mark_stale_using_conn,
+        )
         from core.approval.state_machine import (
             STATE_APPROVED_TO_SEND, TRIGGER_BODY_REGENERATED,
         )
+        # Map partner_id -> hash of the new recommended variant.
+        # Partners whose batch had no recommended variant (failed
+        # regeneration) don't appear here and skip the no-op check.
+        new_rec_hash: dict[str, str] = {}
+        for pctx_x, output_x, _ in partner_outputs:
+            pid_x = pctx_x["partner_id"]
+            for v in output_x.variants:
+                if v.strategy == output_x.recommended_variant_strategy:
+                    new_rec_hash[pid_x] = compute_draft_hash(
+                        v.subject, v.body,
+                    )
+                    break
         max_versions: dict[str, int] = {}
-        approved_to_stale: list[tuple[int, str]] = []
+        unchanged_partners: set[str] = set()
         with engine.begin() as conn:
             for pid in partner_ids_in_batch:
                 cur_max = conn.execute(
@@ -781,18 +813,36 @@ def main() -> int:
                     .where(email_drafts.c.partner_id == pid)
                 ).scalar() or 0
                 max_versions[pid] = int(cur_max)
+                # No-op detection: compare the new recommended hash
+                # against the prior live recommended row's hash. If
+                # they match, the regeneration produced byte-identical
+                # output -- skip supersede + stale + insert entirely.
+                prior_rec_hash = conn.execute(
+                    select(email_drafts.c.draft_hash).where(
+                        email_drafts.c.partner_id == pid,
+                        email_drafts.c.is_recommended.is_(True),
+                        email_drafts.c.superseded_at.is_(None),
+                    )
+                ).scalar()
+                new_hash = new_rec_hash.get(pid)
+                if (
+                    new_hash is not None
+                    and prior_rec_hash is not None
+                    and prior_rec_hash == new_hash
+                ):
+                    unchanged_partners.add(pid)
+                    continue  # leave prior generation in place
                 # Capture currently-approved drafts BEFORE the
                 # supersede UPDATE so mark_stale's state-machine
                 # check sees the right pointer state.
-                for r in conn.execute(
+                approved_rows = list(conn.execute(
                     select(email_drafts.c.draft_id, email_drafts.c.partner_id)
                     .where(
                         email_drafts.c.partner_id == pid,
                         email_drafts.c.approval_status == STATE_APPROVED_TO_SEND,
                         email_drafts.c.superseded_at.is_(None),
                     )
-                ):
-                    approved_to_stale.append((int(r.draft_id), r.partner_id))
+                ))
                 conn.execute(
                     email_drafts.update()
                     .where(
@@ -804,6 +854,21 @@ def main() -> int:
                         is_recommended=False,
                     )
                 )
+                # Stale prior approved drafts IN THIS TRANSACTION so a
+                # crash between supersede and stale can't produce an
+                # inconsistent state.
+                for r in approved_rows:
+                    mark_stale_using_conn(
+                        conn,
+                        draft_id=int(r.draft_id),
+                        partner_id=r.partner_id,
+                        trigger=TRIGGER_BODY_REGENERATED,
+                        notes=(
+                            f"Stage 7 regeneration: prior draft "
+                            f"superseded by new version "
+                            f"{max_versions[pid] + 1}"
+                        ),
+                    )
                 # Slice 17 follow-up (#17): supersede followup_drafts +
                 # deck_request_responses too. Same version+superseded_at
                 # pattern as email_drafts -- the new Stage 7 generation
@@ -825,19 +890,6 @@ def main() -> int:
                     )
                     .values(superseded_at=_now())
                 )
-        # Run stale_after_approval transitions OUTSIDE the supersede
-        # transaction; mark_stale opens its own engine.begin().
-        for draft_id, pid in approved_to_stale:
-            mark_stale(
-                engine,
-                draft_id=draft_id,
-                partner_id=pid,
-                trigger=TRIGGER_BODY_REGENERATED,
-                notes=(
-                    f"Stage 7 regeneration: prior draft superseded "
-                    f"by new version {max_versions[pid] + 1}"
-                ),
-            )
         with engine.begin() as conn:
 
             # Index per-draft QA results by (partner_id, strategy).
@@ -854,6 +906,13 @@ def main() -> int:
                 # ordering would pick up. Skip the insert too so the
                 # preservation guarantee is actually airtight.
                 if pid in partner_ids_with_failed_rec:
+                    continue
+                # Post-PR-29 review fix (no phantom staling): when the
+                # supersede pass detected a byte-identical recommended
+                # body for this partner, the prior generation was left
+                # in place. Skip the insert so we don't pile up
+                # duplicate rows that have the same draft_hash.
+                if pid in unchanged_partners:
                     continue
                 # Slice 1: every new draft starts in the approval state
                 # machine as `needs_review`. Stage 7 produces drafts but
