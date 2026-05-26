@@ -17,244 +17,42 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import pathlib
 import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from selectolax.parser import HTMLParser
 from sqlalchemy import select
 
 from core.config_loader import add_workspace_arg
-from core.db import funds, partners, source_snapshots, upsert
-from core.stage_runner import stage_run
-from core.http_client import HttpClient
+from core.db import funds, partners, upsert
 from core.ids import partner_id_for
-from core.llm.client import MODEL_BATCH
-from schemas.fund_enrichment import FundEnrichment
+from core.stage_runner import stage_run
 
-STAGE = "02_enrich_funds"
-# Required pages: failing to fetch any of these means the fund row
-# can't be enriched meaningfully -- the homepage is the canonical
-# source for fund identity, thesis, and team lookup. A transport /
-# 5xx failure on a REQUIRED path becomes a per-fund run.fail in
-# gather_live_pages's caller.
-LIVE_PATHS_REQUIRED: tuple[str, ...] = ("",)
-# Optional pages: useful context when they fetch, but a missing
-# /portfolio or /news is normal and shouldn't bump run.failed.
-LIVE_PATHS_OPTIONAL: tuple[str, ...] = (
-    "portfolio", "team", "thesis", "about", "news",
+# Slice 18c: fetch + extract logic moved to core/stage2/. Re-exported
+# below as module-level names so any external caller that imports
+# from this script keeps working.
+from core.stage2.fetch import (  # noqa: F401
+    LIVE_PATHS,
+    LIVE_PATHS_OPTIONAL,
+    LIVE_PATHS_REQUIRED,
+    STAGE,
+    extract_text as _extract_text,
+    gather_fixture_pages,
+    gather_live_pages,
+    page_url as _page_url,
+    store_snapshots,
 )
-LIVE_PATHS = list(LIVE_PATHS_REQUIRED + LIVE_PATHS_OPTIONAL)
-PROMPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "enrich_fund.txt"
+from core.stage2.extract import (  # noqa: F401
+    PROMPT_PATH,
+    deterministic_enrichment,
+    enrich,
+)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _extract_text(html: str) -> str:
-    return HTMLParser(html).text(separator=" ", strip=True)
-
-
-def _content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _page_url(domain: str, path: str) -> str:
-    return f"https://{domain}/" if path in ("", "index") else f"https://{domain}/{path}"
-
-
-def gather_fixture_pages(fund: dict, ws) -> dict[str, str]:
-    """Read local fixture HTML for a fund. Returns {url: html}."""
-    fx_dir = ws.fixtures_dir / "fund_pages" / fund["domain"]
-    pages: dict[str, str] = {}
-    if not fx_dir.is_dir():
-        return pages
-    for f in sorted(fx_dir.glob("*.html")):
-        pages[_page_url(fund["domain"], f.stem)] = f.read_text(encoding="utf-8")
-    return pages
-
-
-async def gather_live_pages(
-    fund: dict,
-) -> tuple[dict[str, dict], list[tuple[str, str]], list[tuple[str, str]]]:
-    """Fetch standard fund pages. Returns
-    (pages_by_url, required_failures, optional_failures) where the
-    failure lists are (url, reason) tuples for the operator audit trail.
-
-    Required failures (transport / 5xx on a REQUIRED path) signal that
-    the fund can't be enriched at all -- Stage 2's caller counts each
-    as a per-fund run.fail so cron / wrappers notice. Optional
-    failures (transport / 5xx on a NICE-TO-HAVE path) are logged for
-    audit but don't bump run.failed; a missing /portfolio is normal.
-
-    Batch 36 (#13): result dict carries final_url alongside the HTML so
-    store_snapshots can persist the post-redirect URL into
-    source_snapshots.final_url.
-
-    Non-200 4xx responses are still ignored (a missing /portfolio is
-    normal and Attio-like sites often 404 paths that don't exist),
-    but transport-layer errors and 5xx responses are surfaced to the
-    caller so they can land in run_errors.
-    """
-    client = HttpClient()
-    pages: dict[str, dict] = {}
-    required_failures: list[tuple[str, str]] = []
-    optional_failures: list[tuple[str, str]] = []
-    for path in LIVE_PATHS:
-        is_required = path in LIVE_PATHS_REQUIRED
-        url = _page_url(fund["domain"], path)
-        try:
-            res = await client.fetch(url)
-        except Exception as exc:  # noqa: BLE001 - audited via failures
-            bucket = required_failures if is_required else optional_failures
-            bucket.append((url, f"{type(exc).__name__}: {exc}"))
-            continue
-        if res.status == 200 and res.text.strip():
-            pages[url] = {"html": res.text, "final_url": res.final_url}
-            continue
-        if res.status >= 500:
-            bucket = required_failures if is_required else optional_failures
-            bucket.append((url, f"HTTP {res.status}"))
-            continue
-        # 4xx on a REQUIRED path is also a hard fund-level problem:
-        # we asked for the homepage and got "not here". Optional 4xx
-        # stays silent.
-        if is_required and res.status >= 400:
-            required_failures.append((url, f"HTTP {res.status}"))
-    return pages, required_failures, optional_failures
-
-
-def deterministic_enrichment(pages: dict) -> dict:
-    """Offline stub: extract enrichment from the structured fixture HTML.
-
-    Designed for the fixture HTML format (meta tags + .partner / .portfolio-company
-    nodes). The live LLM path handles arbitrary real fund sites.
-    """
-    out = {
-        "thesis_summary": None,
-        "stated_sectors": [],
-        "stated_stage_focus": None,
-        "check_size_range": None,
-        "portfolio_companies": [],
-        "current_partners": [],
-        "recent_focus_signals": None,
-        "explicit_kill_signals": [],
-        "source_urls_used": sorted(pages.keys()),
-    }
-    for entry in pages.values():
-        html = _page_html(entry)
-        tree = HTMLParser(html)
-
-        def meta(name: str) -> str | None:
-            node = tree.css_first(f'meta[name="{name}"]')
-            return node.attributes.get("content") if node else None
-
-        if (t := meta("thesis")) and not out["thesis_summary"]:
-            out["thesis_summary"] = t
-        if (s := meta("stage")) and not out["stated_stage_focus"]:
-            out["stated_stage_focus"] = s
-        if (c := meta("check-size")) and not out["check_size_range"]:
-            out["check_size_range"] = c
-        if (sec := meta("sectors")) and not out["stated_sectors"]:
-            out["stated_sectors"] = [x.strip() for x in sec.split(",") if x.strip()]
-        if (rf := meta("recent-focus")) and not out["recent_focus_signals"]:
-            out["recent_focus_signals"] = rf
-        if (ks := meta("kill-signal")) and ks not in out["explicit_kill_signals"]:
-            out["explicit_kill_signals"].append(ks)
-
-        for node in tree.css("div.partner"):
-            name = node.attributes.get("data-name")
-            if not name:
-                continue
-            out["current_partners"].append({
-                "name": name,
-                "title": node.attributes.get("data-title"),
-                "bio_snippet": node.text(separator=" ", strip=True) or None,
-            })
-        for node in tree.css("li.portfolio-company"):
-            company = node.text(strip=True)
-            if company and company not in out["portfolio_companies"]:
-                out["portfolio_companies"].append(company)
-    return out
-
-
-def _page_html(entry) -> str:
-    """Pages may be {url: html_str} (fixture) or {url: {html, final_url}}
-    (live; Batch 36 #13). Normalize."""
-    if isinstance(entry, dict):
-        return entry.get("html", "")
-    return entry
-
-
-def enrich(llm: LLMClient, fund: dict, pages: dict) -> FundEnrichment:
-    """Run enrichment. Live: LLM over fetched content. Stub: deterministic."""
-    content = "\n\n".join(
-        f"--- {url} ---\n{_extract_text(_page_html(html))}"
-        for url, html in pages.items()
-    )
-    prompt = (
-        PROMPT_PATH.read_text(encoding="utf-8")
-        .replace("{FUND_NAME}", fund["name"])
-        .replace("{DOMAIN}", fund["domain"])
-        .replace("{CONTENT}", content)
-    )
-    return llm.complete_json(
-        prompt=prompt,
-        schema=FundEnrichment,
-        model=MODEL_BATCH,
-        stub_response=deterministic_enrichment(pages),
-    )
-
-
-def store_snapshots(engine, pages: dict) -> int:
-    """Write each fetched page to source_snapshots, deduped on (url, hash).
-
-    `pages` accepts either:
-      - {url: html_str}  (fixture path; final_url stays NULL)
-      - {url: {"html": ..., "final_url": ...}}  (live path; final_url is
-        captured from the post-redirect httpx response, Batch 36 #13)
-    """
-    written = 0
-    with engine.begin() as conn:
-        for url, entry in pages.items():
-            if isinstance(entry, dict):
-                html = entry.get("html", "")
-                final_url = entry.get("final_url")
-            else:
-                html = entry
-                final_url = None
-            text = _extract_text(html)
-            chash = _content_hash(text)
-            exists = conn.execute(
-                select(source_snapshots.c.snapshot_id).where(
-                    source_snapshots.c.source_url == url,
-                    source_snapshots.c.content_hash == chash,
-                )
-            ).first()
-            if exists:
-                continue
-            # Slice 18b: register the URL in the canonical sources
-            # registry + stamp source_id on the snapshot.
-            from core.sources import upsert_source
-            sid = upsert_source(
-                conn, source_url=url, source_type="fund_team_page",
-            )
-            conn.execute(source_snapshots.insert().values(
-                source_url=url,
-                source_id=sid,
-                final_url=final_url,
-                fetched_at=_now(),
-                http_status=200,
-                content_hash=chash,
-                extracted_text=text,
-                fetched_during_stage=STAGE,
-            ))
-            written += 1
-    return written
 
 
 def main() -> int:
