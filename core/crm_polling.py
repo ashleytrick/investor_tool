@@ -165,6 +165,50 @@ class AttioCRMClient:
         # future PR.
         return []
 
+    # ---------- B7/B8/B9 read surfaces ----------
+    #
+    # These all currently return [] in production for the same
+    # reason as list_pipeline_updates_since -- the real Attio
+    # endpoints exist but the schema mapping depends on per-tenant
+    # workspace shape that we'd ask the operator to configure.
+    # Tests inject fake data via client_factory.
+
+    def list_investors(self) -> list[dict]:
+        """Return every firm/partner pair the CRM has on file:
+            {"firm": str, "partner": str, "email": str | None,
+             "attio_person_id": str | None,
+             "attio_company_id": str | None}
+        Used by B7's poll-crm-investors hook + B9's one-shot
+        bulk import on connect."""
+        return []
+
+    def list_relationships_since(
+        self, after: _dt.datetime,
+    ) -> list[dict]:
+        """Recent relationship events the CRM tracks (intro made,
+        mutual connection added, last contact). Per-event dict:
+            {"partner_email": str, "rel_type": str,
+             "occurred_at": datetime UTC, "notes": str | None}
+        B7's poll-crm-relationships (6h)."""
+        return []
+
+    def list_list_memberships(self) -> list[dict]:
+        """Snapshot of every list-membership pairing in the CRM:
+            {"list_name": str, "partner_email": str}
+        B8's poll-crm-lists (1h)."""
+        return []
+
+    def list_deals_since(
+        self, after: _dt.datetime,
+    ) -> list[dict]:
+        """Recent deal records:
+            {"deal_id": str, "stage": str,
+             "partner_email": str | None,
+             "amount": float | None,
+             "updated_at": datetime UTC}
+        B8's poll-crm-deals (1h)."""
+        return []
+
 
 class CRMPollError(RuntimeError):
     """Raised by provider clients on any HTTP / parse failure.
@@ -439,3 +483,398 @@ def poll_crm_pipeline_for_workspace(
         ))
         _stamp_sync_status(engine, provider=provider, status="ok")
     return results
+
+
+# ---------- B7: investors + relationships (6h cadence) ----------
+
+def _import_investor_row(
+    engine: Any, *, firm: str, partner_name: str,
+    email: Optional[str], attio_person_id: Optional[str],
+    attio_company_id: Optional[str],
+) -> bool:
+    """Upsert one investor row into local funds + partners.
+    Returns True if a new partner row was created."""
+    from core.ids import (
+        fund_id_for, normalize_domain, partner_id_for,
+    )
+    from core.db import funds as _funds, partners as _partners
+    domain = normalize_domain(
+        ((email or '').split('@', 1)[1] if '@' in (email or '') else '')
+        or _slug_unclaimed(firm)
+    )
+    if not domain:
+        return False
+    fund_id = fund_id_for(domain)
+    partner_id = partner_id_for(domain, partner_name)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    created = False
+    with engine.begin() as conn:
+        # Upsert fund.
+        existing_fund = conn.execute(
+            select(_funds.c.fund_id).where(
+                _funds.c.fund_id == fund_id,
+            )
+        ).first()
+        if existing_fund is None:
+            conn.execute(_funds.insert().values(
+                fund_id=fund_id,
+                name=firm,
+                domain=domain,
+                attio_record_id=attio_company_id,
+                is_active=True,
+                is_provisional=domain.endswith('.unclaimed'),
+                last_updated=now,
+            ))
+        # Upsert partner.
+        existing_partner = conn.execute(
+            select(_partners.c.partner_id).where(
+                _partners.c.partner_id == partner_id,
+            )
+        ).first()
+        if existing_partner is None:
+            conn.execute(_partners.insert().values(
+                partner_id=partner_id,
+                fund_id=fund_id,
+                name=partner_name,
+                email=email,
+                attio_record_id=attio_person_id,
+                is_provisional=domain.endswith('.unclaimed'),
+                last_updated=now,
+            ))
+            created = True
+        elif email:
+            # Backfill email if we now know one. Don't overwrite
+            # an existing email (multiple emails per partner is a
+            # different signal that we handle elsewhere).
+            current = conn.execute(
+                select(_partners.c.email).where(
+                    _partners.c.partner_id == partner_id,
+                )
+            ).scalar()
+            if not current:
+                conn.execute(
+                    _partners.update()
+                    .where(_partners.c.partner_id == partner_id)
+                    .values(email=email, last_updated=now)
+                )
+    return created
+
+
+def _slug_unclaimed(firm: str) -> str:
+    cleaned = ''.join(
+        ch if ch.isalnum() else '-'
+        for ch in (firm or '').strip().lower()
+    ).strip('-')
+    return f'{cleaned}.unclaimed' if cleaned else ''
+
+
+def poll_crm_investors_for_workspace(
+    ws, client_factory=None,
+) -> list[PollResult]:
+    """B7 (6h). Pull the CRM's full investor list and upsert into
+    local funds + partners. Idempotent on (fund_id, partner_id).
+    """
+    if client_factory is None:
+        client_factory = _client_for
+    ws_path_str = str(getattr(ws, 'path', ws))
+    engine = get_engine(f'sqlite:///{ws.path}/data/pipeline.db')
+    providers = _connected_providers(engine)
+    if not providers:
+        return []
+    results: list[PollResult] = []
+    for provider, api_key in providers:
+        _stamp_sync_status(engine, provider=provider, status='syncing')
+        try:
+            client = client_factory(provider, api_key)
+            rows = list(client.list_investors())
+        except CRMPollError as exc:
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=str(exc),
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error', error=str(exc),
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=f'client_failed: {exc}',
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error',
+                error=f'client_failed: {exc}',
+            )
+            continue
+        new_partners = 0
+        for r in rows:
+            firm = (r.get('firm') or '').strip()
+            partner_name = (r.get('partner') or '').strip()
+            if not firm or not partner_name:
+                continue
+            if _import_investor_row(
+                engine,
+                firm=firm,
+                partner_name=partner_name,
+                email=r.get('email'),
+                attio_person_id=r.get('attio_person_id'),
+                attio_company_id=r.get('attio_company_id'),
+            ):
+                new_partners += 1
+        results.append(PollResult(
+            workspace=ws_path_str, provider=provider,
+            inserted=new_partners,
+        ))
+        _stamp_sync_status(engine, provider=provider, status='ok')
+    return results
+
+
+def poll_crm_relationships_for_workspace(
+    ws, client_factory=None,
+) -> list[PollResult]:
+    """B7 (6h). Pull recent relationship events from the CRM and
+    persist them as outreach_events with event_type='replied' (or
+    similar) -- so the Today queue can de-prioritize partners we
+    last contacted recently. For now this is a thin pass that
+    stamps a last-seen note; richer suppression heuristics will
+    use the data later.
+    """
+    if client_factory is None:
+        client_factory = _client_for
+    ws_path_str = str(getattr(ws, 'path', ws))
+    engine = get_engine(f'sqlite:///{ws.path}/data/pipeline.db')
+    providers = _connected_providers(engine)
+    if not providers:
+        return []
+    results: list[PollResult] = []
+    partner_by_email = _partner_id_by_email(engine)
+    for provider, api_key in providers:
+        _stamp_sync_status(engine, provider=provider, status='syncing')
+        try:
+            client = client_factory(provider, api_key)
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=f'client_init_failed: {exc}',
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error',
+                error=f'client_init_failed: {exc}',
+            )
+            continue
+        # 30-day lookback every pass -- this is a slow refresh.
+        after_dt = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+            days=30,
+        )
+        try:
+            events = list(client.list_relationships_since(after_dt))
+        except CRMPollError as exc:
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=str(exc),
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error', error=str(exc),
+            )
+            continue
+        inserted = 0
+        for ev in events:
+            email = (ev.get('partner_email') or '').strip().lower()
+            partner_id = partner_by_email.get(email) if email else None
+            if not partner_id:
+                continue
+            occurred_at = ev.get('occurred_at') or _dt.datetime.now(
+                _dt.timezone.utc,
+            )
+            rel_type = (ev.get('rel_type') or 'rel').strip()
+            external_id = f'{provider}-rel-{partner_id}-{occurred_at.isoformat()}'
+            with engine.begin() as conn:
+                existing = conn.execute(
+                    select(outreach_events.c.event_id).where(
+                        outreach_events.c.source == provider,
+                        outreach_events.c.external_id == external_id,
+                    )
+                ).first()
+                if existing is not None:
+                    continue
+                upsert(
+                    conn, outreach_events, ['event_id'],
+                    {
+                        'source': provider,
+                        'event_type': 'replied',
+                        'external_id': external_id,
+                        'occurred_at': occurred_at,
+                        'subject': f'CRM relationship: {rel_type}',
+                        'body_snippet': ev.get('notes'),
+                        'partner_id': partner_id,
+                        'draft_id': None,
+                        'unread': False,
+                        'created_at': _dt.datetime.now(_dt.timezone.utc),
+                    },
+                )
+                inserted += 1
+        results.append(PollResult(
+            workspace=ws_path_str, provider=provider,
+            inserted=inserted,
+        ))
+        _stamp_sync_status(engine, provider=provider, status='ok')
+    return results
+
+
+# ---------- B8: lists + deals (1h cadence) ----------
+
+def poll_crm_lists_for_workspace(
+    ws, client_factory=None,
+) -> list[PollResult]:
+    """B8 (1h). Snapshot every list-membership pairing in the CRM
+    into crm_list_memberships. Replace-based: a partner removed
+    from a list locally disappears on the next pass."""
+    if client_factory is None:
+        client_factory = _client_for
+    from core.db import crm_list_memberships
+    ws_path_str = str(getattr(ws, 'path', ws))
+    engine = get_engine(f'sqlite:///{ws.path}/data/pipeline.db')
+    providers = _connected_providers(engine)
+    if not providers:
+        return []
+    results: list[PollResult] = []
+    partner_by_email = _partner_id_by_email(engine)
+    for provider, api_key in providers:
+        _stamp_sync_status(engine, provider=provider, status='syncing')
+        try:
+            client = client_factory(provider, api_key)
+            memberships = list(client.list_list_memberships())
+        except CRMPollError as exc:
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=str(exc),
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error', error=str(exc),
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=f'client_failed: {exc}',
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error',
+                error=f'client_failed: {exc}',
+            )
+            continue
+        now = _dt.datetime.now(_dt.timezone.utc)
+        with engine.begin() as conn:
+            # Replace-based: wipe this provider's rows then re-insert.
+            conn.execute(
+                crm_list_memberships.delete().where(
+                    crm_list_memberships.c.provider == provider,
+                )
+            )
+            applied = 0
+            for m in memberships:
+                email = (m.get('partner_email') or '').strip().lower()
+                list_name = (m.get('list_name') or '').strip()
+                partner_id = partner_by_email.get(email)
+                if not partner_id or not list_name:
+                    continue
+                conn.execute(crm_list_memberships.insert().values(
+                    provider=provider,
+                    list_name=list_name,
+                    partner_id=partner_id,
+                    updated_at=now,
+                ))
+                applied += 1
+        results.append(PollResult(
+            workspace=ws_path_str, provider=provider,
+            inserted=applied,
+        ))
+        _stamp_sync_status(engine, provider=provider, status='ok')
+    return results
+
+
+def poll_crm_deals_for_workspace(
+    ws, client_factory=None,
+) -> list[PollResult]:
+    """B8 (1h). Pull recent deals from the CRM. Upserts on
+    (provider, deal_id) so re-polling is idempotent."""
+    if client_factory is None:
+        client_factory = _client_for
+    from core.db import crm_deals
+    ws_path_str = str(getattr(ws, 'path', ws))
+    engine = get_engine(f'sqlite:///{ws.path}/data/pipeline.db')
+    providers = _connected_providers(engine)
+    if not providers:
+        return []
+    results: list[PollResult] = []
+    partner_by_email = _partner_id_by_email(engine)
+    for provider, api_key in providers:
+        _stamp_sync_status(engine, provider=provider, status='syncing')
+        after_dt = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+            days=30,
+        )
+        try:
+            client = client_factory(provider, api_key)
+            deals = list(client.list_deals_since(after_dt))
+        except CRMPollError as exc:
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=str(exc),
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error', error=str(exc),
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=ws_path_str, provider=provider,
+                inserted=0, error=f'client_failed: {exc}',
+            ))
+            _stamp_sync_status(
+                engine, provider=provider, status='error',
+                error=f'client_failed: {exc}',
+            )
+            continue
+        applied = 0
+        for d in deals:
+            deal_id = (d.get('deal_id') or '').strip()
+            if not deal_id:
+                continue
+            email = (d.get('partner_email') or '').strip().lower()
+            partner_id = partner_by_email.get(email) if email else None
+            with engine.begin() as conn:
+                upsert(
+                    conn, crm_deals, ['provider', 'deal_id'],
+                    {
+                        'provider': provider,
+                        'deal_id': deal_id,
+                        'partner_id': partner_id,
+                        'stage': d.get('stage'),
+                        'amount': d.get('amount'),
+                        'updated_at': d.get('updated_at')
+                            or _dt.datetime.now(_dt.timezone.utc),
+                    },
+                )
+                applied += 1
+        results.append(PollResult(
+            workspace=ws_path_str, provider=provider,
+            inserted=applied,
+        ))
+        _stamp_sync_status(engine, provider=provider, status='ok')
+    return results
+
+
+# ---------- B9: one-time bulk import on connect ----------
+
+def bulk_import_for_workspace(
+    ws, client_factory=None,
+) -> list[PollResult]:
+    """B9. Called by POST /crm/{provider}/bulk-import (the
+    frontend prompts on first connect). Pulls the CRM's full
+    investor list and upserts into local funds+partners. Same
+    semantics as poll_crm_investors but framed as a one-shot
+    explicit operator action."""
+    return poll_crm_investors_for_workspace(
+        ws, client_factory=client_factory,
+    )
+

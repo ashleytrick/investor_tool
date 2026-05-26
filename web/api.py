@@ -1564,6 +1564,180 @@ def hook_poll_crm_pipeline(
     )
 
 
+# ---------- B7: CRM slow polling (investors + relationships, 6h) ----------
+
+def _run_crm_hook(
+    poll_fn,
+) -> CRMPollHookResult:
+    """Shared scatter-gather plumbing for all five CRM hooks (B6
+    activity / pipeline + B7 investors / relationships + B8 lists
+    / deals). Iterates every tenant + collects per-provider
+    results."""
+    from core.config_loader import load_workspace as _load_workspace
+    from web.routers.admin import _iter_tenant_workspaces
+
+    tenants = _iter_tenant_workspaces()
+    if not tenants:
+        ws_dir = pathlib.Path(_ws_path())
+        if ws_dir.exists():
+            tenants = [ws_dir]
+
+    flat: list[CRMPollProviderResult] = []
+    total = 0
+    for ws_dir in tenants:
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            flat.append(CRMPollProviderResult(
+                workspace=str(ws_dir), provider="(unknown)",
+                inserted=0,
+                error=f"load_workspace_failed: {exc}",
+            ))
+            continue
+        for r in poll_fn(ws):
+            flat.append(CRMPollProviderResult(
+                workspace=r.workspace, provider=r.provider,
+                inserted=r.inserted, error=r.error,
+            ))
+            total += r.inserted
+
+    return CRMPollHookResult(
+        polled=len(flat), total_inserted=total, results=flat,
+    )
+
+
+@app.post(
+    "/api/public/hooks/poll-crm-investors",
+    response_model=CRMPollHookResult,
+    summary=(
+        "Cron-triggered pull of every connected CRM's investor list "
+        "-> local funds + partners (6h)"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_crm_investors(
+    _hook: None = Depends(_hook_secret_required),
+) -> CRMPollHookResult:
+    from core.crm_polling import (
+        poll_crm_investors_for_workspace as _poll,
+    )
+    return _run_crm_hook(_poll)
+
+
+@app.post(
+    "/api/public/hooks/poll-crm-relationships",
+    response_model=CRMPollHookResult,
+    summary=(
+        "Cron-triggered pull of CRM relationship events -> "
+        "outreach_events (6h)"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_crm_relationships(
+    _hook: None = Depends(_hook_secret_required),
+) -> CRMPollHookResult:
+    from core.crm_polling import (
+        poll_crm_relationships_for_workspace as _poll,
+    )
+    return _run_crm_hook(_poll)
+
+
+# ---------- B8: CRM hourly polling (lists + deals) ----------
+
+@app.post(
+    "/api/public/hooks/poll-crm-lists",
+    response_model=CRMPollHookResult,
+    summary=(
+        "Cron-triggered snapshot of CRM list-memberships -> "
+        "crm_list_memberships (1h)"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_crm_lists(
+    _hook: None = Depends(_hook_secret_required),
+) -> CRMPollHookResult:
+    from core.crm_polling import (
+        poll_crm_lists_for_workspace as _poll,
+    )
+    return _run_crm_hook(_poll)
+
+
+@app.post(
+    "/api/public/hooks/poll-crm-deals",
+    response_model=CRMPollHookResult,
+    summary=(
+        "Cron-triggered snapshot of CRM deal records -> "
+        "crm_deals (1h)"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_crm_deals(
+    _hook: None = Depends(_hook_secret_required),
+) -> CRMPollHookResult:
+    from core.crm_polling import (
+        poll_crm_deals_for_workspace as _poll,
+    )
+    return _run_crm_hook(_poll)
+
+
+# ---------- B9: one-time bulk import on connect ----------
+
+class CRMBulkImportBody(BaseModel):
+    provider: str = Field(
+        description="CRM provider to import from (attio / salesforce / hubspot)",
+    )
+
+
+class CRMBulkImportResult(BaseModel):
+    provider: str
+    imported: int
+    error: str | None = None
+
+
+@app.post(
+    "/crm/bulk-import",
+    response_model=CRMBulkImportResult,
+    summary=(
+        "One-shot import of the connected CRM's full investor "
+        "list into local funds + partners"
+    ),
+    tags=["crm"],
+)
+def crm_bulk_import(
+    body: CRMBulkImportBody,
+    _auth: None = Depends(require_auth),
+) -> CRMBulkImportResult:
+    """B9. Called by the wizard after the operator first connects
+    a CRM (frontend prompts: "Import your existing investors?").
+    Synchronous; the response carries the count. Idempotent --
+    re-running is safe.
+    """
+    from core.config_loader import load_workspace as _load_workspace
+    from core.crm_polling import bulk_import_for_workspace
+
+    provider = (body.provider or "").strip().lower()
+    if provider not in _SUPPORTED_CRM_PROVIDERS:
+        raise HTTPException(
+            422,
+            f"unsupported CRM provider {provider!r}; supported: "
+            f"{sorted(_SUPPORTED_CRM_PROVIDERS)}",
+        )
+
+    ws = _load_workspace(_ws_path())
+    results = bulk_import_for_workspace(ws)
+    matching = [r for r in results if r.provider == provider]
+    if not matching:
+        raise HTTPException(
+            404,
+            f"no connection on file for provider={provider}; "
+            f"POST /crm/connect first",
+        )
+    r = matching[0]
+    return CRMBulkImportResult(
+        provider=r.provider, imported=r.inserted, error=r.error,
+    )
+
+
 @app.get(
     "/replies",
     response_model=list[ReplyItem],
