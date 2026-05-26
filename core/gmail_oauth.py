@@ -162,6 +162,23 @@ def start_flow(ws, redirect_uri: str) -> tuple[str, str]:
     return auth_url, state
 
 
+def pending_workspace_path(state: str) -> str | None:
+    """Look up the workspace_path stamped on a pending OAuth state
+    WITHOUT consuming the pending entry.
+
+    Used by the callback handler (post-#3-review) to load the right
+    workspace BEFORE calling complete_flow -- the callback runs
+    without a Bearer header (Google redirects the browser to it
+    cross-origin), so we can't resolve the tenant via the JWT path.
+    The state token itself is the unforgeable handle.
+    """
+    with _lock:
+        entry = _pending.get(state)
+        if entry is None:
+            return None
+        return entry.workspace_path
+
+
 def complete_flow(state: str, code: str, ws) -> dict:
     """Exchange the OAuth `code` for tokens, persist them, and return
     the connected Gmail profile.

@@ -112,6 +112,13 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
 
     The frontend's eventual end state is JWT-only; flip the
     fallback off once it stops sending the legacy key.
+
+    Side effect (post-#1-review): on a successful auth this also
+    sets the `_CURRENT_USER_ID_VAR` contextvar so `_engine_and_ws()`
+    and `_ws_path()` route per-tenant even when the endpoint only
+    declared `Depends(require_auth)` (not `current_principal`).
+    Previously only `current_principal` set the var, which meant
+    most authed routes silently fell back to the pinned workspace.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing bearer token")
@@ -120,8 +127,13 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
     jwt_mode = _jwt_secret() is not None
 
     # 1) Supabase JWT path (when configured).
-    if jwt_mode and _verify_supabase_jwt(token) is not None:
-        return
+    if jwt_mode:
+        claims = _verify_supabase_jwt(token)
+        if claims is not None:
+            principal = _principal_from_claims(claims)
+            if principal and principal.get("user_id"):
+                _CURRENT_USER_ID_VAR.set(principal["user_id"])
+            return
 
     # 2) Legacy API_KEY fallback.
     # - In legacy mode (no JWT secret), this is always on -- existing
@@ -144,6 +156,12 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
                     "is unset; refusing to attribute legacy traffic "
                     "to an unknown tenant",
                 )
+            # Stamp the contextvar from the bound UUID env so
+            # downstream routing follows the same tenant as the
+            # JWT path would have.
+            fallback_uid = os.environ.get("API_KEY_FALLBACK_USER_ID")
+            if fallback_uid:
+                _CURRENT_USER_ID_VAR.set(fallback_uid)
             return
 
     raise HTTPException(
@@ -341,6 +359,22 @@ def require_admin(
 
 
 def _ws_path() -> str:
+    """Return the workspace path for the active request.
+
+    Per-user mode (`WORKSPACE_PER_USER=true` and the request has an
+    authenticated principal): returns `${WORKSPACES_ROOT}/{user_id}/`,
+    provisioned from the template on first call. This is the path
+    every mutating CLI shell-out uses, so they all stay in the
+    tenant's own workspace.
+
+    Legacy single-tenant mode: returns `INVESTOR_WORKSPACE` env var.
+    Refuses to start with 500 if unset.
+    """
+    user_id = _CURRENT_USER_ID_VAR.get()
+    if user_id and _per_user_workspaces_enabled():
+        ws_path = _user_workspace_path(user_id)
+        _provision_user_workspace(ws_path)
+        return str(ws_path)
     ws = os.environ.get("INVESTOR_WORKSPACE")
     if not ws:
         raise HTTPException(
