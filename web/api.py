@@ -2462,6 +2462,156 @@ def _shell_pipeline_stage(
     )
 
 
+class PipelineStageResult(BaseModel):
+    """One stage's outcome in a multi-stage run. The wizard renders
+    each row so the operator can see which stages succeeded /
+    failed without parsing combined stdout."""
+    stage: str
+    ok: bool
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+
+
+class PipelineIngestResult(BaseModel):
+    """Response from POST /pipeline/ingest. `stages` is in execution
+    order. `ok = all stages ok`."""
+    ok: bool
+    stages: list[PipelineStageResult]
+
+
+# Review item #8: scripts that turn a fresh workspace into one
+# Stage 6 / 7 can score+draft against. Run in order; any non-zero
+# return code aborts the rest and surfaces in `stages[].ok`.
+_INGEST_STAGES: list[tuple[str, str]] = [
+    ("01_aggregate_sources.py", "aggregate_sources"),
+    ("02_enrich_funds.py", "enrich_funds"),
+    ("03_mine_activity.py", "mine_activity"),
+    ("04_mine_partner_signals.py", "mine_partner_signals"),
+    ("05_verify_and_quality.py", "verify_and_quality"),
+]
+
+
+@app.post(
+    "/pipeline/ingest",
+    response_model=PipelineIngestResult,
+    summary=(
+        "Run Stages 1-5 (sources -> enrich -> activity -> partner "
+        "signals -> verify) end-to-end for the wizard"
+    ),
+    tags=["onboarding"],
+)
+def pipeline_ingest(
+    _auth: None = Depends(require_auth),
+) -> PipelineIngestResult:
+    """Wizard's "Run pipeline" button. Fresh workspaces had no
+    funds / partners / signals before this -- /pipeline/score and
+    /pipeline/generate would either fail or produce empty drafts.
+    This endpoint walks Stages 1-5 in order so subsequent /score
+    + /generate calls have real data to work with.
+
+    Fail-fast: any stage with returncode != 0 aborts the rest and
+    is reported as `ok=False` in the response. The frontend
+    surfaces which stage failed.
+
+    Idempotent: re-running over an already-populated workspace
+    upserts rather than duplicating.
+    """
+    out: list[PipelineStageResult] = []
+    for script, label in _INGEST_STAGES:
+        try:
+            cli_res = _run_cli(
+                script, "--workspace", _ws_path(),
+                *_allow_example_domains_args(),
+                timeout=600,
+            )
+        except Exception as exc:  # noqa: BLE001
+            out.append(PipelineStageResult(
+                stage=label, ok=False, returncode=1,
+                stdout="", stderr=f"runner exception: {exc}",
+            ))
+            return PipelineIngestResult(ok=False, stages=out)
+        ok = cli_res.returncode == 0
+        out.append(PipelineStageResult(
+            stage=label, ok=ok,
+            returncode=cli_res.returncode,
+            stdout=cli_res.stdout, stderr=cli_res.stderr,
+        ))
+        if not ok:
+            return PipelineIngestResult(ok=False, stages=out)
+    return PipelineIngestResult(ok=True, stages=out)
+
+
+@app.post(
+    "/pipeline/aggregate",
+    response_model=CommandResult,
+    summary="Run Stage 1 (aggregate_sources) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_aggregate(
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    return _shell_pipeline_stage(
+        "01_aggregate_sources.py", label="aggregate_sources",
+    )
+
+
+@app.post(
+    "/pipeline/enrich",
+    response_model=CommandResult,
+    summary="Run Stage 2 (enrich_funds) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_enrich(
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    return _shell_pipeline_stage(
+        "02_enrich_funds.py", label="enrich_funds",
+    )
+
+
+@app.post(
+    "/pipeline/activity",
+    response_model=CommandResult,
+    summary="Run Stage 3 (mine_activity) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_activity(
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    return _shell_pipeline_stage(
+        "03_mine_activity.py", label="mine_activity",
+    )
+
+
+@app.post(
+    "/pipeline/partner-signals",
+    response_model=CommandResult,
+    summary="Run Stage 4 (mine_partner_signals) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_partner_signals(
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    return _shell_pipeline_stage(
+        "04_mine_partner_signals.py", label="mine_partner_signals",
+    )
+
+
+@app.post(
+    "/pipeline/verify",
+    response_model=CommandResult,
+    summary="Run Stage 5 (verify_and_quality) for the wizard",
+    tags=["onboarding"],
+)
+def pipeline_verify(
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    return _shell_pipeline_stage(
+        "05_verify_and_quality.py", label="verify_and_quality",
+    )
+
+
 @app.post(
     "/pipeline/score",
     response_model=CommandResult,
