@@ -128,12 +128,35 @@ def test_full_pipeline_end_to_end():
         _run("07_generate_emails.py", "--workspace", ws, "--top", "5", cwd=REPO_ROOT)
 
         new_counts = _counts(db)
+        # email_drafts is excluded from raw-count idempotency: Slice 17
+        # preserves prior generations (superseded_at IS NOT NULL) instead
+        # of deleting them, so the row total doubles on each Stage 7
+        # re-run by design. The LIVE row count (superseded_at IS NULL)
+        # IS still idempotent and is checked separately below.
         for table in ("funds", "partners", "signals", "deal_attributions",
                       "partner_score_summaries", "source_snapshots",
-                      "email_drafts", "followup_drafts", "deck_request_responses"):
+                      "followup_drafts", "deck_request_responses"):
             assert new_counts[table] == counts[table], (
                 f"idempotency broken on {table}: was {counts[table]}, now {new_counts[table]}"
             )
+        c = sqlite3.connect(db)
+        live_drafts = c.execute(
+            "select count(*) from email_drafts where superseded_at is null"
+        ).fetchone()[0]
+        superseded_drafts = c.execute(
+            "select count(*) from email_drafts where superseded_at is not null"
+        ).fetchone()[0]
+        c.close()
+        # Live count matches the original (the new generation replaces
+        # the prior live set); the original 10 drafts are now superseded.
+        assert live_drafts == counts["email_drafts"], (
+            f"live email_drafts changed across runs: "
+            f"first={counts['email_drafts']} now_live={live_drafts}"
+        )
+        assert superseded_drafts == counts["email_drafts"], (
+            f"superseded count != prior live count: "
+            f"superseded={superseded_drafts} prior_live={counts['email_drafts']}"
+        )
 
 
 
