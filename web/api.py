@@ -60,6 +60,7 @@ from core.approval.gate import (  # noqa: E402
     split_blockers,
 )
 from core.approval.persistence import (  # noqa: E402
+    REVIEWABLE_STATES,
     approved_for_send,
     pending_review,
 )
@@ -68,8 +69,11 @@ from core.config_loader import load_workspace  # noqa: E402
 from core.db import (  # noqa: E402
     email_drafts,
     get_engine,
+    partner_score_summaries,
     partners,
     runs,
+    today_picks,
+    workspace_settings,
 )
 
 
@@ -97,6 +101,10 @@ class DraftView(BaseModel):
     template_smell: str | None = None
     partner_email: str | None = None
     gate: GateInfo | None = None
+    # B1: the partner's recommendation_reasoning from Stage 6 (why
+    # this is worth reaching out to). The frontend renders this as
+    # the "why now" / coaching line on the review queue card.
+    rationale: str | None = None
 
 
 class ApproveBody(BaseModel):
@@ -253,7 +261,10 @@ def _gate_to_dict(gate: ApprovalGate) -> GateInfo:
 
 
 def _serialize_draft(
-    d: Any, *, partner_email: str | None, gate: GateInfo | None,
+    d: Any, *,
+    partner_email: str | None,
+    gate: GateInfo | None,
+    rationale: str | None = None,
 ) -> DraftView:
     return DraftView(
         draft_id=int(d.draft_id),
@@ -266,7 +277,72 @@ def _serialize_draft(
         template_smell=d.template_smell,
         partner_email=partner_email,
         gate=gate,
+        rationale=rationale,
     )
+
+
+def _rationale_by_partner(conn: Any) -> dict[str, str]:
+    """Map partner_id -> Stage 6 recommendation_reasoning.
+
+    Returns an empty dict for workspaces that have never run Stage 6
+    (the table exists from `metadata.create_all` but is empty); the
+    caller treats missing entries as `rationale=None` rather than as
+    an error.
+    """
+    rows = conn.execute(
+        select(
+            partner_score_summaries.c.partner_id,
+            partner_score_summaries.c.recommendation_reasoning,
+        )
+    )
+    return {
+        r.partner_id: r.recommendation_reasoning
+        for r in rows
+        if r.recommendation_reasoning
+    }
+
+
+# ---------- B1 (Coach Today flow) ----------
+#
+# `send_pace` is the operator's preferred number of drafts to work
+# through per day. The frontend's Today tab reads it to pick the
+# default `limit` for `/today`. Clamped to [1, 20] -- below 1 makes
+# the queue useless; above 20 violates deliverability discipline
+# (and the spec's stated range).
+
+_SEND_PACE_KEY = "send_pace"
+_SEND_PACE_DEFAULT = 10
+_SEND_PACE_MIN = 1
+_SEND_PACE_MAX = 20
+
+
+def _read_send_pace(conn: Any) -> int:
+    row = conn.execute(
+        select(workspace_settings.c.value)
+        .where(workspace_settings.c.key == _SEND_PACE_KEY)
+    ).first()
+    if not row or not row.value:
+        return _SEND_PACE_DEFAULT
+    try:
+        n = int(row.value)
+    except (TypeError, ValueError):
+        return _SEND_PACE_DEFAULT
+    return max(_SEND_PACE_MIN, min(_SEND_PACE_MAX, n))
+
+
+def _write_send_pace(conn: Any, value: int) -> int:
+    import datetime as _dt
+    clamped = max(_SEND_PACE_MIN, min(_SEND_PACE_MAX, value))
+    from core.db import upsert as _upsert
+    _upsert(
+        conn, workspace_settings, ["key"],
+        {
+            "key": _SEND_PACE_KEY,
+            "value": str(clamped),
+            "updated_at": _dt.datetime.now(_dt.timezone.utc),
+        },
+    )
+    return clamped
 
 
 # ---------- app ----------
@@ -356,6 +432,7 @@ def get_pending(_auth: None = Depends(require_auth)) -> list[DraftView]:
                 select(partners.c.partner_id, partners.c.email),
             )
         }
+        rationale_by_pid = _rationale_by_partner(conn)
     out: list[DraftView] = []
     for d in drafts:
         gate = can_approve_draft(
@@ -368,6 +445,7 @@ def get_pending(_auth: None = Depends(require_auth)) -> list[DraftView]:
             d,
             partner_email=email_by_pid.get(d.partner_id),
             gate=_gate_to_dict(gate),
+            rationale=rationale_by_pid.get(d.partner_id),
         ))
     return out
 
@@ -388,11 +466,13 @@ def get_approved(_auth: None = Depends(require_auth)) -> list[DraftView]:
                 select(partners.c.partner_id, partners.c.email),
             )
         }
+        rationale_by_pid = _rationale_by_partner(conn)
     return [
         _serialize_draft(
             d,
             partner_email=email_by_pid.get(d.partner_id),
             gate=None,  # gate is checked on approve; the queue is post-gate
+            rationale=rationale_by_pid.get(d.partner_id),
         )
         for d in drafts
     ]
@@ -453,6 +533,219 @@ def reject_draft(
             },
         )
     return CommandResult(ok=True, stdout=res.stdout, stderr=res.stderr)
+
+
+# ---------- B1: Today flow ----------
+
+class TodayPickView(BaseModel):
+    """One pick on the daily Today queue."""
+    pick_date: str  # ISO date (YYYY-MM-DD)
+    rank: int
+    partner_id: str
+    draft_id: int
+    rationale: str | None = None
+    # Convenience: hydrate the draft + partner email + gate so the
+    # frontend doesn't have to round-trip /review/pending separately.
+    draft: DraftView | None = None
+
+
+class SendPaceBody(BaseModel):
+    value: int = Field(
+        ge=_SEND_PACE_MIN, le=_SEND_PACE_MAX,
+        description=(
+            f"Drafts-per-day pace. Clamped server-side to "
+            f"[{_SEND_PACE_MIN}, {_SEND_PACE_MAX}]."
+        ),
+    )
+
+
+class SendPaceView(BaseModel):
+    value: int
+
+
+@app.get(
+    "/today",
+    response_model=list[TodayPickView],
+    summary="Today's ranked draft batch (stable per day)",
+    tags=["coach"],
+)
+def get_today(
+    limit: int | None = Query(
+        None, ge=1, le=_SEND_PACE_MAX,
+        description=(
+            "Optional batch size. Defaults to the workspace's "
+            "`send_pace` setting (1..20)."
+        ),
+    ),
+    _auth: None = Depends(require_auth),
+) -> list[TodayPickView]:
+    """Returns the operator's daily draft batch, ranked.
+
+    The pick set is materialized once per (workspace, date) and
+    reused for every subsequent call that same day -- so the queue
+    doesn't reorder under the operator if Stage 6 re-runs between
+    sessions.
+
+    Picks are sourced from drafts whose `approval_status` is in
+    REVIEWABLE_STATES (i.e. pending review) ordered by
+    `partner_score_summaries.send_now_priority DESC`. Once approved
+    or rejected, drafts naturally drop out of the source set but
+    today's persisted pick row stays; the consumer should join
+    today_picks -> email_drafts to know whether the draft has since
+    moved to approved/rejected.
+    """
+    import datetime as _dt
+    engine, ws = _engine_and_ws()
+    today_iso = _dt.date.today()
+
+    with engine.begin() as conn:
+        effective_limit = limit if limit is not None else _read_send_pace(conn)
+
+        # 1) Existing picks for today -- return as-is.
+        existing = list(conn.execute(
+            select(today_picks)
+            .where(today_picks.c.pick_date == today_iso)
+            .order_by(today_picks.c.rank)
+        ))
+        if existing:
+            picks_rows = existing[:effective_limit]
+        else:
+            # 2) Materialize today's picks from the reviewable queue
+            #    ordered by send_now_priority DESC. Stage 7 normally
+            #    supersedes prior drafts so there's at most one live
+            #    draft per partner, but fixtures + edge cases can
+            #    leave multiple reviewable rows; dedupe per partner
+            #    here so the upsert (PK = pick_date, partner_id)
+            #    doesn't silently collapse ranks.
+            raw_candidates = list(conn.execute(
+                select(
+                    email_drafts.c.draft_id,
+                    email_drafts.c.partner_id,
+                    partner_score_summaries.c.send_now_priority,
+                    partner_score_summaries.c.recommendation_reasoning,
+                )
+                .join(
+                    partner_score_summaries,
+                    partner_score_summaries.c.partner_id
+                    == email_drafts.c.partner_id,
+                    isouter=True,
+                )
+                .where(
+                    email_drafts.c.approval_status.in_(
+                        list(REVIEWABLE_STATES)
+                    ),
+                    email_drafts.c.superseded_at.is_(None),
+                )
+                .order_by(
+                    # NULLS LAST: partners that never scored fall to
+                    # the bottom (and typically won't make the cut).
+                    desc(partner_score_summaries.c.send_now_priority),
+                    email_drafts.c.draft_id,
+                )
+            ))
+            seen: set[str] = set()
+            candidates: list[Any] = []
+            for row in raw_candidates:
+                if row.partner_id in seen:
+                    continue
+                seen.add(row.partner_id)
+                candidates.append(row)
+                if len(candidates) >= effective_limit:
+                    break
+            now = _dt.datetime.now(_dt.timezone.utc)
+            from core.db import upsert as _upsert
+            for rank, row in enumerate(candidates, start=1):
+                _upsert(
+                    conn, today_picks, ["pick_date", "partner_id"],
+                    {
+                        "pick_date": today_iso,
+                        "partner_id": row.partner_id,
+                        "draft_id": int(row.draft_id),
+                        "rank": rank,
+                        "rationale": row.recommendation_reasoning,
+                        "created_at": now,
+                    },
+                )
+            picks_rows = list(conn.execute(
+                select(today_picks)
+                .where(today_picks.c.pick_date == today_iso)
+                .order_by(today_picks.c.rank)
+            ))
+
+        if not picks_rows:
+            return []
+
+        # Hydrate draft + partner_email + gate so the frontend renders
+        # the card without a second round-trip.
+        partner_ids = [p.partner_id for p in picks_rows]
+        draft_ids = [int(p.draft_id) for p in picks_rows if p.draft_id]
+        drafts_by_id: dict[int, Any] = {
+            row.draft_id: row
+            for row in conn.execute(
+                select(email_drafts).where(
+                    email_drafts.c.draft_id.in_(draft_ids)
+                )
+            )
+        }
+        email_by_pid = {
+            r.partner_id: r.email or ""
+            for r in conn.execute(
+                select(partners.c.partner_id, partners.c.email)
+                .where(partners.c.partner_id.in_(partner_ids))
+            )
+        }
+
+    result: list[TodayPickView] = []
+    for p in picks_rows:
+        d = drafts_by_id.get(int(p.draft_id)) if p.draft_id else None
+        draft_view: DraftView | None = None
+        if d is not None:
+            gate = can_approve_draft(
+                ws, engine, int(d.draft_id),
+                allow_example_domains=bool(_allow_example_domains_args()),
+            )
+            draft_view = _serialize_draft(
+                d,
+                partner_email=email_by_pid.get(d.partner_id),
+                gate=_gate_to_dict(gate),
+                rationale=p.rationale,
+            )
+        result.append(TodayPickView(
+            pick_date=str(p.pick_date),
+            rank=int(p.rank),
+            partner_id=str(p.partner_id),
+            draft_id=int(p.draft_id) if p.draft_id else 0,
+            rationale=p.rationale,
+            draft=draft_view,
+        ))
+    return result
+
+
+@app.get(
+    "/settings/send-pace",
+    response_model=SendPaceView,
+    summary="Read the workspace's daily send-pace setting",
+    tags=["coach"],
+)
+def get_send_pace(_auth: None = Depends(require_auth)) -> SendPaceView:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        return SendPaceView(value=_read_send_pace(conn))
+
+
+@app.post(
+    "/settings/send-pace",
+    response_model=SendPaceView,
+    summary="Update the workspace's daily send-pace setting (clamped 1-20)",
+    tags=["coach"],
+)
+def set_send_pace(
+    body: SendPaceBody,
+    _auth: None = Depends(require_auth),
+) -> SendPaceView:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        return SendPaceView(value=_write_send_pace(conn, body.value))
 
 
 # ---------- partner mutations ----------
