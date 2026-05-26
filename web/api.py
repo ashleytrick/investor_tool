@@ -2500,6 +2500,67 @@ def _count_csv_rows(content: bytes) -> int:
     return len(rows) - 1
 
 
+# Review items #9 + #10: header / row validation for sources upload.
+#
+# Stage 1's CSV ingester does case-insensitive header aliasing and
+# extracts a fund/firm name + a domain from each row. Pre-this-fix
+# `/pipeline/sources` only counted total spreadsheet rows and could
+# say "Loaded N investors" when Stage 1 would later ingest zero
+# (header names didn't match any alias) -- a silent dead-end.
+# These constants are the alias whitelist; keep in sync with the
+# downstream sync helper (_sync_uploaded_csv_to_global_pool) and
+# Stage 1's parser.
+_FIRM_HEADER_ALIASES = (
+    "name", "firm", "investor", "investor name",
+    "fund", "fund name",
+)
+_DOMAIN_HEADER_ALIASES = (
+    "domain", "website", "url", "homepage", "site",
+)
+
+
+def _count_usable_sources_rows(content: bytes) -> tuple[int, list[str]]:
+    """Return (usable_row_count, recognized_headers) for the upload.
+
+    A "usable" row is one that carries at least a firm name -- the
+    minimum Stage 1 needs to do anything. Domain is preferred but
+    Stage 1 can fall back to enrichment when missing.
+
+    Recognized headers is the intersection of the CSV's header row
+    with `_FIRM_HEADER_ALIASES | _DOMAIN_HEADER_ALIASES`; the
+    endpoint surfaces it in the error message when no headers
+    match, so the operator can rename a column without guessing.
+    """
+    import csv
+    import io
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    raw_headers = reader.fieldnames or []
+    normalized = [(h or "").strip().lower() for h in raw_headers]
+    accepted = set(_FIRM_HEADER_ALIASES) | set(_DOMAIN_HEADER_ALIASES)
+    recognized = [h for h in normalized if h in accepted]
+    if not any(h in _FIRM_HEADER_ALIASES for h in normalized):
+        # No firm-name column -> Stage 1 cannot ingest a single
+        # row. Return 0 + the recognized list (likely empty) so
+        # the caller can build a precise error.
+        return 0, recognized
+    usable = 0
+    for row in reader:
+        # Lookup is case-insensitive on the alias side. cell values
+        # are stripped to drop leading/trailing whitespace.
+        lower = {
+            (k or "").strip().lower(): (v or "").strip()
+            for k, v in row.items() if k is not None
+        }
+        firm_value = next(
+            (lower.get(h) for h in _FIRM_HEADER_ALIASES if lower.get(h)),
+            "",
+        )
+        if firm_value:
+            usable += 1
+    return usable, recognized
+
+
 def _link_sources_yaml(yaml_path: pathlib.Path, csv_relative: str,
                        display_name: str) -> None:
     """Prepend an entry to `public_lists` in sources.yaml pointing at
@@ -2644,6 +2705,44 @@ async def upload_pipeline_sources(
                 "stdout": "", "stderr": "", "returncode": 1,
             },
         )
+
+    # Review items #9 + #10: validate that the headers Stage 1 will
+    # look for are actually present, AND that at least one row
+    # has a firm-name value. Without this we silently accept
+    # uploads that Stage 1 would then ingest zero rows from.
+    try:
+        usable_count, recognized = _count_usable_sources_rows(content)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            400,
+            detail={
+                "error": f"could not parse CSV headers: {exc}",
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    if usable_count <= 0:
+        # Either no firm-name column at all OR every row had an
+        # empty firm cell. Surface the actually-recognized headers
+        # (if any) so the operator can rename rather than guess.
+        hint = (
+            f" recognized headers: {recognized}."
+            if recognized else ""
+        )
+        raise HTTPException(
+            400,
+            detail={
+                "error": (
+                    "no recognizable firm/fund-name column. Stage 1 "
+                    "looks for one of: "
+                    f"{list(_FIRM_HEADER_ALIASES)}." + hint
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    # The frontend renders row_count as 'Loaded N investors'; use
+    # the usable count so the count matches what Stage 1 will
+    # actually ingest.
+    row_count = usable_count
 
     safe_name = _sanitize_sources_filename(name)
     _, ws = _engine_and_ws()
