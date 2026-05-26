@@ -56,6 +56,34 @@ def latest_event_at(
     return val if isinstance(val, _dt.datetime) else None
 
 
+def draft_id_by_partner_lookup(engine: Any) -> dict[str, int]:
+    """Latest non-superseded draft_id per partner -- the best guess
+    at "which draft did this sent event come from" for an outbound
+    Gmail message. (Review item #18.)
+
+    Stage 7 supersedes prior drafts so there's typically one live
+    row per partner. We pick the highest draft_id (autoincrement)
+    among non-superseded rows to handle the rare multi-draft case
+    deterministically.
+    """
+    from sqlalchemy import func as _sqlfunc
+    from core.db import email_drafts
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(
+                email_drafts.c.partner_id,
+                _sqlfunc.max(email_drafts.c.draft_id).label("draft_id"),
+            )
+            .where(email_drafts.c.superseded_at.is_(None))
+            .group_by(email_drafts.c.partner_id)
+        )
+        return {
+            r.partner_id: int(r.draft_id)
+            for r in rows
+            if r.partner_id and r.draft_id is not None
+        }
+
+
 def partner_by_email_lookup(engine: Any) -> dict[str, str]:
     """Lowercased-email -> partner_id map for matching Gmail
     recipients to the local partner row. Built once per poll pass
@@ -186,6 +214,7 @@ def poll_gmail_sent_for_workspace(ws, gmail_client_factory=None) -> PollResult:
         )
 
     partner_by_email = partner_by_email_lookup(engine)
+    draft_by_partner = draft_id_by_partner_lookup(engine)
     inserted = 0
     for msg in messages:
         # `list_sent_since` returns dicts (not Gmail SDK types) so
@@ -194,6 +223,12 @@ def poll_gmail_sent_for_workspace(ws, gmail_client_factory=None) -> PollResult:
         #   subject, body_snippet
         recipient = (msg.get("recipient_email") or "").strip().lower()
         partner_id = partner_by_email.get(recipient) if recipient else None
+        # Review item #18: link the sent event to the latest
+        # non-superseded draft for the partner so the audit trail
+        # answers "which draft did this come from."
+        draft_id = (
+            draft_by_partner.get(partner_id) if partner_id else None
+        )
         ok = record_gmail_sent(
             engine,
             external_id=msg["external_id"],
@@ -203,7 +238,7 @@ def poll_gmail_sent_for_workspace(ws, gmail_client_factory=None) -> PollResult:
             subject=msg.get("subject"),
             body_snippet=msg.get("body_snippet"),
             partner_id=partner_id,
-            draft_id=None,
+            draft_id=draft_id,
         )
         if ok:
             inserted += 1
