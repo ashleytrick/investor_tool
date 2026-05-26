@@ -1,0 +1,58 @@
+You are extracting company info from a pitch deck to PREFILL a setup form. This is a draft. A human will review every field before saving. Your job: extract what the deck actually says + flag what's missing or ambiguous.
+
+Hard rules:
+- Do NOT invent values. If the deck doesn't say something, OMIT that field (don't return an empty ExtractedField).
+- For every field you return, include a SHORT evidence snippet (a phrase or sentence FROM the deck) so the human can audit.
+- Confidence 0.0-1.0:
+    - >=0.85 means the deck states this explicitly (e.g. company name on the cover slide).
+    - 0.6-0.85 means strong inference (e.g. business_model from a clearly-described GTM motion).
+    - <0.6 means weak inference (e.g. round_amount_usd inferred from a "we're raising" line without a number) -- flag in warnings if you produce these.
+- Localize each claim with a "source" tag like "slide 4" or "page 2" when you can; empty string otherwise.
+- Investor-fit fields (target_check_min_usd, target_stages, target_sectors, target_geographies, desired_traits, excluded_sectors) are RARELY in pitch decks. Only return them if explicitly stated; do not infer from sector/stage.
+- scheduling_link: return ONLY if the deck contains a Calendly / cal.com / similar URL. Otherwise omit.
+- Add a warning when:
+    - the deck appears image-heavy (very little text)
+    - founder_email is not present
+    - traction has no concrete metrics
+    - the deck contradicts itself (e.g. two different ARR numbers)
+
+Fields to extract (omit any the deck doesn't support):
+- name, one_liner, website
+- founder_name, founder_title, founder_email
+- stage (one of: Pre-seed, Seed, Series A, Series B+)
+- sectors (list, e.g. ["fintech", "compliance"])
+- business_model (one short string)
+- problem, solution, differentiators, why_now, traction
+- round_amount_usd (integer dollars)
+- round_instrument (e.g. "SAFE", "priced", "convertible")
+- round_valuation_usd (integer dollars)
+- round_close_target (free text, e.g. "Q1 2026")
+- target_check_min_usd, target_check_max_usd
+- target_stages, target_sectors, target_geographies
+- desired_traits, excluded_sectors
+- scheduling_link
+
+Deck text (per-page or per-slide blocks separated by "--- SLIDE/PAGE N ---"):
+{DECK_TEXT}
+
+Return JSON in this exact shape (no prose, no code fences):
+
+{
+  "extracted_fields": [
+    {
+      "field": "name",
+      "value": "Acme",
+      "confidence": 0.95,
+      "evidence": "cover slide title 'Acme'",
+      "source": "slide 1"
+    },
+    {
+      "field": "sectors",
+      "value": ["fintech", "compliance"],
+      "confidence": 0.9,
+      "evidence": "deck describes 'B2B compliance API for fintechs'",
+      "source": "slide 2"
+    }
+  ],
+  "warnings": []
+}
