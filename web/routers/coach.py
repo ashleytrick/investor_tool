@@ -399,13 +399,18 @@ def get_today(
                 gate=gate_to_dict(gate),
                 rationale=p.rationale,
             )
+        # Pass `draft` as a dict (not the DraftView instance) so
+        # Pydantic doesn't trip on class-identity checks when this
+        # module gets reloaded in tests via importlib.reload --
+        # which produces two DraftView class refs sharing the
+        # same fields but failing isinstance().
         result.append(TodayPickView(
             pick_date=str(p.pick_date),
             rank=int(p.rank),
             partner_id=str(p.partner_id),
             draft_id=int(p.draft_id) if p.draft_id else 0,
             rationale=p.rationale,
-            draft=draft_view,
+            draft=(draft_view.model_dump() if draft_view else None),
         ))
     return result
 
