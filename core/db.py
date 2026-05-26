@@ -682,6 +682,44 @@ deck_request_responses = Table(
     Index("ix_deck_request_responses_batch_id", "batch_id"),
 )
 
+meeting_prep_artifacts = Table(
+    # Build Session 12: cached LLM output for the objection-map and
+    # framing-brief builders. Keyed on (partner_id, artifact_type,
+    # signal_set_hash) -- re-running prep_brief.py against unchanged
+    # signals is free (zero LLM calls); a new verified signal flips
+    # the hash and forces a regenerate.
+    "meeting_prep_artifacts", metadata,
+    Column("artifact_id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+    ),
+    # "objection_map" | "framing_brief". Free-text column because
+    # adding a third artifact type later shouldn't need a migration.
+    Column("artifact_type", Text, nullable=False),
+    # SHA-256 of the sorted, verified, quality>=2 signal_ids for this
+    # partner at build time. Cache hit when this matches the current
+    # set; miss otherwise. Same content-hash idiom as
+    # source_snapshots.content_hash.
+    Column("signal_set_hash", Text, nullable=False),
+    # Full pydantic-validated JSON output, stringified. The renderer
+    # parses it back; the operator can read it raw for debugging.
+    Column("payload_json", Text, nullable=False),
+    # True when the underlying builder returned insufficient_evidence
+    # -- cached separately so renderers can short-circuit without
+    # parsing the payload.
+    Column("insufficient_evidence", Boolean, nullable=False),
+    Column("model_used", Text),
+    Column("generated_at", DateTime),
+    # Index on (partner_id, artifact_type) so the lookup is O(1)
+    # without scanning every row.
+    Index(
+        "ix_meeting_prep_artifacts_partner_type",
+        "partner_id", "artifact_type",
+    ),
+)
+
+
 batch_qa_reports = Table(
     "batch_qa_reports", metadata,
     Column("report_id", Integer, primary_key=True, autoincrement=True),
