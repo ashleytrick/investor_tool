@@ -15,11 +15,19 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt
 
 
 class AttioError(RuntimeError):
     """Raised on any non-2xx response."""
+
+
+class AttioRetryableError(AttioError):
+    """Raised for rate-limit/transient HTTP statuses that should be retried."""
+
+    def __init__(self, message: str, *, retry_after_s: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 class AttioNotConfigured(RuntimeError):
@@ -34,6 +42,23 @@ class AttioNotConfigured(RuntimeError):
 ALLOWED_API_BASE_HOSTS = {
     "api.attio.com",
 }
+
+
+def _retry_after_s(response: httpx.Response) -> float | None:
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
+
+
+def _attio_retry_wait_s(retry_state) -> float:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, AttioRetryableError) and exc.retry_after_s is not None:
+        return exc.retry_after_s
+    return min(16.0, 2.0 * (2 ** max(0, retry_state.attempt_number - 1)))
 
 
 @dataclass
@@ -99,12 +124,21 @@ class AttioClient:
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, max=16),
-        retry=retry_if_exception_type((httpx.TransportError, httpx.TimeoutException)),
+        wait=lambda retry_state: _attio_retry_wait_s(retry_state),
+        retry=retry_if_exception_type((
+            httpx.TransportError,
+            httpx.TimeoutException,
+            AttioRetryableError,
+        )),
         reraise=True,
     )
     def _request(self, method: str, path: str, *, json_body: Any = None) -> dict:
         r = self.client.request(method, path, json=json_body)
+        if r.status_code in {429, 503}:
+            raise AttioRetryableError(
+                f"Attio {method} {path} -> {r.status_code}: {r.text[:500]}",
+                retry_after_s=_retry_after_s(r),
+            )
         if r.status_code >= 400:
             raise AttioError(
                 f"Attio {method} {path} -> {r.status_code}: {r.text[:500]}"
