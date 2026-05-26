@@ -56,8 +56,9 @@ def test_blocks_when_stage_7_never_run():
 
 
 def test_passes_when_pipeline_complete_and_mode_unset():
-    """Stage 7 ran, drafts exist, and we patch mode to None (no
-    explicit fixture/prod). All checks should pass."""
+    """Stage 7 ran, drafts exist (pending review only), and we patch
+    mode to None. The review-phase checks should all pass -- send/gmail
+    checks would reasonably block because nothing is approved yet."""
     with tempfile.TemporaryDirectory() as tmpdir:
         ws_src = REPO_ROOT / "clients" / "test_workspace"
         ws_dst = Path(tmpdir) / "test_workspace"
@@ -76,11 +77,12 @@ def test_passes_when_pipeline_complete_and_mode_unset():
         cfg = cfg.replace("\nmode: \"fixture\"\n", "\n")
         cfg_path.write_text(cfg, encoding="utf-8")
 
-        res = _check(ws)
-        # The approval_pipeline check should pass; we have pending
-        # drafts. mode=(unset) is OK.
+        # Default --for would be 'send' which requires approved drafts.
+        # Use --for review since this workspace has only pending drafts.
+        res = _check(ws, "--for", "review")
         assert "mode: OK" in res.stdout, res.stdout
         assert "approval_pipeline: OK" in res.stdout, res.stdout
+        assert res.returncode == 0, res.stdout
 
 
 def test_blocks_when_approved_draft_has_no_email():
@@ -178,8 +180,9 @@ def test_scheduling_link_reachable_skips_example_tld():
         shutil.copytree(ws_src, ws_dst)
         ws = str(ws_dst)
         _run_pipeline_through_stage_6(ws_dst)
-        # The fixture already uses cal.example.
-        res = _check(ws)
+        # The fixture already uses cal.example. The scheduling check
+        # only fires in --for gmail mode.
+        res = _check(ws, "--for", "gmail")
         assert "scheduling_link_reachable: OK" in res.stdout, res.stdout
 
 
@@ -204,7 +207,7 @@ def test_scheduling_link_reachable_flags_broken_link():
         assert "127.0.0.1:1" in cfg, "scheduling-link substitution failed"
         cfg_path.write_text(cfg, encoding="utf-8")
 
-        res = _check(ws)
+        res = _check(ws, "--for", "gmail")
         # Fixture mode also blocks, but the scheduling check should
         # specifically appear in the BLOCKED list.
         assert "scheduling_link_reachable: BLOCKED" in res.stdout, res.stdout
@@ -220,7 +223,7 @@ def test_gmail_oauth_check_skips_when_not_linked():
         shutil.copytree(ws_src, ws_dst)
         ws = str(ws_dst)
         _run_pipeline_through_stage_6(ws_dst)
-        res = _check(ws)
+        res = _check(ws, "--for", "gmail")
         assert "gmail_oauth: OK" in res.stdout, res.stdout
         assert "not linked" in res.stdout
 
@@ -296,6 +299,75 @@ def test_blocks_when_dnc_partner_has_approved_draft():
         res = _check(ws)
         assert res.returncode == 1
         assert "no_dnc_approvals: BLOCKED" in res.stdout
+
+
+def test_for_send_blocks_when_zero_approved_but_pending_exist():
+    """--for send is a real pre-send green light: 10 pending review
+    drafts + 0 approved is NOT ready to send. Default --for=send
+    must surface this state explicitly via have_approved_drafts."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        _run(
+            "07_generate_emails.py", "--workspace", ws,
+            "--top", "5", "--allow-example-domains", cwd=REPO_ROOT,
+        )
+        # Stage 7 produced pending-review drafts; nothing is approved.
+        res = _check(ws, "--for", "send")
+        assert res.returncode == 1, res.stdout
+        assert "have_approved_drafts: BLOCKED" in res.stdout, res.stdout
+        # And the review-phase view of the same workspace is OK on the
+        # approval_pipeline check (pending drafts count as "operator
+        # has something to do").
+        res2 = _check(ws, "--for", "review")
+        assert "approval_pipeline: OK" in res2.stdout, res2.stdout
+        # have_approved_drafts shouldn't even run in review mode.
+        assert "have_approved_drafts" not in res2.stdout, res2.stdout
+
+
+def test_for_attio_requires_attio_config(monkeypatch=None):
+    """--for attio adds an Attio-config reachability check. A workspace
+    without ATTIO_API_KEY blocks specifically on attio_config."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        # Run with ATTIO_API_KEY scrubbed from the env. The check must
+        # fire even when other things also fail.
+        env = {k: v for k, v in os.environ.items() if k != "ATTIO_API_KEY"}
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "check_ready.py"),
+             "--workspace", ws, "--for", "attio"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert res.returncode == 1, res.stdout
+        # The fixture has no attio.yaml AND we scrubbed ATTIO_API_KEY.
+        # Either condition is enough for the attio_config check to
+        # surface BLOCKED -- the point of the test is that --for attio
+        # actually runs the check (other modes do not).
+        assert "attio_config: BLOCKED" in res.stdout, res.stdout
+
+
+def test_for_gmail_includes_scheduling_and_oauth_checks():
+    """--for gmail adds scheduling + Gmail OAuth on top of send-mode
+    checks. Earlier modes (review, send) skip them."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        res_review = _check(ws, "--for", "review")
+        assert "scheduling_link_reachable" not in res_review.stdout
+        assert "gmail_oauth" not in res_review.stdout
+        res_gmail = _check(ws, "--for", "gmail")
+        assert "scheduling_link_reachable" in res_gmail.stdout
+        assert "gmail_oauth" in res_gmail.stdout
 
 
 def test_quiet_mode_only_prints_blocked_and_summary():

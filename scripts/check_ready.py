@@ -1,32 +1,25 @@
-"""Single 'safe to send?' check for the workspace.
+"""Pre-flight 'safe to ___?' check for the workspace.
 
-Walks the operator-actionable preconditions for cold-outreach send
-and prints OK / BLOCKED per check + a one-line summary at the end.
-Designed for cron-friendly use: exits 0 when nothing is blocking
-a send pass, non-zero when at least one check fails.
+Walks the operator-actionable preconditions for the chosen workflow
+phase and prints OK / BLOCKED per check + a one-line summary at the
+end. Designed for cron-friendly use: exits 0 when nothing is blocking,
+non-zero when at least one check fails.
 
-Checks:
+The phase is selected with `--for`:
 
-  1.  mode -- workspace is not in fixture mode
-  2.  workspace_config -- required configs present
-  3.  stage6_freshness -- Stage 6 completed within STALE_STAGE6_HOURS
-  4.  approval_pipeline -- something is in the queue or already approved
-  5.  approved_have_emails -- defense-in-depth against gate gaps
-  6.  no_dnc_approvals -- defense-in-depth against gate gaps
-  7.  approved_gate_clean -- every approved_to_send draft still passes
-      the LIVE approval gate (catches generic/role mailboxes,
-      invalid/risky verification, suppression flipped on after
-      approval, qa_status regressions -- the same checks Slices 7-9
-      added to the approval gate, re-run at "ready to send" time)
-  8.  no_duplicate_recipients -- no two approved drafts target the
-      same partner_email
-  9.  daily_cap_headroom -- today's approval count is below the cap
-      (informational; sends still legal until cap hits)
-  10. scheduling_link_reachable -- HEAD-request the configured
-      scheduling link; catches broken / 404 calendar URLs before
-      they ship in every cold email (Slice 15)
-  11. gmail_oauth -- call users.getProfile to confirm the operator's
-      Gmail OAuth token still works without pushing a draft (Slice 15)
+  --for review   (default-friendly view: what's queued for me to do?)
+                 OK with only pending-review drafts; no Gmail / Attio
+                 reachability assumed.
+
+  --for send     Pre-send gate -- requires at least ONE approved draft
+                 AND every approved draft still passes the live gate.
+                 Use this before Gmail/export/Attio.
+
+  --for gmail    Pre-Gmail-push: send-mode checks + Gmail OAuth +
+                 scheduling-link reachability.
+
+  --for attio    Pre-Attio-sync: send-mode checks + Attio config /
+                 credentials reachable.
 
 Output format:
   [check_ready] {section}: OK / BLOCKED -- {reason}
@@ -130,9 +123,12 @@ def _check_stage6_freshness(engine) -> CheckResult:
 
 
 def _check_approval_pipeline(engine) -> CheckResult:
-    """Either approved drafts exist (ready to send) OR pending-review
-    drafts exist (operator has something to do). An empty workspace
-    in both buckets means Stage 7 hasn't been run."""
+    """Review-mode pipeline check: either approved drafts exist OR
+    pending-review drafts exist (operator has something to do). An
+    empty workspace in both buckets means Stage 7 hasn't been run.
+    Stricter check for send/gmail/attio modes lives in
+    `_check_have_approved_drafts`.
+    """
     approved = approved_for_send(engine)
     pending = pending_review(engine)
     if not approved and not pending:
@@ -144,6 +140,51 @@ def _check_approval_pipeline(engine) -> CheckResult:
     return CheckResult(
         "approval_pipeline", True,
         f"{len(approved)} approved + {len(pending)} pending review",
+    )
+
+
+def _check_have_approved_drafts(engine) -> CheckResult:
+    """Send/gmail/attio modes require at least one live approved draft.
+    A workspace with 0 approved + 10 pending review looks ready under
+    `_check_approval_pipeline` but has nothing for Gmail / export /
+    Attio to ship -- this check refuses that state explicitly so
+    `check_ready --for send` is a real green light."""
+    approved = approved_for_send(engine)
+    if not approved:
+        return CheckResult(
+            "have_approved_drafts", False,
+            "0 drafts in approved_to_send -- approve at least one "
+            "draft via scripts/approve_draft.py before sending",
+        )
+    return CheckResult(
+        "have_approved_drafts", True,
+        f"{len(approved)} approved draft(s) ready to ship",
+    )
+
+
+def _check_attio_config(ws) -> CheckResult:
+    """Attio-mode reachability: workspace has an Attio config block and
+    an ATTIO_API_KEY env var. Doesn't make a network call -- the next
+    Stage 8 run will. The point here is to refuse fast on
+    `check_ready --for attio` when the workspace was never wired up."""
+    import os
+    attio = (ws.attio or {}) if hasattr(ws, "attio") else {}
+    attio_cfg = (attio.get("attio") or {}) if isinstance(attio, dict) else {}
+    if not attio_cfg:
+        return CheckResult(
+            "attio_config", False,
+            "config/attio.yaml is missing or empty -- Stage 8 has "
+            "nothing to sync to",
+        )
+    if not os.environ.get("ATTIO_API_KEY"):
+        return CheckResult(
+            "attio_config", False,
+            "ATTIO_API_KEY env var is not set -- Stage 8 will refuse "
+            "to authenticate",
+        )
+    return CheckResult(
+        "attio_config", True,
+        "attio.yaml present and ATTIO_API_KEY set",
     )
 
 
@@ -350,26 +391,40 @@ def _check_scheduling_link_reachable(ws) -> CheckResult:
                 f"skipping reachability for reserved-TLD link {link!r} "
                 f"(production_guard refuses this at send time)",
             )
-    try:
-        import urllib.request
-        req = urllib.request.Request(link, method="HEAD")
-        # 5s is enough for any healthy scheduling service; we'd rather
-        # report "slow / unreachable" than hang the operator.
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            status = resp.getcode()
-    except Exception as exc:  # noqa: BLE001 -- diverse URL/timeout errors
+    # Some scheduling services (Calendly, SavvyCal) reject HEAD with
+    # 403/405 even though GET works. Try HEAD first; on those two
+    # status codes -- or any error -- fall back to a lightweight GET
+    # before declaring the link broken.
+    import urllib.request
+    def _probe(method: str) -> tuple[int | None, str | None]:
+        try:
+            req = urllib.request.Request(link, method=method)
+            # 5s is enough for any healthy scheduling service; we'd
+            # rather report "slow / unreachable" than hang the operator.
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.getcode(), None
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+        except Exception as exc:  # noqa: BLE001 -- diverse URL/timeout errors
+            return None, f"{type(exc).__name__}: {exc}"
+
+    status, err = _probe("HEAD")
+    if status in (403, 405) or status is None:
+        # HEAD-hostile server or low-level error -- retry with GET.
+        status, err = _probe("GET")
+    if status is None:
         return CheckResult(
             "scheduling_link_reachable", False,
-            f"HEAD {link} failed: {type(exc).__name__}: {exc}",
+            f"GET {link} failed: {err}",
         )
     if status >= 400:
         return CheckResult(
             "scheduling_link_reachable", False,
-            f"HEAD {link} -> {status}; recipients will hit a broken link",
+            f"GET {link} -> {status}; recipients will hit a broken link",
         )
     return CheckResult(
         "scheduling_link_reachable", True,
-        f"HEAD {link} -> {status}",
+        f"{link} -> {status}",
     )
 
 
@@ -423,28 +478,65 @@ def _check_mode(ws) -> CheckResult:
     return CheckResult("mode", True, f"mode={mode}")
 
 
-def _run_all_checks(ws, engine, *, allow_example_domains: bool) -> list[CheckResult]:
-    return [
+PHASES = ("review", "send", "gmail", "attio")
+
+
+def _run_all_checks(
+    ws, engine, *, phase: str, allow_example_domains: bool,
+) -> list[CheckResult]:
+    """Build the check list for the requested phase.
+
+    review: minimal -- show what's queued, don't insist on approvals.
+    send:   require at least one approved draft + every approved draft
+            still passes the live gate.
+    gmail:  send + Gmail OAuth + scheduling link.
+    attio:  send + Attio config / credentials.
+    """
+    # Common baseline: every phase needs a valid workspace + fresh
+    # Stage 6 data, and we always print the pipeline summary so the
+    # operator knows what state they're in.
+    checks: list[CheckResult] = [
         _check_mode(ws),
         _check_config(ws),
         _check_stage6_freshness(engine),
         _check_approval_pipeline(engine),
+    ]
+    if phase == "review":
+        # The reviewer's view: that's it. Approval-side defense checks
+        # only make sense when something is actually approved.
+        return checks
+    # send / gmail / attio share the "actually sendable" gate.
+    checks.extend([
+        _check_have_approved_drafts(engine),
         _check_approved_have_emails(engine),
         _check_no_dnc_approvals(engine),
         _check_approved_gate_clean(ws, engine, allow_example_domains),
         _check_no_duplicate_recipients(engine),
         _check_daily_cap_headroom(ws, engine),
-        # Slice 15:
-        _check_scheduling_link_reachable(ws),
-        _check_gmail_oauth(ws),
-    ]
+    ])
+    if phase == "gmail":
+        checks.extend([
+            _check_scheduling_link_reachable(ws),
+            _check_gmail_oauth(ws),
+        ])
+    elif phase == "attio":
+        checks.append(_check_attio_config(ws))
+    return checks
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pre-send safety check for cold-outreach.",
+        description="Pre-flight safety check for cold-outreach.",
     )
     add_workspace_arg(parser)
+    parser.add_argument(
+        "--for", dest="phase", choices=PHASES, default="send",
+        help="Which workflow phase to gate on. review = approval-queue "
+             "snapshot (no approved drafts required); send = pre-send "
+             "checks (requires approved drafts); gmail = send + Gmail "
+             "OAuth + scheduling-link reachability; attio = send + "
+             "Attio config. Default: send.",
+    )
     parser.add_argument(
         "--quiet", action="store_true",
         help="Only print BLOCKED lines + the summary.",
@@ -458,10 +550,12 @@ def main() -> int:
 
     ws = load_workspace(args.workspace)
     engine = get_engine(ws.db_url)
-    print_banner(ws, stage="check_ready")
+    print_banner(ws, stage=f"check_ready --for {args.phase}")
 
     results = _run_all_checks(
-        ws, engine, allow_example_domains=args.allow_example_domains,
+        ws, engine,
+        phase=args.phase,
+        allow_example_domains=args.allow_example_domains,
     )
     blocked = [r for r in results if not r.ok]
     passed = [r for r in results if r.ok]
