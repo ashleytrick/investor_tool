@@ -656,12 +656,27 @@ def get_today(
     with engine.begin() as conn:
         effective_limit = limit if limit is not None else _read_send_pace(conn)
 
-        # 1) Existing picks for today -- return as-is.
-        existing = list(conn.execute(
-            select(today_picks)
-            .where(today_picks.c.pick_date == today_iso)
-            .order_by(today_picks.c.rank)
-        ))
+        # Review item #14: filter snoozed drafts out of the read
+        # path too -- if the operator snoozes a draft AFTER today's
+        # picks were materialized, refreshing Today should drop it
+        # rather than confusingly show the row they just snoozed.
+        now_dt = _dt.datetime.now(_dt.timezone.utc)
+        active_snooze_ids = {
+            row.draft_id for row in conn.execute(
+                select(draft_snoozes.c.draft_id)
+                .where(draft_snoozes.c.snoozed_until > now_dt)
+            )
+        }
+
+        # 1) Existing picks for today -- return as-is (minus snoozes).
+        existing = [
+            r for r in conn.execute(
+                select(today_picks)
+                .where(today_picks.c.pick_date == today_iso)
+                .order_by(today_picks.c.rank)
+            )
+            if r.draft_id not in active_snooze_ids
+        ]
         if existing:
             picks_rows = existing[:effective_limit]
         else:
@@ -672,6 +687,16 @@ def get_today(
             #    leave multiple reviewable rows; dedupe per partner
             #    here so the upsert (PK = pick_date, partner_id)
             #    doesn't silently collapse ranks.
+            # Review item #14: exclude drafts whose snooze hasn't
+            # elapsed yet. The Today queue should match the
+            # operator's mental "what should I work on right now"
+            # filter; a draft they explicitly snoozed for tomorrow
+            # belongs to tomorrow, not today.
+            now_dt = _dt.datetime.now(_dt.timezone.utc)
+            snoozed_subq = (
+                select(draft_snoozes.c.draft_id)
+                .where(draft_snoozes.c.snoozed_until > now_dt)
+            )
             raw_candidates = list(conn.execute(
                 select(
                     email_drafts.c.draft_id,
@@ -690,6 +715,7 @@ def get_today(
                         list(REVIEWABLE_STATES)
                     ),
                     email_drafts.c.superseded_at.is_(None),
+                    ~email_drafts.c.draft_id.in_(snoozed_subq),
                 )
                 .order_by(
                     # NULLS LAST: partners that never scored fall to
