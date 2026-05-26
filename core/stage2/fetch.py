@@ -8,23 +8,21 @@ Three responsibilities:
         exist (a fund seeded via funds_seed.csv but missing fixture HTML).
 
   - gather_live_pages(fund) -> (pages, required_failures, optional_failures)
-        Async HTTP fetch over the standard fund-page paths via
-        core.http_client.HttpClient. Required-path failures (homepage /
-        5xx) bubble up so Stage 2's caller can `run.fail` per fund; optional-
-        path failures (e.g. missing /portfolio) only log.
+        Fetch the homepage first, discover likely internal team / portfolio /
+        thesis / news / about pages from its links, then fetch those plus the
+        fixed fallback paths. Operators only need to provide the fund domain.
 
   - store_snapshots(engine, pages) -> int
         Dedup-on-(url, content_hash) write into source_snapshots. Each new
         snapshot also registers its URL via core.sources.upsert_source
         (Slice 18b) so the canonical sources registry stays in lockstep.
 
-Lifted verbatim from scripts/02_enrich_funds.py; signatures unchanged
-so any external caller importing these from the script keeps working
-through the back-compat re-exports there.
+Lifted from scripts/02_enrich_funds.py; signatures unchanged so any external
+caller importing these from the script keeps working through the back-compat
+re-exports there.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import pathlib
 from datetime import datetime, timezone
@@ -33,17 +31,22 @@ from selectolax.parser import HTMLParser
 from sqlalchemy import select
 
 from core.db import source_snapshots
-from core.http_client import HttpClient
+from core.http_client import HttpClient, FetchResult
 from core.sources import upsert_source
+from core.stage2.discovery import discover_fund_pages
 
 
 STAGE = "02_enrich_funds"
 
 LIVE_PATHS_REQUIRED: tuple[str, ...] = ("",)
 LIVE_PATHS_OPTIONAL: tuple[str, ...] = (
-    "portfolio", "team", "thesis", "about", "news",
+    "portfolio", "team", "people", "partners", "investors",
+    "investment-team", "our-team", "team-members", "thesis", "approach",
+    "about", "about-us", "who-we-are", "firm", "news", "insights",
 )
 LIVE_PATHS = list(LIVE_PATHS_REQUIRED + LIVE_PATHS_OPTIONAL)
+DISCOVERED_PAGE_LIMIT = 10
+LIVE_PAGE_FETCH_LIMIT = 14
 
 
 def _now() -> datetime:
@@ -78,6 +81,18 @@ def _page_html(entry) -> str:
     return entry
 
 
+def _dedupe_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        key = url.rstrip("/") or url
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(url)
+    return out
+
+
 def gather_fixture_pages(fund: dict, ws) -> dict[str, str]:
     """Read local fixture HTML for a fund. Returns {url: html}."""
     fx_dir = ws.fixtures_dir / "fund_pages" / fund["domain"]
@@ -89,45 +104,76 @@ def gather_fixture_pages(fund: dict, ws) -> dict[str, str]:
     return pages
 
 
+async def _fetch_page(
+    client: HttpClient,
+    url: str,
+) -> tuple[FetchResult | None, str | None]:
+    try:
+        return await client.fetch(url), None
+    except Exception as exc:  # noqa: BLE001 - caller buckets for audit
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 async def gather_live_pages(
     fund: dict,
 ) -> tuple[dict[str, dict], list[tuple[str, str]], list[tuple[str, str]]]:
-    """Fetch standard fund pages. Returns
-    (pages_by_url, required_failures, optional_failures) where the
-    failure lists are (url, reason) tuples for the operator audit trail.
+    """Fetch live fund pages with homepage-driven discovery.
 
-    Required failures (transport / 5xx on a REQUIRED path) signal that
-    the fund can't be enriched at all -- Stage 2's caller counts each
-    as a per-fund run.fail so cron / wrappers notice. Optional
-    failures (transport / 5xx on a NICE-TO-HAVE path) are logged for
-    audit but don't bump run.failed; a missing /portfolio is normal.
-
-    Batch 36 (#13): result dict carries final_url alongside the HTML so
-    store_snapshots can persist the post-redirect URL into
-    source_snapshots.final_url.
+    Homepage is required. Once it is fetched, Stage 2 extracts internal links
+    and ranks likely team / people / portfolio / thesis / news pages, then
+    fetches the best discovered URLs plus fixed fallback paths. This lets the
+    operator provide only a fund domain while still finding pages like
+    /people, /investment-team, /who-we-are, or /companies.
     """
     client = HttpClient()
     pages: dict[str, dict] = {}
     required_failures: list[tuple[str, str]] = []
     optional_failures: list[tuple[str, str]] = []
-    for path in LIVE_PATHS:
-        is_required = path in LIVE_PATHS_REQUIRED
-        url = page_url(fund["domain"], path)
-        try:
-            res = await client.fetch(url)
-        except Exception as exc:  # noqa: BLE001 - audited via failures
-            bucket = required_failures if is_required else optional_failures
-            bucket.append((url, f"{type(exc).__name__}: {exc}"))
+
+    homepage = page_url(fund["domain"], "")
+    res, error = await _fetch_page(client, homepage)
+    if error:
+        required_failures.append((homepage, error))
+        return pages, required_failures, optional_failures
+    if res is None or res.status != 200 or not res.text.strip():
+        status = res.status if res is not None else "?"
+        required_failures.append((homepage, f"HTTP {status}"))
+        return pages, required_failures, optional_failures
+
+    pages[homepage] = {"html": res.text, "final_url": res.final_url}
+
+    discovered = discover_fund_pages(
+        res.final_url or homepage,
+        res.text,
+        max_pages=DISCOVERED_PAGE_LIMIT,
+    )
+    discovered_urls = [p.url for p in discovered]
+    fixed_optional_urls = [page_url(fund["domain"], p) for p in LIVE_PATHS_OPTIONAL]
+    candidate_urls = _dedupe_urls(discovered_urls + fixed_optional_urls)
+    candidate_urls = [u for u in candidate_urls if (u.rstrip("/") or u) != homepage.rstrip("/")]
+    candidate_urls = candidate_urls[:LIVE_PAGE_FETCH_LIMIT]
+
+    if not any(p.category == "team" for p in discovered):
+        optional_failures.append((
+            homepage,
+            "no likely team/people page discovered from homepage links; "
+            "fixed fallback paths will still be tried",
+        ))
+
+    for url in candidate_urls:
+        res, error = await _fetch_page(client, url)
+        if error:
+            optional_failures.append((url, error))
+            continue
+        if res is None:
+            optional_failures.append((url, "no response"))
             continue
         if res.status == 200 and res.text.strip():
             pages[url] = {"html": res.text, "final_url": res.final_url}
             continue
         if res.status >= 500:
-            bucket = required_failures if is_required else optional_failures
-            bucket.append((url, f"HTTP {res.status}"))
+            optional_failures.append((url, f"HTTP {res.status}"))
             continue
-        if is_required and res.status >= 400:
-            required_failures.append((url, f"HTTP {res.status}"))
     return pages, required_failures, optional_failures
 
 
