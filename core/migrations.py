@@ -86,6 +86,50 @@ def _m001_baseline(_conn: Any) -> None:
     a parent to chain after."""
 
 
+def _m002_backfill_source_ids(conn: Any) -> None:
+    """Slice 18b: backfill source_snapshots.source_id by upserting
+    every distinct source_url into the new `sources` registry.
+
+    Safe to run on a workspace where some snapshots already carry a
+    source_id (e.g. partial migration mid-flight): the WHERE clause
+    filters to snapshots that still need a backfill, and upsert_source
+    is idempotent on the URL UNIQUE index.
+
+    Also safe to run on a workspace that doesn't have source_snapshots
+    yet -- the early return below short-circuits.
+    """
+    # Defensive: a minimal pre-existing workspace might not have a
+    # source_snapshots table yet (the test fixture for
+    # `test_predates_workspace_actually_runs_migrations` is exactly
+    # this shape). No table -> nothing to backfill.
+    has_table = [
+        row[0] for row in conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='source_snapshots'"
+        )
+    ]
+    if not has_table:
+        return
+    urls = [
+        row[0] for row in conn.exec_driver_sql(
+            "SELECT DISTINCT source_url FROM source_snapshots "
+            "WHERE source_id IS NULL AND source_url IS NOT NULL"
+        )
+    ]
+    if not urls:
+        return
+    # Import here so this module doesn't pull core.sources at top
+    # level (avoids the cycle db -> migrations -> sources -> db).
+    from core.sources import upsert_source
+    for url in urls:
+        sid = upsert_source(conn, source_url=url, source_type=None)
+        conn.exec_driver_sql(
+            "UPDATE source_snapshots SET source_id = ? "
+            "WHERE source_url = ? AND source_id IS NULL",
+            (sid, url),
+        )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(
         id="m001_baseline",
@@ -94,6 +138,15 @@ MIGRATIONS: list[Migration] = [
             "Records that the workspace is using the migrations system."
         ),
         apply=_m001_baseline,
+    ),
+    Migration(
+        id="m002_backfill_source_ids",
+        description=(
+            "Slice 18b -- upsert every distinct source_snapshots.source_url "
+            "into the new `sources` registry + stamp source_id on the "
+            "snapshot rows. Idempotent."
+        ),
+        apply=_m002_backfill_source_ids,
     ),
 ]
 

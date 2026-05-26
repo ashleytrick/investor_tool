@@ -237,8 +237,15 @@ def store_snapshots(engine, pages: dict) -> int:
             ).first()
             if exists:
                 continue
+            # Slice 18b: register the URL in the canonical sources
+            # registry + stamp source_id on the snapshot.
+            from core.sources import upsert_source
+            sid = upsert_source(
+                conn, source_url=url, source_type="fund_team_page",
+            )
             conn.execute(source_snapshots.insert().values(
                 source_url=url,
+                source_id=sid,
                 final_url=final_url,
                 fetched_at=_now(),
                 http_status=200,

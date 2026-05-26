@@ -77,9 +77,16 @@ def upsert_snapshot_failure(
 ) -> int | None:
     chash = _content_hash(f"FAIL:{http_status}:{note}")
     with engine.begin() as conn:
+        # Slice 18b: register the URL in the canonical sources
+        # registry even when the fetch failed.
+        from core.sources import upsert_source
+        sid = upsert_source(
+            conn, source_url=source_url, source_type="partner_content",
+        )
         try:
             result = conn.execute(source_snapshots.insert().values(
                 source_url=source_url,
+                source_id=sid,
                 final_url=final_url,
                 fetched_at=_now(),
                 http_status=http_status,
@@ -97,6 +104,11 @@ def upsert_snapshot(engine, source_url: str, text: str,
     """Return snapshot_id; create if (source_url, content_hash) not present."""
     chash = _content_hash(text)
     with engine.begin() as conn:
+        # Slice 18b: canonical sources registry.
+        from core.sources import upsert_source
+        sid = upsert_source(
+            conn, source_url=source_url, source_type="partner_content",
+        )
         existing = conn.execute(
             select(source_snapshots.c.snapshot_id).where(
                 source_snapshots.c.source_url == source_url,
@@ -107,6 +119,7 @@ def upsert_snapshot(engine, source_url: str, text: str,
             return int(existing.snapshot_id)
         result = conn.execute(source_snapshots.insert().values(
             source_url=source_url,
+            source_id=sid,
             final_url=final_url,  # Batch 36 (#14): post-redirect URL
             fetched_at=_now(),
             http_status=200,

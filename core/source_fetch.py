@@ -39,6 +39,7 @@ from typing import Any
 from sqlalchemy import select
 
 from core.db import source_snapshots
+from core.sources import upsert_source
 
 
 # Sentinel http_status used in failure snapshots when no HTTP response
@@ -92,13 +93,22 @@ def record_fetch_success(
     final_url: str | None,
     stage: str,
     http_status: int = 200,
+    source_type: str | None = None,
 ) -> int:
     """Insert (or return-existing) source_snapshots row for a successful
     fetch. Dedup key is (source_url, content_hash) so the same body
     re-fetched produces the same snapshot_id rather than churning rows.
+
+    Slice 18b: also upserts a row in the canonical `sources`
+    registry and stamps `source_id` on the snapshot. `source_type`
+    is the optional category hint (e.g. "funding_announcement_feed",
+    "fund_team_page") and is recorded on first sight only.
     """
     chash = content_hash(text)
     with engine.begin() as conn:
+        sid = upsert_source(
+            conn, source_url=source_url, source_type=source_type,
+        )
         existing = conn.execute(
             select(source_snapshots.c.snapshot_id).where(
                 source_snapshots.c.source_url == source_url,
@@ -109,6 +119,7 @@ def record_fetch_success(
             return int(existing.snapshot_id)
         result = conn.execute(source_snapshots.insert().values(
             source_url=source_url,
+            source_id=sid,
             final_url=final_url,
             fetched_at=_now(),
             http_status=http_status,
@@ -127,6 +138,7 @@ def record_fetch_failure(
     final_url: str | None,
     note: str,
     stage: str,
+    source_type: str | None = None,
 ) -> int | None:
     """Insert a source_snapshots row for a failed fetch so the audit
     captures the attempt. extracted_text stays NULL; the content_hash
@@ -134,14 +146,22 @@ def record_fetch_failure(
     the same URL produce distinct rows (and re-running the same
     failure deduplicates via UNIQUE constraint).
 
+    Slice 18b: failures also upsert the URL into the canonical
+    `sources` registry -- a URL we tried to fetch is a URL we know
+    about, even if today's attempt didn't return content.
+
     Returns the inserted snapshot_id, or None when the insert hit the
     UNIQUE collision (the same failure was already audited).
     """
     chash = content_hash(f"FAIL:{http_status}:{note}")
     with engine.begin() as conn:
+        sid = upsert_source(
+            conn, source_url=source_url, source_type=source_type,
+        )
         try:
             result = conn.execute(source_snapshots.insert().values(
                 source_url=source_url,
+                source_id=sid,
                 final_url=final_url,
                 fetched_at=_now(),
                 http_status=http_status,
