@@ -18,40 +18,41 @@ Run: uv run scripts/04_mine_partner_signals.py --workspace clients/test_workspac
 from __future__ import annotations
 
 import argparse
-import asyncio
-import csv
-import hashlib
 import json
 import pathlib
 import sys
-from collections import defaultdict
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from selectolax.parser import HTMLParser
 from sqlalchemy import and_, select
 
 from core.config_loader import add_workspace_arg
-from core.stage_runner import stage_run
 from core.db import funds, partners, signals, source_snapshots
-from core.http_client import HttpClient
 from core.llm.client import MODEL_BATCH
+from core.stage_runner import stage_run
 from schemas.partner_signals import PartnerSignalsOutput
 
-STAGE = "04_mine_partner_signals"
+# Slice 18c: fetch + extract logic moved to core/stage4/. Re-exported
+# below as module-level names so any external caller that imports
+# from this script keeps working.
+from core.stage4.fetch import (  # noqa: F401
+    CSV_REQUIRED_HEADERS,
+    PARTNER_CONTENT_URLS_PATH,
+    STAGE,
+    _fetch_live_partner_content,
+    upsert_snapshot,
+    upsert_snapshot_failure,
+)
+from core.stage4.extract import render_prompt  # noqa: F401
+
 PROMPT_PATH = (
     pathlib.Path(__file__).resolve().parent.parent / "prompts" / "extract_partner_signals.txt"
 )
-PARTNER_CONTENT_URLS_PATH = "data/raw/partner_content_urls.csv"
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def build_axes_block(axes_cfg: dict) -> str:
@@ -64,209 +65,6 @@ def build_axes_block(axes_cfg: dict) -> str:
         if ax.get("negative_signals"):
             lines.append(f'  Negative: {", ".join(ax["negative_signals"])}')
     return "\n".join(lines)
-
-
-# Batch 36 (#12/#14): when a Stage 4 fetch fails OR returns non-200, we
-# still want a source_snapshots row so the audit trail captures the
-# attempt. http_status carries the real status (or -1 for transport
-# failures); extracted_text stays NULL. final_url is the post-redirect
-# URL when available.
-def upsert_snapshot_failure(
-    engine, source_url: str, *, http_status: int, final_url: str | None,
-    note: str,
-) -> int | None:
-    chash = _content_hash(f"FAIL:{http_status}:{note}")
-    with engine.begin() as conn:
-        # Slice 18b: register the URL in the canonical sources
-        # registry even when the fetch failed.
-        from core.sources import upsert_source
-        sid = upsert_source(
-            conn, source_url=source_url, source_type="partner_content",
-        )
-        try:
-            result = conn.execute(source_snapshots.insert().values(
-                source_url=source_url,
-                source_id=sid,
-                final_url=final_url,
-                fetched_at=_now(),
-                http_status=http_status,
-                content_hash=chash,
-                extracted_text=None,
-                fetched_during_stage=STAGE,
-            ))
-            return int(result.inserted_primary_key[0])
-        except Exception:  # noqa: BLE001 - UNIQUE collision on (url, hash)
-            return None
-
-
-def upsert_snapshot(engine, source_url: str, text: str,
-                    *, final_url: str | None = None) -> int:
-    """Return snapshot_id; create if (source_url, content_hash) not present."""
-    chash = _content_hash(text)
-    with engine.begin() as conn:
-        # Slice 18b: canonical sources registry.
-        from core.sources import upsert_source
-        sid = upsert_source(
-            conn, source_url=source_url, source_type="partner_content",
-        )
-        existing = conn.execute(
-            select(source_snapshots.c.snapshot_id).where(
-                source_snapshots.c.source_url == source_url,
-                source_snapshots.c.content_hash == chash,
-            )
-        ).first()
-        if existing:
-            return int(existing.snapshot_id)
-        result = conn.execute(source_snapshots.insert().values(
-            source_url=source_url,
-            source_id=sid,
-            final_url=final_url,  # Batch 36 (#14): post-redirect URL
-            fetched_at=_now(),
-            http_status=200,
-            content_hash=chash,
-            extracted_text=text,
-            fetched_during_stage=STAGE,
-        ))
-        return int(result.inserted_primary_key[0])
-
-
-CSV_REQUIRED_HEADERS = {"partner_id", "source_type", "source_url"}
-
-
-def _fetch_live_partner_content(
-    ws, engine, run, known_partner_ids: set[str],
-    *, strict_unknown_partners: bool = True,
-) -> dict:
-    """Read data/raw/partner_content_urls.csv (cols: partner_id, source_type,
-    source_url), fetch each URL via http_client, and return a dict matching
-    the partner_signals_seed.json shape so the rest of Stage 4 is identical.
-
-    Batch 36 (#8/#10/#11/#12/#14):
-    - Validates the CSV header against CSV_REQUIRED_HEADERS upfront and
-      raises a clear error if missing.
-    - Unknown partner_id rows are recorded in run_errors (and the run
-      EXITS with run.failed when strict_unknown_partners=True).
-    - Per-URL fetch failures land in run_errors AND a source_snapshots
-      row with http_status set (or -1 for transport errors), instead of
-      vanishing into stdout.
-    - Successful fetches now record final_url (post-redirect).
-    """
-    csv_path = ws.path / PARTNER_CONTENT_URLS_PATH
-    if not csv_path.exists():
-        return {}
-    client = HttpClient()
-    out: dict[str, dict] = {}
-    by_partner: dict[str, list[tuple[str, str]]] = defaultdict(list)
-
-    # core/csv_ingest (Refactor item 4) replaces the bespoke header +
-    # row validation. unknown_partner errors are reported via row_errors;
-    # the strict_unknown_partners knob still decides whether they bump
-    # run.failed for cron non-zero exit. Rows with empty partner_id /
-    # source_url were previously silently skipped via `continue`; the
-    # require_field validators now flag those as missing_field row
-    # errors that get logged (matches the brief's "no silent failures"
-    # rule but doesn't change the per-row outcome -- the row is still
-    # excluded from `by_partner`).
-    from core.csv_ingest import (
-        CsvIngestSchema, ingest_csv, in_set, require_field,
-    )
-
-    schema = CsvIngestSchema(
-        required_headers=CSV_REQUIRED_HEADERS,
-        row_validators=(
-            require_field("partner_id"),
-            require_field("source_url"),
-            in_set("partner_id", known_partner_ids,
-                   error_type="unknown_partner_in_csv"),
-        ),
-    )
-    result = ingest_csv(csv_path, schema)
-    if result.missing_headers:
-        msg = (
-            f"partner_content_urls.csv missing required column(s): "
-            f"{result.missing_headers} (have: {result.headers})"
-        )
-        run.log_error(str(csv_path), "csv_schema", msg)
-        run.failed += 1
-        raise ValueError(msg)
-    for err in result.row_errors:
-        # Empty-field errors are noise (the prior code skipped them
-        # silently); only unknown_partner is operator-actionable. Log
-        # both for the audit trail but only bump run.failed for the
-        # unknown_partner class so existing strict/permissive semantics
-        # hold.
-        run.log_error(
-            err.record_id, err.error_type,
-            f"row {err.row_num}: {err.message}",
-        )
-        if err.error_type == "unknown_partner_in_csv" and strict_unknown_partners:
-            run.failed += 1
-    for row in result.rows:
-        pid = row["partner_id"]
-        url = row["source_url"]
-        stype = row.get("source_type") or "blog"
-        by_partner[pid].append((stype, url))
-
-    # Shared fetch + snapshot helper (core/source_fetch.py, Refactor
-    # item 5). One call per URL captures transport errors, non-200
-    # statuses, and empty-body 200s as failure snapshots; we still
-    # log + bump run.failed via the existing audit pattern so cron /
-    # wrappers see partial-fetch failures.
-    from core.source_fetch import fetch_and_record_sync
-
-    for pid, items in by_partner.items():
-        sources: list[dict] = []
-        for stype, url in items:
-            outcome = fetch_and_record_sync(
-                engine, client, url, stage=STAGE,
-            )
-            if outcome.error or not outcome.ok:
-                print(
-                    f"[stage 4] {pid} {url} -> {outcome.error}; skipping"
-                )
-                run.log_error(
-                    f"{pid}:{url}",
-                    "fetch_failed" if outcome.status < 0 else "http_error",
-                    outcome.error or f"HTTP {outcome.status}",
-                )
-                run.failed += 1
-                continue
-            text = HTMLParser(outcome.text).text(separator=" ", strip=True)
-            if not text:
-                run.log_error(
-                    f"{pid}:{url}", "empty_body",
-                    f"HTTP 200 but extracted text was empty "
-                    f"(final_url={outcome.final_url!r})",
-                )
-                run.failed += 1
-                continue
-            sources.append({
-                "source_type": stype,
-                "source_url": url,
-                "final_url": outcome.final_url,
-                "quote_date": None,
-                "text": text,
-            })
-        if sources:
-            out[pid] = {"sources": sources}
-            print(f"[stage 4] {pid}: {len(sources)} live content source(s) fetched")
-    return out
-
-
-def render_prompt(template: str, *, company: dict, partner_row, fund_name: str,
-                  axes_block: str, content: str) -> str:
-    c = company["company"]
-    raise_ctx = company["raise_context"]
-    return (
-        template
-        .replace("{COMPANY_NAME}", c["name"])
-        .replace("{ROUND}", raise_ctx.get("round", ""))
-        .replace("{AMOUNT}", raise_ctx.get("amount", ""))
-        .replace("{PARTNER_NAME}", partner_row.name)
-        .replace("{FUND_NAME}", fund_name)
-        .replace("{AXES_BLOCK}", axes_block)
-        .replace("{CONTENT}", content)
-    )
 
 
 def main() -> int:
