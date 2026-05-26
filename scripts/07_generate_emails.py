@@ -804,9 +804,27 @@ def main() -> int:
                         is_recommended=False,
                     )
                 )
-                conn.execute(delete(followup_drafts).where(followup_drafts.c.partner_id == pid))
-                conn.execute(delete(deck_request_responses).where(
-                    deck_request_responses.c.partner_id == pid))
+                # Slice 17 follow-up (#17): supersede followup_drafts +
+                # deck_request_responses too. Same version+superseded_at
+                # pattern as email_drafts -- the new Stage 7 generation
+                # records its row at version+1; the prior generation
+                # stays queryable by partner_id + version for audit.
+                conn.execute(
+                    followup_drafts.update()
+                    .where(
+                        followup_drafts.c.partner_id == pid,
+                        followup_drafts.c.superseded_at.is_(None),
+                    )
+                    .values(superseded_at=_now())
+                )
+                conn.execute(
+                    deck_request_responses.update()
+                    .where(
+                        deck_request_responses.c.partner_id == pid,
+                        deck_request_responses.c.superseded_at.is_(None),
+                    )
+                    .values(superseded_at=_now())
+                )
         # Run stale_after_approval transitions OUTSIDE the supersede
         # transaction; mark_stale opens its own engine.begin().
         for draft_id, pid in approved_to_stale:
@@ -923,13 +941,25 @@ def main() -> int:
                     )
                 # Batch 23 (#473/#474): tag followup + deck with batch_id
                 # so they can be reconciled to email_drafts.batch_id later.
+                # Slice 17 follow-up (#17): version = max(prior) + 1 so
+                # the supersede chain stays monotonic per partner.
+                fu_max = conn.execute(
+                    select(func.coalesce(func.max(followup_drafts.c.version), 0))
+                    .where(followup_drafts.c.partner_id == pid)
+                ).scalar() or 0
+                dk_max = conn.execute(
+                    select(func.coalesce(func.max(deck_request_responses.c.version), 0))
+                    .where(deck_request_responses.c.partner_id == pid)
+                ).scalar() or 0
                 conn.execute(followup_drafts.insert().values(
                     partner_id=pid, batch_id=batch_id,
+                    version=int(fu_max) + 1,
                     body=output.followup_draft,
                     generated_at=_now(),
                 ))
                 conn.execute(deck_request_responses.insert().values(
                     partner_id=pid, batch_id=batch_id,
+                    version=int(dk_max) + 1,
                     body=output.deck_request_response,
                     generated_at=_now(),
                 ))

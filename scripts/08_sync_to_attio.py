@@ -390,18 +390,19 @@ def main() -> int:
             ):
                 key = "recommended" if d.is_recommended else "alternate"
                 drafts_by_partner.setdefault(d.partner_id, {})[key] = d
+            # Slice 17 follow-up (#17): live (non-superseded) rows only.
             followups_by_partner: dict[str, str] = {}
             for f in conn.execute(
-                select(followup_drafts).order_by(
-                    followup_drafts.c.followup_id.asc()
-                )
+                select(followup_drafts)
+                .where(followup_drafts.c.superseded_at.is_(None))
+                .order_by(followup_drafts.c.followup_id.asc())
             ):
                 followups_by_partner[f.partner_id] = f.body
             deck_by_partner: dict[str, str] = {}
             for d in conn.execute(
-                select(deck_request_responses).order_by(
-                    deck_request_responses.c.response_id.asc()
-                )
+                select(deck_request_responses)
+                .where(deck_request_responses.c.superseded_at.is_(None))
+                .order_by(deck_request_responses.c.response_id.asc())
             ):
                 deck_by_partner[d.partner_id] = d.body
 
@@ -692,9 +693,16 @@ def main() -> int:
                                     .where(email_drafts.c.draft_id == alt_draft.draft_id)
                                     .values(pushed_to_attio_at=now)
                                 )
+                            # Slice 17 follow-up (#17): only stamp the
+                            # live row (superseded_at IS NULL) -- stamping
+                            # a superseded row would silently re-mark a
+                            # prior generation as pushed.
                             latest_followup_id = conn.execute(
                                 select(followup_drafts.c.followup_id)
-                                .where(followup_drafts.c.partner_id == p.partner_id)
+                                .where(
+                                    followup_drafts.c.partner_id == p.partner_id,
+                                    followup_drafts.c.superseded_at.is_(None),
+                                )
                                 .order_by(followup_drafts.c.followup_id.desc())
                                 .limit(1)
                             ).scalar()
@@ -706,7 +714,10 @@ def main() -> int:
                                 )
                             latest_deck_id = conn.execute(
                                 select(deck_request_responses.c.response_id)
-                                .where(deck_request_responses.c.partner_id == p.partner_id)
+                                .where(
+                                    deck_request_responses.c.partner_id == p.partner_id,
+                                    deck_request_responses.c.superseded_at.is_(None),
+                                )
                                 .order_by(deck_request_responses.c.response_id.desc())
                                 .limit(1)
                             ).scalar()

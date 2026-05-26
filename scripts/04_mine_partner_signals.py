@@ -297,12 +297,23 @@ def main() -> int:
                                     ))
                                 )
                                 continue
+                            # Slice 18b follow-up (#18): register the
+                            # signal's source URL in the canonical
+                            # registry + thread source_id through to
+                            # the insert.
+                            from core.sources import upsert_source
+                            sid = upsert_source(
+                                conn,
+                                source_url=str(s.source_url),
+                                source_type=s.source_type,
+                            )
                             conn.execute(signals.insert().values(
                                 **signal_insert_values(
                                     partner_id=p.partner_id,
                                     signal=s,
                                     snapshot_id=snap_id,
                                     captured_at=now,
+                                    source_id=sid,
                                 )
                             ))
                             inserted_here += 1

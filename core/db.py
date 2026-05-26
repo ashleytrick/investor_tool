@@ -264,6 +264,10 @@ signals = Table(
     Column("snapshot_id", Integer, ForeignKey("source_snapshots.snapshot_id")),
     Column("source_type", Text),
     Column("source_url", Text, nullable=False),
+    # Slice 18b follow-up (#18): FK to the canonical sources registry.
+    # source_url stays as a fallback for legacy callers; source_id is
+    # populated by every new writer + backfilled by m003.
+    Column("source_id", Integer, ForeignKey("sources.source_id")),
     Column("quoted_text", Text, nullable=False),
     Column("quote_date", Date),
     Column("axis_relevance", Text),
@@ -290,6 +294,9 @@ deal_attributions = Table(
     Column("lead_fund_id", Text, ForeignKey("funds.fund_id")),
     Column("attributed_partner_id", Text, ForeignKey("partners.partner_id")),
     Column("source_url", Text),
+    # Slice 18b follow-up (#18): FK to the canonical sources registry.
+    # source_url stays for back-compat readers; m003 backfills source_id.
+    Column("source_id", Integer, ForeignKey("sources.source_id")),
     # Sector tags persisted from the Stage 3 LLM output (JSON list).
     # Surfaced by Stage 6 round_fit for recent_relevant_deals scoring.
     Column("sector_tags", Text),
@@ -610,6 +617,11 @@ followup_drafts = Table(
     Column("body", Text),
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
+    # Slice 17 follow-up (#17): immutable history matching email_drafts.
+    # Stage 7's per-partner DELETE becomes UPDATE-supersede; new row
+    # gets version+1. Operator audit can recover any prior generation.
+    Column("version", Integer, default=1),
+    Column("superseded_at", DateTime),
     Index("ix_followup_drafts_partner_id", "partner_id"),
     Index("ix_followup_drafts_batch_id", "batch_id"),
 )
@@ -626,6 +638,9 @@ deck_request_responses = Table(
     Column("body", Text),
     Column("generated_at", DateTime),
     Column("pushed_to_attio_at", DateTime),
+    # Slice 17 follow-up (#17): immutable history.
+    Column("version", Integer, default=1),
+    Column("superseded_at", DateTime),
     Index("ix_deck_request_responses_partner_id", "partner_id"),
     Index("ix_deck_request_responses_batch_id", "batch_id"),
 )
@@ -692,6 +707,8 @@ ambiguous_matches = Table(
     Column("entity_type", Text),          # 'fund' or 'partner'
     Column("raw_name", Text),
     Column("source_url", Text),
+    # Slice 18b follow-up (#18): FK to the canonical sources registry.
+    Column("source_id", Integer, ForeignKey("sources.source_id")),
     Column("candidates", Text),           # JSON list of {id, name, score}
     Column("chosen_id", Text),            # the auto-picked id (may be NULL)
     Column("chosen_score", Float),

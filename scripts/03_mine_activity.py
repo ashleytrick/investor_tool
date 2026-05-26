@@ -455,10 +455,18 @@ def main() -> int:
                         )
                     ):
                         with engine.begin() as conn:
+                            # Slice 18b follow-up (#18): register the
+                            # announcement source URL + thread source_id.
+                            from core.sources import upsert_source
+                            sid = upsert_source(
+                                conn, source_url=source_url,
+                                source_type="funding_announcement_feed",
+                            )
                             conn.execute(ambiguous_matches.insert().values(
                                 entity_type="fund",
                                 raw_name=deal.lead_investor,
                                 source_url=source_url,
+                                source_id=sid,
                                 candidates=json.dumps(lead_candidates),
                                 chosen_id=lead_fund_id,
                                 chosen_score=(
@@ -653,6 +661,16 @@ def main() -> int:
                             )
                         )
                         if rows:
+                            # Slice 18b follow-up (#18): register the
+                            # announcement source URL once, then stamp
+                            # source_id on every deal row.
+                            from core.sources import upsert_source
+                            sid = upsert_source(
+                                conn, source_url=source_url,
+                                source_type="funding_announcement_feed",
+                            )
+                            for _row in rows:
+                                _row["source_id"] = sid
                             conn.execute(deal_attributions.insert(), rows)
                     if not rows:
                         run.skip()

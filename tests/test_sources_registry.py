@@ -212,3 +212,93 @@ def test_list_sources_cli_json_output(tmp_path: Path) -> None:
         assert "source_url" in r
         assert r["first_seen_at"] is not None
         assert r["last_seen_at"] is not None
+
+
+def test_source_id_populated_on_signals_after_pipeline(tmp_path):
+    """Slice 18b follow-up (#18): a fresh fixture pipeline should
+    populate signals.source_id via the new upsert_source call site in
+    scripts/04_mine_partner_signals.py -- not via the m003 backfill,
+    since brand-new workspaces stamp migrations without running them."""
+    ws_src = REPO_ROOT / "clients" / "test_workspace"
+    ws_dst = tmp_path / "test_workspace"
+    shutil.copytree(ws_src, ws_dst)
+    db = ws_dst / "data" / "pipeline.db"
+    if db.exists():
+        db.unlink()
+    _run_pipeline_through_stage_6(ws_dst)
+
+    c = sqlite3.connect(db)
+    total, with_id = c.execute(
+        "select count(*), count(source_id) from signals"
+    ).fetchone()
+    c.close()
+    assert total > 0
+    assert with_id == total, (
+        f"expected every signal to carry source_id; "
+        f"got {with_id}/{total}"
+    )
+
+
+def test_source_id_populated_on_deal_attributions(tmp_path):
+    """Same shape: deal_attributions writers thread source_id."""
+    ws_src = REPO_ROOT / "clients" / "test_workspace"
+    ws_dst = tmp_path / "test_workspace"
+    shutil.copytree(ws_src, ws_dst)
+    db = ws_dst / "data" / "pipeline.db"
+    if db.exists():
+        db.unlink()
+    _run_pipeline_through_stage_6(ws_dst)
+
+    c = sqlite3.connect(db)
+    total, with_id = c.execute(
+        "select count(*), count(source_id) from deal_attributions"
+    ).fetchone()
+    c.close()
+    assert total > 0
+    assert with_id == total, (
+        f"expected every deal_attribution to carry source_id; "
+        f"got {with_id}/{total}"
+    )
+
+
+def test_m003_backfills_signals_on_legacy_workspace(tmp_path):
+    """A legacy workspace that has signals without source_id should
+    have them backfilled by m003 on first get_engine call."""
+    from sqlalchemy import create_engine
+    db_path = tmp_path / "legacy_signals.db"
+    raw_engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with raw_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE signals ("
+            "  signal_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  source_url TEXT NOT NULL, "
+            "  quoted_text TEXT NOT NULL "
+            ")"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO signals (source_url, quoted_text) "
+            "VALUES ('https://podcasts.example/ep1', 'quote a'), "
+            "       ('https://podcasts.example/ep1', 'quote b'), "
+            "       ('https://blog.example/post1', 'quote c')"
+        )
+    # Open via get_engine -- _sync_columns_with_metadata adds source_id;
+    # apply_pending_migrations runs m003 backfill.
+    engine = get_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        rows = list(conn.execute(
+            select(text("signal_id, source_url, source_id"))
+            .select_from(text("signals"))
+            .order_by(text("signal_id"))
+        )) if False else None
+    # Use raw SQL since SQLAlchemy mapped table is broader than the
+    # minimal column set we created.
+    import sqlite3 as _sq
+    c = _sq.connect(db_path)
+    rows = c.execute(
+        "select source_url, source_id from signals order by signal_id"
+    ).fetchall()
+    src_count = c.execute("select count(*) from sources").fetchone()[0]
+    c.close()
+    assert all(r[1] is not None for r in rows)
+    # Two distinct URLs -> two sources rows.
+    assert src_count == 2

@@ -130,6 +130,61 @@ def _m002_backfill_source_ids(conn: Any) -> None:
         )
 
 
+def _m003_backfill_source_ids_extended(conn: Any) -> None:
+    """Slice 18b follow-up (#18): backfill source_id on signals,
+    deal_attributions, and ambiguous_matches. Same pattern as m002 but
+    across the three remaining tables that carry loose source_url.
+
+    Each table's source_url either matches a row already in the
+    `sources` registry (registered by m002 from source_snapshots, or
+    by a new writer post-Slice-18b) OR is a URL we haven't seen
+    elsewhere -- in which case upsert_source registers it now.
+
+    Idempotent: re-runs no-op once source_id is populated.
+    """
+    from core.sources import upsert_source
+
+    targets = (
+        ("signals", "source_url"),
+        ("deal_attributions", "source_url"),
+        ("ambiguous_matches", "source_url"),
+    )
+    for table_name, url_col in targets:
+        # Defensive: skip when the table doesn't exist (minimal
+        # pre-existing workspaces from the test fixtures).
+        has_table = [
+            row[0] for row in conn.exec_driver_sql(
+                f"SELECT name FROM sqlite_master "
+                f"WHERE type='table' AND name='{table_name}'"
+            )
+        ]
+        if not has_table:
+            continue
+        # Check the table has a source_id column (the ALTER ADD COLUMN
+        # ran via _sync_columns_with_metadata before us; defensive in
+        # case migration ordering changes).
+        cols = {
+            row[1] for row in conn.exec_driver_sql(
+                f"PRAGMA table_info({table_name})"
+            )
+        }
+        if "source_id" not in cols:
+            continue
+        urls = [
+            row[0] for row in conn.exec_driver_sql(
+                f"SELECT DISTINCT {url_col} FROM {table_name} "
+                f"WHERE source_id IS NULL AND {url_col} IS NOT NULL"
+            )
+        ]
+        for url in urls:
+            sid = upsert_source(conn, source_url=url, source_type=None)
+            conn.exec_driver_sql(
+                f"UPDATE {table_name} SET source_id = ? "
+                f"WHERE {url_col} = ? AND source_id IS NULL",
+                (sid, url),
+            )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(
         id="m001_baseline",
@@ -147,6 +202,14 @@ MIGRATIONS: list[Migration] = [
             "snapshot rows. Idempotent."
         ),
         apply=_m002_backfill_source_ids,
+    ),
+    Migration(
+        id="m003_backfill_source_ids_extended",
+        description=(
+            "Slice 18b follow-up (#18) -- backfill source_id on signals, "
+            "deal_attributions, and ambiguous_matches. Idempotent."
+        ),
+        apply=_m003_backfill_source_ids_extended,
     ),
 ]
 

@@ -85,15 +85,25 @@ def signal_insert_values(
     signal: Any,
     snapshot_id: int | None,
     captured_at: datetime,
+    source_id: int | None = None,
 ) -> dict:
     """Shape an LLM-extracted signal into a signals.insert() values
     dict. verified defaults to False; Stage 5's gauntlet flips it on
-    after verifying the quote against the snapshot."""
+    after verifying the quote against the snapshot.
+
+    Slice 18b follow-up (#18): `source_id` is the canonical FK into
+    the `sources` registry. Caller passes the registered id (from
+    `core.sources.upsert_source`) so the writer doesn't have to
+    re-open a connection. NULL is permitted -- legacy callers that
+    don't yet thread the id will still produce valid rows and m003
+    backfills them.
+    """
     return {
         "partner_id": partner_id,
         "snapshot_id": snapshot_id,
         "source_type": signal.source_type,
         "source_url": str(signal.source_url),
+        "source_id": source_id,
         "quoted_text": signal.quoted_text,
         "quote_date": signal.quote_date,
         "axis_relevance": json.dumps(signal.axis_relevance),

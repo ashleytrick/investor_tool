@@ -92,18 +92,23 @@ def main() -> int:
             )
         }
         # Followup + deck per partner (latest by id ascending wins).
+        # Slice 17 follow-up (#17): filter to live (non-superseded) rows
+        # so the send queue picks up the current generation only. The
+        # dict-build via .partner_id collapses to one row per partner;
+        # ordering by followup_id ascending means the LIVE row (highest
+        # id within the partner's set) wins as last-write.
         followup_by_partner = {
             f.partner_id: f.body for f in conn.execute(
-                select(followup_drafts).order_by(
-                    followup_drafts.c.followup_id.asc(),
-                )
+                select(followup_drafts)
+                .where(followup_drafts.c.superseded_at.is_(None))
+                .order_by(followup_drafts.c.followup_id.asc())
             )
         }
         deck_by_partner = {
             d.partner_id: d.body for d in conn.execute(
-                select(deck_request_responses).order_by(
-                    deck_request_responses.c.response_id.asc(),
-                )
+                select(deck_request_responses)
+                .where(deck_request_responses.c.superseded_at.is_(None))
+                .order_by(deck_request_responses.c.response_id.asc())
             )
         }
         # Latest approved_to_send event per draft for actor + at.
