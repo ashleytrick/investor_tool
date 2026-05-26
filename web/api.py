@@ -228,6 +228,7 @@ from web.deps import (  # noqa: E402
     _engine_and_ws,
     _run_cli,
     _ws_path,
+    current_principal,
     require_auth,
 )
 
@@ -1641,4 +1642,134 @@ def _sync_uploaded_csv_to_global_pool(csv_bytes: bytes) -> int:
         return 0
     engine = get_global_engine()
     return upsert_many(engine, rows)
+
+
+# ---------- Phase 4: discovery surface ----------
+
+class DiscoveryMatch(BaseModel):
+    """One ranked discovery result. Flat shape for direct frontend
+    consumption -- the wizard renders a card per match with fit
+    reasons + a Claim button."""
+    global_id: int
+    firm: str
+    partner: str
+    email: str | None = None
+    stages: list[str] = Field(default_factory=list)
+    sectors: list[str] = Field(default_factory=list)
+    geographies: list[str] = Field(default_factory=list)
+    enriched_fields: dict = Field(default_factory=dict)
+    fit_score: int
+    fit_reasons: list[str] = Field(default_factory=list)
+
+
+class DiscoveryMatchesResult(BaseModel):
+    matches: list[DiscoveryMatch] = Field(default_factory=list)
+    count: int = 0
+
+
+class DiscoveryClaimBody(BaseModel):
+    global_id: int = Field(..., gt=0)
+
+
+class DiscoveryClaimResult(BaseModel):
+    ok: bool
+    fund_id: str
+    partner_id: str
+    global_id: int
+    created_fund: bool
+    created_partner: bool
+    stdout: str = ""
+
+
+@app.get(
+    "/discovery/matches",
+    response_model=DiscoveryMatchesResult,
+    summary="Ranked investors from the shared pool not yet in your list",
+    tags=["discovery"],
+)
+def discovery_matches(
+    limit: int = Query(50, ge=1, le=500),
+    _principal: dict | None = Depends(current_principal),
+    _auth: None = Depends(require_auth),
+) -> DiscoveryMatchesResult:
+    """Top-N investors_global rows not already in the tenant's
+    `partners` table, ranked by fit to the tenant's company
+    profile (sector / stage / geography overlap)."""
+    from core.discovery import find_matches
+    from core.investors_global import get_global_engine
+
+    engine, ws = _engine_and_ws()
+    global_engine = get_global_engine()
+    matches = find_matches(
+        engine, global_engine, ws.company, limit=limit,
+    )
+    return DiscoveryMatchesResult(
+        matches=[
+            DiscoveryMatch(**{
+                "global_id": m.global_id,
+                "firm": m.firm,
+                "partner": m.partner,
+                "email": m.email,
+                "stages": m.stages,
+                "sectors": m.sectors,
+                "geographies": m.geographies,
+                "enriched_fields": m.enriched_fields,
+                "fit_score": m.fit_score,
+                "fit_reasons": m.fit_reasons,
+            })
+            for m in matches
+        ],
+        count=len(matches),
+    )
+
+
+@app.post(
+    "/discovery/claim",
+    response_model=DiscoveryClaimResult,
+    summary="Copy an investors_global row into your private list",
+    tags=["discovery"],
+)
+def discovery_claim(
+    body: DiscoveryClaimBody,
+    _principal: dict | None = Depends(current_principal),
+    _auth: None = Depends(require_auth),
+) -> DiscoveryClaimResult:
+    """Idempotent claim: copy the named global investor into the
+    tenant's `funds` + `partners` tables, stamping
+    `partners.claimed_from_global_id` for audit traceability.
+
+    Re-claiming an already-claimed row is a no-op + still
+    returns the same fund_id / partner_id so the frontend can
+    deep-link without checking `created_*` flags first."""
+    from core.discovery import ClaimError, claim_investor
+    from core.investors_global import get_global_engine
+
+    engine, _ = _engine_and_ws()
+    global_engine = get_global_engine()
+    try:
+        result = claim_investor(
+            engine, global_engine, body.global_id,
+        )
+    except ClaimError as exc:
+        raise HTTPException(
+            404,
+            detail={
+                "error": str(exc),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    return DiscoveryClaimResult(
+        ok=True,
+        fund_id=result.fund_id,
+        partner_id=result.partner_id,
+        global_id=result.global_id,
+        created_fund=result.created_fund,
+        created_partner=result.created_partner,
+        stdout=(
+            f"[discovery] claimed global_id={result.global_id} -> "
+            f"fund_id={result.fund_id} partner_id={result.partner_id} "
+            f"(fund created: {result.created_fund}, "
+            f"partner created: {result.created_partner})"
+        ),
+    )
 
