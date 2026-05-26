@@ -31,8 +31,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from core.db import (
-    draft_snoozes, email_drafts, partner_pipeline, partners, upsert,
+    draft_snoozes, email_drafts, funds, partner_pipeline, partners,
+    upsert,
 )
+from core.ids import fund_id_for, partner_id_for
 from web.deps import _engine_and_ws, require_auth
 
 
@@ -261,4 +263,211 @@ def snooze_draft_alias(
         snoozed_until=snoozed_until.isoformat(),
         reason=body.reason,
         created_at=now.isoformat(),
+    )
+
+
+# ---------- FR-1b: POST /investors/capture (QR-flow seed) ----------
+
+_VALID_CAPTURE_CHANNELS = {"email", "linkedin", "both"}
+_VALID_CAPTURE_SOURCES = {"qr", "manual", "import"}
+
+
+class InvestorCaptureBody(BaseModel):
+    """Frontend's `POST /investors/capture` body. Matches the
+    QR-scan flow + the "manual add" flow at the same endpoint."""
+    linkedin_url: str = Field(
+        description=(
+            "Canonical LinkedIn profile URL. De-duped per workspace; "
+            "re-capturing returns the existing row with "
+            "status='already_in_pipeline'."
+        ),
+    )
+    partner_name: str = Field(min_length=1)
+    firm: str = Field(
+        min_length=1,
+        description=(
+            "Firm/fund name. We slug it to firm-slug.unclaimed if "
+            "we don't already know the real domain; operators can "
+            "fix the domain on the fund row later."
+        ),
+    )
+    channel: str = Field(
+        default="email",
+        description="email | linkedin | both",
+    )
+    cadence_key: str | None = Field(
+        default=None,
+        description=(
+            "warm | cold | NULL. Ignored in FR-1b -- the sequence "
+            "seed lands in FR-3; we store the choice for then."
+        ),
+    )
+    note: str | None = None
+    source: str = Field(
+        default="qr",
+        description="qr | manual | import",
+    )
+
+
+class InvestorCaptureResult(BaseModel):
+    """One investor row + a status the frontend renders."""
+    status: str  # 'created' | 'already_in_pipeline'
+    partner_id: str
+    fund_id: str
+    name: str
+    firm: str
+    linkedin_url: str | None = None
+    channel_pref: str | None = None
+    source: str | None = None
+    note: str | None = None
+
+
+def _slug_unclaimed_domain(firm: str) -> str:
+    """firm -> firm-slug.unclaimed. Same logic as core.discovery's
+    fallback used by /discovery/claim."""
+    cleaned = "".join(
+        ch if ch.isalnum() else "-"
+        for ch in (firm or "").strip().lower()
+    ).strip("-")
+    return f"{cleaned}.unclaimed" if cleaned else ""
+
+
+@router.post(
+    "/investors/capture",
+    response_model=InvestorCaptureResult,
+    summary=(
+        "Create a partner row from a QR-scanned LinkedIn profile "
+        "(or manual entry). Idempotent on linkedin_url within the "
+        "workspace."
+    ),
+)
+def capture_investor(
+    body: InvestorCaptureBody,
+    _auth: None = Depends(require_auth),
+) -> InvestorCaptureResult:
+    """FR-1 §6. Frontend uses this from the QR scanner + the
+    manual-add form. Dedup contract:
+
+      - linkedin_url already on a partner row in this workspace
+        -> return that row with status='already_in_pipeline',
+        DO NOT overwrite any of its fields.
+      - otherwise -> create a new partner + (if needed) a new
+        provisional `funds` row at `{firm-slug}.unclaimed`. Same
+        DNC + is_provisional treatment as /discovery/claim for
+        pseudo-domain rows so cold outreach can't accidentally
+        ship before the operator fills in a real fund domain.
+
+    Sequence seed (FR-1 §6: "newly-seeded sequence enqueued on the
+    chosen cadence_key") is deferred to FR-3 when the sequences
+    table lands; the cadence_key on the body is accepted now so the
+    frontend doesn't have to change shape later.
+    """
+    channel = (body.channel or "email").strip().lower()
+    if channel not in _VALID_CAPTURE_CHANNELS:
+        raise HTTPException(
+            422,
+            f"channel must be one of {sorted(_VALID_CAPTURE_CHANNELS)}; "
+            f"got {body.channel!r}",
+        )
+    source = (body.source or "qr").strip().lower()
+    if source not in _VALID_CAPTURE_SOURCES:
+        raise HTTPException(
+            422,
+            f"source must be one of {sorted(_VALID_CAPTURE_SOURCES)}; "
+            f"got {body.source!r}",
+        )
+
+    linkedin_url = (body.linkedin_url or "").strip()
+    if not linkedin_url:
+        raise HTTPException(422, "linkedin_url is empty")
+    partner_name = body.partner_name.strip()
+    firm = body.firm.strip()
+
+    engine, _ = _engine_and_ws()
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    with engine.begin() as conn:
+        # 1) Dedup on linkedin_url.
+        existing_partner = conn.execute(
+            select(partners.c.partner_id, partners.c.fund_id,
+                   partners.c.name, partners.c.linkedin_url,
+                   partners.c.channel_pref, partners.c.source)
+            .where(partners.c.linkedin_url == linkedin_url)
+        ).first()
+        if existing_partner is not None:
+            # Look up the firm name from the funds row.
+            fund_name_row = conn.execute(
+                select(funds.c.name).where(
+                    funds.c.fund_id == existing_partner.fund_id,
+                )
+            ).first()
+            return InvestorCaptureResult(
+                status="already_in_pipeline",
+                partner_id=existing_partner.partner_id,
+                fund_id=existing_partner.fund_id,
+                name=existing_partner.name,
+                firm=fund_name_row.name if fund_name_row else "",
+                linkedin_url=existing_partner.linkedin_url,
+                channel_pref=existing_partner.channel_pref,
+                source=existing_partner.source,
+            )
+
+        # 2) Create the fund row (provisional, pseudo-domain).
+        # Operator-edited firms with real domains can come later.
+        pseudo_domain = _slug_unclaimed_domain(firm)
+        if not pseudo_domain:
+            raise HTTPException(
+                422, f"could not derive a domain from firm={firm!r}",
+            )
+        fund_id = fund_id_for(pseudo_domain)
+        partner_id = partner_id_for(pseudo_domain, partner_name)
+
+        existing_fund = conn.execute(
+            select(funds.c.fund_id).where(
+                funds.c.fund_id == fund_id,
+            )
+        ).first()
+        if existing_fund is None:
+            conn.execute(funds.insert().values(
+                fund_id=fund_id,
+                name=firm,
+                domain=pseudo_domain,
+                is_active=True,
+                is_provisional=True,
+                last_updated=now,
+            ))
+
+        # 3) Create the partner row. Mark do_not_contact since the
+        # firm domain is a slug; operator must fix it before
+        # outreach. Same treatment as discovery_claim_pseudo_domain.
+        conn.execute(partners.insert().values(
+            partner_id=partner_id,
+            fund_id=fund_id,
+            name=partner_name,
+            linkedin_url=linkedin_url,
+            channel_pref=channel,
+            source=source,
+            is_provisional=True,
+            do_not_contact=True,
+            do_not_contact_reason=(
+                "captured without a real fund domain "
+                f"({pseudo_domain}); edit the fund's domain "
+                "before contacting"
+            ),
+            do_not_contact_source="capture_pseudo_domain",
+            do_not_contact_set_at=now,
+            bio=body.note,  # operator's QR-time note lands as bio
+            last_updated=now,
+        ))
+
+    return InvestorCaptureResult(
+        status="created",
+        partner_id=partner_id,
+        fund_id=fund_id,
+        name=partner_name,
+        firm=firm,
+        linkedin_url=linkedin_url,
+        channel_pref=channel,
+        source=source,
+        note=body.note,
     )
