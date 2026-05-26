@@ -35,7 +35,9 @@ import subprocess
 import sys
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
+from fastapi import (
+    Depends, FastAPI, File, HTTPException, Header, Query, Request, UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -1061,6 +1063,208 @@ def pipeline_generate(_auth: None = Depends(require_auth)) -> CommandResult:
         "--top", "10",
         *_allow_example_domains_args(),
         label="generate_emails",
+    )
+
+
+# ---------- onboarding step 3: investor sources upload ----------
+
+class SourcesUploadResult(BaseModel):
+    """Response from POST /pipeline/sources. The frontend renders
+    `row_count` as 'Loaded N investors' confirmation; `stdout` is
+    optional diagnostic text the wizard can fold-out behind a 'show
+    details' affordance."""
+    ok: bool
+    row_count: int
+    stdout: str = ""
+
+
+# Cap on the multipart upload. Operator-uploaded investor lists are
+# typically a few hundred KB; 25 MB is the safety valve for the case
+# where someone tries to upload an Excel export they accidentally
+# saved as CSV with embedded BLOBs.
+_MAX_SOURCES_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _sanitize_sources_filename(name: str) -> str:
+    """Reduce a user-supplied filename to ASCII-alnum + .csv. Defends
+    against path-traversal (../) and Windows / Unix reserved chars
+    landing in `data/raw/`. Always ends in `.csv` so Stage 1's CSV
+    parser picks it up; falls back to a stable default when the
+    incoming name has no usable characters."""
+    base = pathlib.Path(name or "").name  # strip any directory parts
+    stem = "".join(
+        ch for ch in pathlib.Path(base).stem
+        if ch.isalnum() or ch in ("_", "-")
+    )
+    if not stem:
+        stem = "operator_sources"
+    return f"{stem}.csv"
+
+
+def _count_csv_rows(content: bytes) -> int:
+    """Count data rows (header excluded). Used both to validate the
+    CSV parses + to populate `row_count` in the response."""
+    import csv  # noqa: PLC0415 - stdlib, hot only when this endpoint fires
+    import io
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if len(rows) <= 1:
+        # An empty file or a file with only a header has zero data
+        # rows. The endpoint refuses upstream because Stage 1 can't
+        # do anything with it, but counting is still well-defined.
+        return 0
+    return len(rows) - 1
+
+
+def _link_sources_yaml(yaml_path: pathlib.Path, csv_relative: str,
+                       display_name: str) -> None:
+    """Prepend an entry to `public_lists` in sources.yaml pointing at
+    the uploaded CSV.
+
+    Prepend (not append) so the operator's upload is the first source
+    Stage 1 processes -- ahead of fixture seeds. PyYAML drops
+    comments; that's acceptable since sources.yaml is rarely
+    hand-edited once the wizard is wired up.
+    """
+    import yaml  # noqa: PLC0415
+
+    data: dict = {}
+    if yaml_path.exists():
+        text = yaml_path.read_text(encoding="utf-8")
+        if text.strip():
+            data = yaml.safe_load(text) or {}
+    public_lists = data.get("public_lists") or []
+    # De-dupe: if a list with the same path is already there, leave it
+    # alone (the operator might be re-uploading; idempotent is the
+    # right behavior).
+    if not any(
+        isinstance(item, dict) and item.get("path") == csv_relative
+        for item in public_lists
+    ):
+        public_lists.insert(0, {
+            "name": f"Operator upload ({display_name})",
+            "path": csv_relative,
+            "parser": "csv",
+        })
+        data["public_lists"] = public_lists
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+@app.post(
+    "/pipeline/sources",
+    response_model=SourcesUploadResult,
+    summary="Upload an investor-sources CSV; wires it into Stage 1",
+    tags=["onboarding"],
+)
+async def upload_pipeline_sources(
+    file: UploadFile = File(
+        ..., description="CSV of investor sources (25 MB max)",
+    ),
+    _auth: None = Depends(require_auth),
+) -> SourcesUploadResult:
+    """Accept the operator's investor-sources CSV, persist it under
+    `clients/<ws>/data/raw/`, and prepend an entry to
+    `config/sources.yaml` so the next Stage 1 run picks it up.
+
+    Non-destructive in the sense that running this endpoint doesn't
+    invoke any pipeline stage -- the wizard's next step is what kicks
+    off Stage 1. Idempotent on filename: re-uploading the same name
+    overwrites the file and leaves sources.yaml unchanged.
+    """
+    name = file.filename or ""
+    if not name.lower().endswith(".csv"):
+        raise HTTPException(
+            400,
+            detail={
+                "error": (
+                    f"sources upload must be a .csv file; got {name!r}"
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    content = await file.read()
+    if not content:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "empty file upload",
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    if len(content) > _MAX_SOURCES_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            detail={
+                "error": (
+                    f"sources upload is "
+                    f"{len(content) // (1024 * 1024)} MB; limit is "
+                    f"{_MAX_SOURCES_UPLOAD_BYTES // (1024 * 1024)} MB"
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+
+    try:
+        row_count = _count_csv_rows(content)
+    except Exception as exc:  # noqa: BLE001 - csv parse failure
+        raise HTTPException(
+            400,
+            detail={
+                "error": f"could not parse CSV: {exc}",
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+    if row_count <= 0:
+        raise HTTPException(
+            400,
+            detail={
+                "error": (
+                    "CSV has no data rows (header-only or empty). "
+                    "Re-export with at least one investor row."
+                ),
+                "stdout": "", "stderr": "", "returncode": 1,
+            },
+        )
+
+    safe_name = _sanitize_sources_filename(name)
+    _, ws = _engine_and_ws()
+    raw_dir = ws.path / "data" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    csv_dst = raw_dir / safe_name
+    csv_dst.write_bytes(content)
+
+    csv_relative = f"data/raw/{safe_name}"
+    sources_yaml = ws.config_dir / "sources.yaml"
+    try:
+        _link_sources_yaml(sources_yaml, csv_relative, safe_name)
+    except Exception as exc:  # noqa: BLE001 - YAML failure shouldn't drop the upload
+        # The CSV is on disk; only the sources.yaml link failed. The
+        # operator can hand-edit, but the API should report it rather
+        # than silently swallow.
+        raise HTTPException(
+            500,
+            detail={
+                "error": f"sources.yaml update failed: {exc}",
+                "stdout": (
+                    f"CSV saved at {csv_relative} but sources.yaml "
+                    f"was not updated; edit it manually to point at "
+                    f"the upload."
+                ),
+                "stderr": str(exc), "returncode": 1,
+            },
+        )
+
+    stdout = (
+        f"[sources] uploaded {safe_name} ({row_count} rows) -> "
+        f"{csv_relative}; sources.yaml updated."
+    )
+    return SourcesUploadResult(
+        ok=True, row_count=row_count, stdout=stdout,
     )
 
 

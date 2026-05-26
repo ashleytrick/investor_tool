@@ -357,6 +357,7 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         "/config/company",
         "/pipeline/score",
         "/pipeline/generate",
+        "/pipeline/sources",
         "/gmail/status",
         "/gmail/connect",
     ):
@@ -785,3 +786,161 @@ def test_config_company_configured_false_when_empty(
     assert res.status_code == 200
     snap = client.get("/config", headers=_auth_headers()).json()
     assert snap["company_configured"] is False
+
+
+# ---------- onboarding: /pipeline/sources upload ----------
+
+_VALID_SOURCES_CSV = (
+    b"name,domain\n"
+    b"Northbeam Capital,northbeam.example\n"
+    b"Tidewater Ventures,tidewater.example\n"
+    b"Pier 9 Partners,pier9.example\n"
+)
+
+
+def test_sources_upload_saves_csv_and_wires_yaml(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """Happy path: upload a CSV, server saves it under data/raw/,
+    prepends an entry to sources.yaml, and returns row_count so the
+    wizard can render 'Loaded N investors'."""
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": (
+            "my_investors.csv", _VALID_SOURCES_CSV, "text/csv",
+        )},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["row_count"] == 3
+    assert "uploaded" in body["stdout"].lower()
+
+    # File landed under data/raw/.
+    csv_path = (
+        workspace_with_one_pending_draft / "data" / "raw"
+        / "my_investors.csv"
+    )
+    assert csv_path.exists()
+    assert csv_path.read_bytes() == _VALID_SOURCES_CSV
+
+    # sources.yaml now has the upload prepended.
+    sources_yaml = (
+        workspace_with_one_pending_draft / "config" / "sources.yaml"
+    )
+    import yaml
+    data = yaml.safe_load(sources_yaml.read_text(encoding="utf-8"))
+    first = data["public_lists"][0]
+    assert first["path"] == "data/raw/my_investors.csv"
+    assert first["parser"] == "csv"
+    assert "my_investors" in first["name"]
+
+
+def test_sources_upload_is_idempotent_on_same_filename(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """Re-uploading the same filename must overwrite the CSV but NOT
+    create a duplicate entry in sources.yaml. The operator who
+    re-uploads (e.g. corrected typo) shouldn't end up with two
+    parallel sources of truth."""
+    files = {"file": (
+        "investors.csv", _VALID_SOURCES_CSV, "text/csv",
+    )}
+    client.post(
+        "/pipeline/sources", headers=_auth_headers(), files=files,
+    )
+    # Second upload with the same name + a different body.
+    updated = (
+        b"name,domain\n"
+        b"Only One Fund,only.example\n"
+    )
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": ("investors.csv", updated, "text/csv")},
+    )
+    assert res.status_code == 200
+    assert res.json()["row_count"] == 1
+
+    import yaml
+    sources_yaml = (
+        workspace_with_one_pending_draft / "config" / "sources.yaml"
+    )
+    data = yaml.safe_load(sources_yaml.read_text(encoding="utf-8"))
+    # Only one entry pointing at this CSV.
+    hits = [
+        item for item in data["public_lists"]
+        if item.get("path") == "data/raw/investors.csv"
+    ]
+    assert len(hits) == 1
+
+
+def test_sources_upload_rejects_non_csv_extension(
+    client: TestClient,
+) -> None:
+    """A .xlsx or .json upload returns 400 -- Stage 1 only reads CSV
+    and silently saving a different format would leave the
+    operator wondering why no funds showed up."""
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": ("investors.xlsx", b"PK\x03\x04binary", "application/octet-stream")},
+    )
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert ".csv" in detail["error"].lower()
+
+
+def test_sources_upload_rejects_empty_file(client: TestClient) -> None:
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": ("empty.csv", b"", "text/csv")},
+    )
+    assert res.status_code == 400
+
+
+def test_sources_upload_rejects_header_only_csv(client: TestClient) -> None:
+    """A header-only file has zero rows -- Stage 1 would happily run
+    but ingest nothing. Refuse upstream so the operator gets a clear
+    error rather than wondering why their fund universe is empty."""
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": ("header_only.csv", b"name,domain\n", "text/csv")},
+    )
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert "no data rows" in detail["error"].lower()
+
+
+def test_sources_upload_sanitizes_filename(
+    client: TestClient, workspace_with_one_pending_draft: Path,
+) -> None:
+    """A filename with path-traversal characters must NOT land
+    outside data/raw/. Sanitization keeps the upload inside the
+    workspace boundary."""
+    res = client.post(
+        "/pipeline/sources",
+        headers=_auth_headers(),
+        files={"file": (
+            "../../etc/passwd.csv", _VALID_SOURCES_CSV, "text/csv",
+        )},
+    )
+    assert res.status_code == 200, res.text
+    # Sanitized to a flat alnum stem inside data/raw/.
+    raw_dir = workspace_with_one_pending_draft / "data" / "raw"
+    csv_files = list(raw_dir.glob("*.csv"))
+    assert len(csv_files) >= 1
+    # No file landed outside data/raw/.
+    outside = workspace_with_one_pending_draft.parent / "etc"
+    assert not outside.exists()
+
+
+def test_sources_upload_requires_auth(client: TestClient) -> None:
+    res = client.post(
+        "/pipeline/sources",
+        files={"file": ("x.csv", _VALID_SOURCES_CSV, "text/csv")},
+    )
+    assert res.status_code == 401
