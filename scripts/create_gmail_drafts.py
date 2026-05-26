@@ -238,13 +238,6 @@ def main() -> int:
                 # was written against the old (partner-row, draft-row)
                 # pair.
                 row = partner
-                if rec.pushed_to_gmail_at and not args.regenerate:
-                    run.skip()
-                    print(
-                        f"[gmail_drafts] skip {row.partner_id}: already pushed "
-                        f"at {rec.pushed_to_gmail_at}. Use --regenerate to force."
-                    )
-                    continue
                 # Refuse to push an empty draft. The schema permits NULL on body
                 # / subject (no NOT NULL on email_drafts) and Gmail's API would
                 # reject the request with a cryptic "Invalid request" -- catch
