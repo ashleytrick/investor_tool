@@ -60,7 +60,7 @@ from typing import Any, Iterator, Optional
 
 from sqlalchemy.engine import Engine
 
-from core.backups import backup_before_stage
+from core.backups import backup_before_stage, pre_migration_backup
 from core.banner import print_banner
 from core.config_loader import Workspace, load_workspace
 from core.db import get_engine
@@ -159,12 +159,10 @@ def stage_run(
     """
     ws = load_workspace(getattr(args, "workspace", None))
     print_banner(ws, stage=stage)
-    engine = get_engine(ws.db_url)
-    # Slice 4: workspace run-lock. Refuse to start a stage when
-    # another stage is already running against the same workspace --
-    # prevents SQLite races + corrupted exports. Read-only / status
-    # callers skip via skip_preflight (those use `Workspace` without
-    # opening RunLogger / writing).
+    # Slice 4 + post-PR-28 migration-safety review: acquire the
+    # workspace lock BEFORE get_engine() so two stages can't race
+    # against the same SQLite ALTER TABLE / migration backfill.
+    # Read-only callers skip via skip_preflight.
     if not skip_preflight:
         try:
             _lock_cm = workspace_lock(ws.path, stage=stage)
@@ -176,46 +174,57 @@ def stage_run(
             raise SystemExit(int(StageResult.OPERATIONAL_FAILURE))
     else:
         _lock_cm = None
-    # Slice 5: pre-stage SQLite backup for destructive stages. The
-    # whitelist lives in core.backups.stages_needing_backup; a
-    # backup failure prints a WARN and continues (backups are
-    # insurance, never a blocker).
-    if not skip_preflight:
-        backup_before_stage(
-            ws.path, stage=stage, db_path=ws.db_path,
-        )
-    # Launch-blocker fix: preflight runs INSIDE the RunLogger context
-    # so a missing API key / config issue lands as a refusal row in
-    # `runs` (status.py / audit can see it) rather than being a
-    # silent sys.exit(2) before any row was created. The previous
-    # shape ran preflight_or_exit() before RunLogger opened.
-    llm = None
-    if require_llm:
-        # Import lazily so non-LLM stages don't pay the cost.
-        from core.llm.client import LLMClient
-        llm = LLMClient(workspace=ws)
-    # Issue #19: optional --pipeline-batch <id>. When present, validate
-    # against pipeline_batches + thread onto RunLogger so the runs row
-    # stamps pipeline_batch_id. Bad ids refuse before the run row
-    # commits so an orphan run isn't created.
-    pipeline_batch_id = getattr(args, "pipeline_batch", None)
-    if pipeline_batch_id:
-        from core.batch_ids import batch_exists
-        with engine.begin() as _conn:
-            if not batch_exists(_conn, pipeline_batch_id):
-                print(
-                    f"[{stage}] REFUSED: --pipeline-batch "
-                    f"{pipeline_batch_id!r} not found in pipeline_batches. "
-                    f"Mint one via scripts/new_pipeline_batch.py before "
-                    f"passing it."
-                )
-                if _lock_cm is not None:
-                    try:
-                        _lock_cm.__exit__(None, None, None)
-                    except Exception:  # noqa: BLE001
-                        pass
-                raise SystemExit(int(StageResult.USAGE_ERROR))
+    # Everything past this point runs INSIDE the lock and must release
+    # it on any exit path. pre_migration_backup() + get_engine() +
+    # batch-id validation can raise (disk full, bad migration, missing
+    # batch); a bare exception leaks the lock for the rest of this
+    # Python process. The single try/finally below releases the lock
+    # whether SystemExit, KeyboardInterrupt, or a normal exception
+    # propagates.
     try:
+        # Snapshot the DB BEFORE get_engine() can run migrations
+        # against a real workspace. Fresh workspaces -> no-op.
+        # Upgraded workspaces -> tagged pre_migration restore point.
+        # Inside the lock so we don't race a concurrent writer.
+        if not skip_preflight:
+            pre_migration_backup(ws.path, db_path=ws.db_path)
+        engine = get_engine(ws.db_url)
+        # Slice 5: pre-stage SQLite backup for destructive stages.
+        # The whitelist lives in core.backups.stages_needing_backup;
+        # a backup failure prints a WARN and continues (backups are
+        # insurance, never a blocker).
+        if not skip_preflight:
+            backup_before_stage(
+                ws.path, stage=stage, db_path=ws.db_path,
+            )
+        # Launch-blocker fix: preflight runs INSIDE the RunLogger
+        # context so a missing API key / config issue lands as a
+        # refusal row in `runs` (status.py / audit can see it)
+        # rather than being a silent sys.exit(2) before any row was
+        # created. The previous shape ran preflight_or_exit() before
+        # RunLogger opened.
+        llm = None
+        if require_llm:
+            # Import lazily so non-LLM stages don't pay the cost.
+            from core.llm.client import LLMClient
+            llm = LLMClient(workspace=ws)
+        # Issue #19: optional --pipeline-batch <id>. When present,
+        # validate against pipeline_batches + thread onto RunLogger
+        # so the runs row stamps pipeline_batch_id. Bad ids refuse
+        # before the run row commits so an orphan run isn't created.
+        pipeline_batch_id = getattr(args, "pipeline_batch", None)
+        if pipeline_batch_id:
+            from core.batch_ids import batch_exists
+            with engine.begin() as _conn:
+                if not batch_exists(_conn, pipeline_batch_id):
+                    print(
+                        f"[{stage}] REFUSED: --pipeline-batch "
+                        f"{pipeline_batch_id!r} not found in "
+                        f"pipeline_batches. Mint one via "
+                        f"scripts/new_pipeline_batch.py before "
+                        f"passing it."
+                    )
+                    raise SystemExit(int(StageResult.USAGE_ERROR))
         with RunLogger(
             engine, ws.name, stage,
             pipeline_batch_id=pipeline_batch_id,
