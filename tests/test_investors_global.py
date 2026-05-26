@@ -241,6 +241,12 @@ def test_pipeline_sources_seeds_global_pool(
 
     from fastapi.testclient import TestClient
     client = TestClient(api_mod.app)
+    # Review item #11: opt in first -- default is now off.
+    client.post(
+        "/settings/discovery-opt-in",
+        json={"opted_in": True},
+        headers={"Authorization": "Bearer test-api-key"},
+    )
     res = client.post(
         "/pipeline/sources",
         headers={"Authorization": "Bearer test-api-key"},
@@ -320,6 +326,13 @@ def test_pipeline_sources_tenant_upload_succeeds_even_if_pool_fails(
 
     from fastapi.testclient import TestClient
     client = TestClient(api_mod.app)
+    # Review item #11: opt in so the sync path actually runs and
+    # we can observe its sabotage being caught.
+    client.post(
+        "/settings/discovery-opt-in",
+        json={"opted_in": True},
+        headers={"Authorization": "Bearer test-api-key"},
+    )
     res = client.post(
         "/pipeline/sources",
         headers={"Authorization": "Bearer test-api-key"},

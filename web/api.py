@@ -349,6 +349,38 @@ def _write_send_pace(conn: Any, value: int) -> int:
     return clamped
 
 
+# Review item #11: per-tenant opt-in for the shared discovery pool.
+# Default off -- uploads stay private until the operator explicitly
+# opts in (frontend prompts during onboarding). The global
+# INVESTORS_GLOBAL_DISABLED env var stays as the kill-switch for
+# the operator / CI; per-tenant override layers on top.
+_DISCOVERY_OPT_IN_KEY = "investors_global_opted_in"
+
+
+def _read_discovery_opt_in(conn: Any) -> bool:
+    row = conn.execute(
+        select(workspace_settings.c.value)
+        .where(workspace_settings.c.key == _DISCOVERY_OPT_IN_KEY)
+    ).first()
+    if not row or not row.value:
+        return False
+    return str(row.value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _write_discovery_opt_in(conn: Any, opted_in: bool) -> bool:
+    import datetime as _dt
+    from core.db import upsert as _upsert
+    _upsert(
+        conn, workspace_settings, ["key"],
+        {
+            "key": _DISCOVERY_OPT_IN_KEY,
+            "value": "true" if opted_in else "false",
+            "updated_at": _dt.datetime.now(_dt.timezone.utc),
+        },
+    )
+    return opted_in
+
+
 # ---------- app ----------
 
 app = FastAPI(
@@ -827,6 +859,58 @@ def set_send_pace(
     engine, _ = _engine_and_ws()
     with engine.begin() as conn:
         return SendPaceView(value=_write_send_pace(conn, body.value))
+
+
+# ---------- Review #11: discovery-pool opt-in ----------
+
+class DiscoveryOptInView(BaseModel):
+    """Per-tenant opt-in for the shared `investors_global` discovery
+    pool. Default False -- uploads stay private until the operator
+    explicitly opts in via the frontend (typically during
+    onboarding). The operator-level kill switch
+    `INVESTORS_GLOBAL_DISABLED=true` env var overrides this even
+    when a tenant has opted in (use that for CI / incidents)."""
+    opted_in: bool
+
+
+class DiscoveryOptInBody(BaseModel):
+    opted_in: bool
+
+
+@app.get(
+    "/settings/discovery-opt-in",
+    response_model=DiscoveryOptInView,
+    summary="Read the tenant's discovery-pool opt-in flag",
+    tags=["onboarding"],
+)
+def get_discovery_opt_in(
+    _auth: None = Depends(require_auth),
+) -> DiscoveryOptInView:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        return DiscoveryOptInView(
+            opted_in=_read_discovery_opt_in(conn),
+        )
+
+
+@app.post(
+    "/settings/discovery-opt-in",
+    response_model=DiscoveryOptInView,
+    summary=(
+        "Set the tenant's discovery-pool opt-in flag (frontend "
+        "prompts during onboarding)"
+    ),
+    tags=["onboarding"],
+)
+def set_discovery_opt_in(
+    body: DiscoveryOptInBody,
+    _auth: None = Depends(require_auth),
+) -> DiscoveryOptInView:
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        return DiscoveryOptInView(
+            opted_in=_write_discovery_opt_in(conn, body.opted_in),
+        )
 
 
 # ---------- B4: pipeline + snoozes ----------
@@ -2681,8 +2765,16 @@ async def upload_pipeline_sources(
     # sync is best-effort -- a global-pool failure must not block
     # the tenant's CSV landing.
     global_synced = 0
+    # Review item #11: per-tenant opt-in check. Skips the sync
+    # silently when the tenant hasn't opted in -- the global
+    # INVESTORS_GLOBAL_DISABLED env var still acts as the
+    # operator-level kill switch beneath it.
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        opted_in = _read_discovery_opt_in(conn)
     try:
-        global_synced = _sync_uploaded_csv_to_global_pool(content)
+        if opted_in:
+            global_synced = _sync_uploaded_csv_to_global_pool(content)
     except Exception as exc:  # noqa: BLE001 - never block the tenant write
         # Surface in stdout so the operator can audit; don't 5xx
         # the request -- the tenant's CSV is already on disk and
@@ -2695,7 +2787,10 @@ async def upload_pipeline_sources(
         # Skip the note entirely on a zero-row sync so the operator
         # can tell "the discovery pool is disabled" / "header-only
         # CSV had nothing to sync" from "synced N rows" without
-        # parsing the count.
+        # parsing the count. When the tenant opted out, we leave
+        # the note blank too -- they get a privacy-by-default
+        # silence rather than a "0 rows synced" reveal that the
+        # pool exists.
         global_sync_note = (
             f"; synced {global_synced} row(s) into the shared "
             f"discovery pool"
