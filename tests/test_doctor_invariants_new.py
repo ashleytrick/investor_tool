@@ -83,7 +83,18 @@ def test_doctor_flags_superseded_row_still_recommended():
         _run_pipeline_through_stage_6(ws_dst)
         ws = str(ws_dst)
         _stage7(ws)
-        # Re-run to actually supersede some rows.
+        # Re-run to actually supersede some rows. Stage 7's
+        # identical-hash no-op (PR A fix) would otherwise short-
+        # circuit the supersede pass since the stub LLM is
+        # deterministic; flip prior recommended rows' draft_hash to
+        # force the real-regeneration path.
+        c = sqlite3.connect(db)
+        c.execute(
+            "update email_drafts set draft_hash='_force_drift_' "
+            "where is_recommended=1 and superseded_at is null"
+        )
+        c.commit()
+        c.close()
         _stage7(ws)
 
         # Drift: re-flag a superseded row as recommended.
