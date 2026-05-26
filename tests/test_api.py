@@ -336,13 +336,22 @@ def test_cors_regex_matches_ephemeral_preview_origin(
 
 def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None:
     """The frontend generates its types from /openapi.json. Refuse a
-    regression that removes a documented endpoint -- the 8 original
-    routes plus the 6 onboarding-wizard routes the Lovable frontend
-    was built against."""
+    regression that removes a documented endpoint.
+
+    Covers every endpoint the Lovable frontend was built against:
+      - the 8 original routes
+      - the 6 onboarding-wizard routes (Lovable spec v1)
+      - the Coach surface (B1 Today / B2 Sent / B3 Replies / B4
+        pipeline + snoozes)
+      - the CRM surface (B5 foundation + B7-9 hooks + bulk import)
+      - the cron-hook surface (Gmail + CRM polling)
+      - the discovery + admin + Phase 6 surfaces
+      - the review-item adds (#8 ingest, #11 opt-in)
+    """
     spec = client.get("/openapi.json").json()
     paths = spec.get("paths", {})
     for required in (
-        # Original surface.
+        # ---- Original surface ----
         "/review/pending",
         "/drafts/approved",
         "/drafts/{draft_id}/approve",
@@ -351,21 +360,133 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         "/check_ready",
         "/runs",
         "/send_queue.csv",
-        # Onboarding wizard surface.
+        # ---- Onboarding wizard surface ----
         "/config",
         "/config/mode",
         "/config/company",
+        "/config/company/extract-from-deck",
         "/pipeline/score",
         "/pipeline/generate",
         "/pipeline/sources",
         "/gmail/status",
         "/gmail/connect",
-        # Build Session 13: per-scope Google OAuth surface.
+        # ---- Per-scope Google OAuth + Phase 6 bootstrap ----
         "/google/status",
+        "/gmail/bootstrap",
+        # ---- Review item #8: Stage 1-5 endpoints ----
+        "/pipeline/ingest",
+        "/pipeline/aggregate",
+        "/pipeline/enrich",
+        "/pipeline/activity",
+        "/pipeline/partner-signals",
+        "/pipeline/verify",
+        # ---- B1: Today flow ----
+        "/today",
+        "/settings/send-pace",
+        # ---- Review item #11: discovery-pool opt-in ----
+        "/settings/discovery-opt-in",
+        # ---- B2 + B3: Sent + Replies tabs ----
+        "/sent",
+        "/replies",
+        "/replies/{event_id}/read",
+        # ---- B4: Pipeline + snoozes (post-route-conflict-fix) ----
+        "/partners/{partner_id}/pipeline",
+        "/snoozes/{draft_id}",
+        # ---- Phase 5: admin endpoints ----
+        "/admin/companies",
+        "/admin/investors",
+        "/admin/tenants",
+        # ---- Phase 4: discovery surface ----
+        "/discovery/matches",
+        "/discovery/claim",
+        # ---- B5 + B9: CRM connection + bulk import ----
+        "/crm/connection",
+        "/crm/connect",
+        "/crm/bulk-import",
+        # ---- Cron-hook surface (Gmail + CRM polling) ----
+        "/api/public/hooks/poll-gmail-sent",
+        "/api/public/hooks/poll-gmail-replies",
+        "/api/public/hooks/reconcile-drafts",
+        "/api/public/hooks/poll-crm-activity",
+        "/api/public/hooks/poll-crm-pipeline",
+        "/api/public/hooks/poll-crm-investors",
+        "/api/public/hooks/poll-crm-relationships",
+        "/api/public/hooks/poll-crm-lists",
+        "/api/public/hooks/poll-crm-deals",
     ):
         assert required in paths, (
             f"OpenAPI spec dropped {required}; "
             f"frontend regen will lose the endpoint"
+        )
+
+
+def test_openapi_today_includes_rationale_on_draft_view(
+    client: TestClient,
+) -> None:
+    """B1 added `rationale` to DraftView. The frontend renders it on
+    every Today/review card, so a regression that removes the field
+    silently breaks the UI."""
+    spec = client.get("/openapi.json").json()
+    schemas = spec.get("components", {}).get("schemas", {})
+    draft_view = schemas.get("DraftView")
+    assert draft_view is not None, "DraftView schema missing"
+    props = draft_view.get("properties", {})
+    assert "rationale" in props, (
+        "DraftView.rationale (B1) missing -- frontend Today/review "
+        "cards lose the 'why this partner' line"
+    )
+
+
+def test_openapi_sent_and_replies_response_shapes(client: TestClient) -> None:
+    """SentItem (B2) + ReplyItem (B3) are the contract for the
+    Sent and Replies tabs. Refuse silent removal of required fields."""
+    spec = client.get("/openapi.json").json()
+    schemas = spec.get("components", {}).get("schemas", {})
+    sent_item = schemas.get("SentItem")
+    assert sent_item is not None
+    sent_props = sent_item.get("properties", {})
+    for required in (
+        "event_id", "external_id", "thread_id",
+        "subject", "occurred_at",
+    ):
+        assert required in sent_props, f"SentItem missing {required}"
+
+    reply_item = schemas.get("ReplyItem")
+    assert reply_item is not None
+    reply_props = reply_item.get("properties", {})
+    for required in (
+        "event_id", "classification", "unread",
+        "sender_email", "occurred_at",
+    ):
+        assert required in reply_props, f"ReplyItem missing {required}"
+
+
+def test_openapi_extraction_response_has_extraction_failed_flag(
+    client: TestClient,
+) -> None:
+    """Review #21: ExtractionResponse.extraction_failed must be in
+    the schema so the frontend can render a clear banner without
+    string-parsing the warnings list."""
+    spec = client.get("/openapi.json").json()
+    schemas = spec.get("components", {}).get("schemas", {})
+    extraction = schemas.get("ExtractionResponse")
+    assert extraction is not None
+    assert "extraction_failed" in extraction.get("properties", {})
+
+
+def test_openapi_admin_results_have_skipped_field(client: TestClient) -> None:
+    """Review #22: AdminCompaniesResult / AdminInvestorsResult /
+    AdminTenantsResult all carry a `skipped` array."""
+    spec = client.get("/openapi.json").json()
+    schemas = spec.get("components", {}).get("schemas", {})
+    for name in (
+        "AdminCompaniesResult", "AdminInvestorsResult",
+        "AdminTenantsResult",
+    ):
+        result_schema = schemas.get(name)
+        assert result_schema is not None, f"{name} schema missing"
+        assert "skipped" in result_schema.get("properties", {}), (
+            f"{name}.skipped (review #22) missing"
         )
 
 
