@@ -906,6 +906,220 @@ def get_sent(
     return out
 
 
+# ---------- B3: reply polling + GET /replies + reconcile-drafts ----------
+
+class ReplyItem(BaseModel):
+    """One row on the Coach Replies tab. Matches the frontend's
+    `ReplyItem` shape (best-effort -- adjust if types.ts diverges)."""
+    event_id: int
+    partner_id: str | None = None
+    partner_name: str | None = None
+    partner_email: str | None = None
+    draft_id: int | None = None
+    external_id: str | None = None  # Gmail Message-ID of the reply
+    thread_id: str | None = None
+    subject: str | None = None
+    body_snippet: str | None = None
+    sender_email: str | None = None  # partner sender (B3: same as recipient_email column)
+    occurred_at: str
+    classification: str | None = None  # 'meeting_booked' | 'interested' | 'pass' | 'unclear'
+    unread: bool = False
+
+
+class PollGmailRepliesResult(BaseModel):
+    polled: int
+    total_inserted: int
+    results: list[PollResult]
+
+
+class ReconcileItem(BaseModel):
+    workspace: str
+    unread_replies: int
+    error: str | None = None
+
+
+class ReconcileDraftsResult(BaseModel):
+    polled: int
+    total_unread_replies: int
+    results: list[ReconcileItem]
+
+
+@app.post(
+    "/api/public/hooks/poll-gmail-replies",
+    response_model=PollGmailRepliesResult,
+    summary=(
+        "Cron-triggered poll of every tenant's Gmail Inbox -> "
+        "outreach_events (event_type='replied')"
+    ),
+    tags=["hooks"],
+)
+def hook_poll_gmail_replies(
+    _hook: None = Depends(_hook_secret_required),
+) -> PollGmailRepliesResult:
+    """Same shape as the poll-gmail-sent hook but pulls replies in
+    threads we've sent into. Classification is auto-applied
+    (heuristic for now -- LLM later). Schedule: every 10min per
+    spec (paired with poll-gmail-sent).
+    """
+    from core.config_loader import load_workspace as _load_workspace
+    from core.outreach_events import (
+        poll_gmail_replies_for_workspace as _poll,
+    )
+    from web.routers.admin import _iter_tenant_workspaces
+
+    tenants = _iter_tenant_workspaces()
+    if not tenants:
+        ws_dir = pathlib.Path(_ws_path())
+        if ws_dir.exists():
+            tenants = [ws_dir]
+
+    results: list[PollResult] = []
+    total = 0
+    for ws_dir in tenants:
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            results.append(PollResult(
+                workspace=str(ws_dir),
+                inserted=0,
+                error=f"load_workspace_failed: {exc}",
+            ))
+            continue
+        r = _poll(ws)
+        results.append(PollResult(
+            workspace=r.workspace,
+            inserted=r.inserted,
+            error=r.error,
+        ))
+        total += r.inserted
+
+    return PollGmailRepliesResult(
+        polled=len(results), total_inserted=total, results=results,
+    )
+
+
+@app.post(
+    "/api/public/hooks/reconcile-drafts",
+    response_model=ReconcileDraftsResult,
+    summary=(
+        "Cron-triggered reconciliation pass; currently surfaces "
+        "per-tenant unread-reply counts for monitoring"
+    ),
+    tags=["hooks"],
+)
+def hook_reconcile_drafts(
+    _hook: None = Depends(_hook_secret_required),
+) -> ReconcileDraftsResult:
+    """Schedule: every 30min per spec. Read-only for B3 -- a
+    future PR will define the mutation policy (does an unread
+    reply automatically supersede an approved_to_send draft? Or
+    surface a review task?). Wiring the hook now lets the
+    scheduler attach to a real endpoint.
+    """
+    from core.config_loader import load_workspace as _load_workspace
+    from core.outreach_events import (
+        reconcile_drafts_for_workspace as _reconcile,
+    )
+    from web.routers.admin import _iter_tenant_workspaces
+
+    tenants = _iter_tenant_workspaces()
+    if not tenants:
+        ws_dir = pathlib.Path(_ws_path())
+        if ws_dir.exists():
+            tenants = [ws_dir]
+
+    results: list[ReconcileItem] = []
+    total = 0
+    for ws_dir in tenants:
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            results.append(ReconcileItem(
+                workspace=str(ws_dir),
+                unread_replies=0,
+                error=f"load_workspace_failed: {exc}",
+            ))
+            continue
+        r = _reconcile(ws)
+        results.append(ReconcileItem(
+            workspace=r.workspace,
+            unread_replies=r.unread_replies,
+            error=r.error,
+        ))
+        total += r.unread_replies
+
+    return ReconcileDraftsResult(
+        polled=len(results),
+        total_unread_replies=total,
+        results=results,
+    )
+
+
+@app.get(
+    "/replies",
+    response_model=list[ReplyItem],
+    summary="Recent Gmail reply events for the current tenant",
+    tags=["coach"],
+)
+def get_replies(
+    limit: int = Query(default=100, ge=1, le=500),
+    unread_only: bool = Query(
+        default=False,
+        description="Filter to `unread=true` rows (inbox view)",
+    ),
+    _auth: None = Depends(require_auth),
+) -> list[ReplyItem]:
+    from core.outreach_events import list_reply_events
+    engine, _ = _engine_and_ws()
+    rows = list_reply_events(engine, limit=limit, unread_only=unread_only)
+    out: list[ReplyItem] = []
+    for r in rows:
+        occurred = r["occurred_at"]
+        occurred_iso = (
+            occurred.isoformat()
+            if hasattr(occurred, "isoformat") else str(occurred)
+        )
+        out.append(ReplyItem(
+            event_id=int(r["event_id"]),
+            partner_id=r.get("partner_id"),
+            partner_name=r.get("partner_name"),
+            partner_email=r.get("partner_email"),
+            draft_id=(
+                int(r["draft_id"]) if r.get("draft_id") is not None
+                else None
+            ),
+            external_id=r.get("external_id"),
+            thread_id=r.get("thread_id"),
+            subject=r.get("subject"),
+            body_snippet=r.get("body_snippet"),
+            sender_email=r.get("recipient_email"),
+            occurred_at=occurred_iso,
+            classification=r.get("classification"),
+            unread=bool(r.get("unread", False)),
+        ))
+    return out
+
+
+@app.post(
+    "/replies/{event_id}/read",
+    response_model=CommandResult,
+    summary="Mark a reply event as read",
+    tags=["coach"],
+)
+def mark_reply_as_read(
+    event_id: int,
+    _auth: None = Depends(require_auth),
+) -> CommandResult:
+    from core.outreach_events import mark_reply_read
+    engine, _ = _engine_and_ws()
+    updated = mark_reply_read(engine, event_id=event_id)
+    if not updated:
+        raise HTTPException(
+            404, "no unread reply with that event_id in this workspace",
+        )
+    return CommandResult(ok=True, stdout="marked read")
+
+
 # ---------- B5: CRM foundation (connect / disconnect / status) ----------
 
 _SUPPORTED_CRM_PROVIDERS = {"attio", "salesforce", "hubspot"}
