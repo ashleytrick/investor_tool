@@ -1220,6 +1220,62 @@ cadence_touches = Table(
 )
 
 
+# FR-3: one row per partner with an in-flight outreach sequence.
+# state values: 'active' | 'stopped' | 'completed'.
+# stopped_reason: 'reply' | 'pipeline' | 'manual' | 'max_touches'
+#                 | 'fund_news' | 'user' | NULL when state != 'stopped'.
+# current_touch starts at 1 (the initial outreach in email_drafts).
+# next_touch_due_at is when the follow-up should land in Today.
+sequences = Table(
+    "sequences", metadata,
+    Column("sequence_id", Text, primary_key=True),  # hex(secrets.token_hex(8))
+    # CASCADE: dropping the partner drops its sequence.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("thread_id", Text),  # Gmail thread for this sequence
+    Column("state", Text, nullable=False, default="active"),
+    Column("stopped_reason", Text),
+    Column("current_touch", Integer, nullable=False, default=1),
+    Column("next_touch_due_at", DateTime),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+    Index("ux_sequences_partner_id", "partner_id", unique=True),
+    Index("ix_sequences_next_due", "next_touch_due_at"),
+    Index("ix_sequences_state", "state"),
+)
+
+
+# FR-3: every drafted / sent follow-up (touch 2+). touch 1 lives
+# in email_drafts; follow-ups are kept in their own table so the
+# Stage 7 supersede + approval state machine doesn't have to
+# learn the sequence concept.
+# status values: 'draft' | 'approved' | 'sent' | 'skipped' | 'killed'
+follow_up_drafts = Table(
+    "follow_up_drafts", metadata,
+    Column("follow_up_id", Integer, primary_key=True, autoincrement=True),
+    # CASCADE: dropping the sequence drops its follow-up rows.
+    Column(
+        "sequence_id", Text,
+        ForeignKey("sequences.sequence_id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("touch_number", Integer, nullable=False),  # 2..N
+    Column("angle", Text, nullable=False),
+    Column("why_now", Text),  # the trigger that justified this touch
+    Column("variant_index", Integer, nullable=False, default=0),
+    Column("subject", Text),  # empty = reuse thread subject
+    Column("body", Text, nullable=False),
+    Column("status", Text, nullable=False, default="draft"),
+    Column("created_at", DateTime, nullable=False),
+    Column("sent_at", DateTime),
+    Index("ix_follow_up_drafts_sequence", "sequence_id"),
+    Index("ix_follow_up_drafts_status", "status"),
+)
+
+
 def _enable_sqlite_foreign_keys(dbapi_conn, _conn_record) -> None:
     """SQLite ships with FK checking OFF by default per connection. Without
     this listener, ForeignKey + ondelete=CASCADE declared on the Tables above
