@@ -74,21 +74,25 @@ Useful routes:
 | Route | Purpose |
 |---|---|
 | `GET /openapi.json` | Frontend type generation / route discovery |
-| `GET /config` | Onboarding snapshot: mode, Gmail, company-config status |
+| `GET /config` | Onboarding snapshot: mode, Gmail + Drive connection state, company-config status |
 | `GET /config/company` | Read editable company setup profile |
 | `PUT /config/company` | Save reviewed/edited company setup profile |
 | `POST /config/company/extract-from-deck` | Extract a draft profile from a PDF/PPT/PPTX deck upload |
-| `POST /config/mode` | Flip fixture/production mode from the browser |
+| `POST /config/mode` | Flip fixture/dry_run/production mode from the browser |
+| `POST /pipeline/sources` | Upload an investor-sources CSV or XLSX (OpenVC export shape supported); writes under `data/raw/` and wires `sources.yaml` to it |
 | `POST /pipeline/score` | Run Stage 6 from the browser |
 | `POST /pipeline/generate` | Run Stage 7 from the browser |
 | `GET /review/pending` | Drafts waiting for human review |
+| `GET /drafts/approved` | Drafts that passed review and are eligible to send/export |
 | `POST /drafts/{draft_id}/approve` | Approve a draft through the audited CLI path |
 | `POST /drafts/{draft_id}/reject` | Reject a draft |
 | `POST /partners/{partner_id}/email` | Set partner email |
 | `GET /check_ready` | Review/send/Gmail/Attio readiness checks |
+| `GET /runs` | Recent stage/operator run history |
 | `GET /send_queue.csv` | Export approved outreach CSV |
-| `POST /gmail/connect` | Start Gmail OAuth |
-| `GET /gmail/status` | Check Gmail connection state |
+| `POST /gmail/connect` | Start Google OAuth (Gmail + Drive in one consent step) |
+| `GET /gmail/status` | Legacy single-scope Gmail connection check |
+| `GET /google/status` | Per-scope status: `gmail_connected`, `drive_connected`, `google_connected` |
 
 All protected routes require `Authorization: Bearer <API_KEY>`. The OAuth
 callback is intentionally public because Google redirects the browser there with
@@ -234,6 +238,40 @@ Common invalidation triggers include:
 - Stage 7 generates materially different content for a previously approved
   partner.
 
+## Investor-Sources Upload
+
+The wizard's Step 3 lets the founder upload an investor list as the starting
+point of the fund universe. Both shapes are accepted:
+
+- `.csv` with `name`/`domain` columns, or any common third-party shape
+  (`Investor name`/`Website`, `Firm`/`URL`, `Fund name`/`Homepage`, etc.).
+  Headers are aliased case-insensitively; OpenVC's standard CSV export is the
+  primary target.
+- `.xlsx` with the same column shape (typical OpenVC dashboard export).
+  Converted to CSV in-memory via openpyxl; the on-disk persistence is always
+  CSV so Stage 1's parser only needs one code path.
+
+Behavior:
+
+1. Frontend uploads the file via `POST /pipeline/sources` (multipart, field
+   `file`).
+2. Backend validates the file extension and content (rejects empty,
+   header-only, and oversized uploads), normalizes headers to lowercase, and
+   writes `clients/{workspace}/data/raw/<sanitized>.csv`.
+3. The new file is prepended to `sources.yaml`'s `public_lists` so the next
+   Stage 1 run picks it up automatically.
+4. The endpoint returns `{ok, row_count, stdout}` so the wizard can confirm
+   "Loaded N investors".
+
+The upload is idempotent on filename: re-uploading the same name overwrites
+the CSV but does not duplicate the `sources.yaml` entry. Path-traversal
+characters in the filename are stripped so uploads always land inside
+`data/raw/`.
+
+Stage 1 then reads the file with `name` + `domain` extracted via aliases (URL
+hosts are stripped so `https://www.foo.org/...` lands as `foo.org`). Rows
+missing either field are silently skipped.
+
 ## Apollo Email Workflow
 
 Apollo is external enrichment by CSV.
@@ -290,7 +328,14 @@ uv run scripts/check_ready.py --for attio
 
 `--for gmail` is strict: unlinked Gmail or a missing scheduling link is blocked.
 
-## Gmail Drafts and Send Queue
+## Google: Gmail Drafts, Send Queue, and Drive Sync
+
+The same OAuth flow grants two Google scopes in one consent step so the
+wizard's "Connect Google" button covers both surfaces:
+
+- `gmail.compose` for creating draft messages (cannot send).
+- `drive.file` (narrow scope: only files this app creates) for pushing
+  meeting-prep dossiers into the operator's Drive.
 
 Gmail integration creates drafts only. It does not send mail.
 
@@ -308,6 +353,10 @@ uv run scripts/export_send_queue.py --out clients/my_raise/exports/send_queue.cs
 
 Only `approved_to_send` drafts should leave the system. Downstream commands
 re-check approval state as defense in depth.
+
+`GET /google/status` returns per-scope booleans so the wizard can distinguish
+"Gmail granted but Drive needs re-consent" (typical for tokens minted before
+the Drive scope was added) from "fully connected".
 
 ## Attio Sync
 
@@ -367,6 +416,26 @@ The intended dossier structure is:
 
 Cold email should stay short. Dossier depth belongs after the investor replies
 or a meeting is booked.
+
+When a substantive outcome lands (`replied` with a non-pass reply type, or
+`meeting_booked`), `persist_outcome_event` automatically creates a review item
+of kind `investor_dossier_needed`. Run
+
+```bash
+uv run scripts/prep_brief.py --dossier --pending-only
+```
+
+to build dossiers for every open task in one pass and mark them resolved. For a
+single partner, `--partner-id <id> --dossier` works too. The dossier respects
+an eligibility gate (only post-reply partners qualify) unless
+`--force-refresh` is passed.
+
+If the workspace has Drive connected, the dossier markdown is also auto-pushed
+into an `investor_outreach_briefs` folder in the operator's Drive as a native
+Google Doc. Filenames are stable across re-runs against the same verified
+signal set (`{partner_id}__YYYY-MM-DD__investor_dossier__{signal_hash[:8]}`),
+so unchanged evidence does not produce duplicate Drive uploads. `--no-drive-push`
+opts out per-run.
 
 Calibration tools help keep scoring honest:
 
