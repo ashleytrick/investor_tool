@@ -139,6 +139,70 @@ def test_pre_migration_backup_helper_returns_none_for_missing_db(tmp_path: Path)
     assert out is None
 
 
+def test_lock_released_when_get_engine_raises_in_stage_run(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Pre-PR-29 review finding: if get_engine() or
+    pre_migration_backup() raises after the lock is acquired, the
+    lock must still be released. A held lock from a crashed test
+    or a long-lived process leaks until process exit; verify the
+    try/finally covers the setup phase.
+    """
+    import core.stage_runner as sr
+    from core.runlock import workspace_lock
+    from core.stage_runner import stage_run
+    import argparse
+
+    ws_dst = _fresh_ws(tmp_path)
+    # Make get_engine blow up so we exercise the failure path.
+
+    def _boom(*_a, **_kw):  # noqa: ANN001 -- test helper
+        raise RuntimeError("simulated migration failure")
+    monkeypatch.setattr(sr, "get_engine", _boom)
+
+    args = argparse.Namespace(workspace=str(ws_dst))
+    with pytest.raises(RuntimeError, match="simulated migration"):
+        with stage_run(args, stage="boom_test", require_llm=False):
+            pytest.fail("body should not have entered")
+
+    # The lock should be free now -- a brand-new workspace_lock
+    # acquisition must NOT block.
+    try:
+        held = workspace_lock(ws_dst, stage="probe")
+        held.__enter__()
+        held.__exit__(None, None, None)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"lock leaked after get_engine failure: {exc}")
+
+
+def test_lock_released_when_get_engine_raises_in_operator_command(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Same protection for operator_command_run."""
+    import argparse
+    import core.operator_command as oc
+    from core.operator_command import operator_command_run
+    from core.runlock import workspace_lock
+
+    ws_dst = _fresh_ws(tmp_path)
+    monkeypatch.setattr(
+        oc, "get_engine",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            RuntimeError("simulated migration failure"),
+        ),
+    )
+    args = argparse.Namespace(workspace=str(ws_dst))
+    with pytest.raises(RuntimeError, match="simulated migration"):
+        with operator_command_run(args, stage="boom_op"):
+            pytest.fail("body should not have entered")
+    try:
+        held = workspace_lock(ws_dst, stage="probe")
+        held.__enter__()
+        held.__exit__(None, None, None)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"lock leaked after get_engine failure: {exc}")
+
+
 def test_pre_migration_backup_rotates_keeping_latest(tmp_path: Path) -> None:
     """The helper reuses the standard rotation -- only the latest
     BACKUP_KEEP_PER_STAGE pre_migration snapshots survive."""

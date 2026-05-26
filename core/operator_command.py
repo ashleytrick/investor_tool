@@ -107,16 +107,20 @@ def operator_command_run(
         print(f"[{stage}] REFUSED: {exc}")
         raise SystemExit(int(StageResult.OPERATIONAL_FAILURE))
 
-    # Snapshot the DB before get_engine() runs migrations. No-op on
-    # a fresh workspace; gives operator-upgraded workspaces a tagged
-    # pre_migration backup. Must be inside the lock.
-    pre_migration_backup(ws.path, db_path=ws.db_path)
-    engine = get_engine(ws.db_url)
-
-    if not skip_backup:
-        backup_before_stage(ws.path, stage=stage, db_path=ws.db_path)
-
+    # Everything past this point holds the lock. pre_migration_backup
+    # and get_engine can both raise (disk full, bad migration); the
+    # outer try/finally guarantees the lock is released no matter
+    # which exit path we take.
     try:
+        # Snapshot the DB before get_engine() runs migrations. No-op
+        # on a fresh workspace; gives operator-upgraded workspaces
+        # a tagged pre_migration backup. Must be inside the lock.
+        pre_migration_backup(ws.path, db_path=ws.db_path)
+        engine = get_engine(ws.db_url)
+
+        if not skip_backup:
+            backup_before_stage(ws.path, stage=stage, db_path=ws.db_path)
+
         with RunLogger(engine, ws.name, stage) as run:
             ctx = OperatorContext(
                 args=args, ws=ws, engine=engine, run=run, stage=stage,

@@ -164,19 +164,35 @@ def _check_have_approved_drafts(engine) -> CheckResult:
 
 def _check_attio_config(ws) -> CheckResult:
     """Attio-mode reachability: workspace has an Attio config block and
-    an ATTIO_API_KEY env var. Doesn't make a network call -- the next
-    Stage 8 run will. The point here is to refuse fast on
-    `check_ready --for attio` when the workspace was never wired up."""
-    import os
+    an ATTIO_API_KEY available. Doesn't make a network call -- the
+    next Stage 8 run will. The point here is to refuse fast on
+    `check_ready --for attio` when the workspace was never wired up.
+
+    Both attio.yaml shapes (top-level `attio:` block OR a flat file)
+    are accepted, matching core/attio_client.py:75. The API key is
+    resolved through `ws.env()` so workspace .env files satisfy this
+    check the same way the live Stage 8 will -- only checking
+    os.environ would fire a false BLOCKED on workspaces that store
+    the key in clients/<name>/.env.
+    """
     attio = (ws.attio or {}) if hasattr(ws, "attio") else {}
-    attio_cfg = (attio.get("attio") or {}) if isinstance(attio, dict) else {}
+    # Accept either {"attio": {...}} (nested) or a flat top-level
+    # config; mirror core.attio_client.AttioClient.from_workspace.
+    if isinstance(attio, dict):
+        attio_cfg = attio.get("attio") if attio.get("attio") else attio
+    else:
+        attio_cfg = {}
     if not attio_cfg:
         return CheckResult(
             "attio_config", False,
             "config/attio.yaml is missing or empty -- Stage 8 has "
             "nothing to sync to",
         )
-    if not os.environ.get("ATTIO_API_KEY"):
+    api_key = (
+        ws.env("ATTIO_API_KEY") if hasattr(ws, "env")
+        else __import__("os").environ.get("ATTIO_API_KEY")
+    )
+    if not api_key:
         return CheckResult(
             "attio_config", False,
             "ATTIO_API_KEY env var is not set -- Stage 8 will refuse "

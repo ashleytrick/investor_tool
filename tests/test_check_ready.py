@@ -353,6 +353,50 @@ def test_for_attio_requires_attio_config(monkeypatch=None):
         assert "attio_config: BLOCKED" in res.stdout, res.stdout
 
 
+def test_for_attio_accepts_flat_yaml_shape_and_env_key():
+    """The attio_config check must accept both attio.yaml shapes the
+    AttioClient accepts:
+        attio:                            <- nested top-level key
+          workspace_id: ...
+        --- OR ---
+        workspace_id: ...                 <- flat file
+    and must resolve ATTIO_API_KEY via ws.env() (which reads layered
+    .env files), not just os.environ. Otherwise a workspace storing
+    its key in clients/<name>/.env trips a false BLOCKED.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_src = REPO_ROOT / "clients" / "test_workspace"
+        ws_dst = Path(tmpdir) / "test_workspace"
+        shutil.copytree(ws_src, ws_dst)
+        ws = str(ws_dst)
+        _run_pipeline_through_stage_6(ws_dst)
+        # Flat-shape attio.yaml (no top-level `attio:` wrapper).
+        (ws_dst / "config" / "attio.yaml").write_text(
+            "workspace_id: dummy\n"
+            "api_base: https://api.attio.com/v2\n"
+            "matching_attributes:\n"
+            "  companies: domains\n"
+            "  people: email_addresses\n",
+            encoding="utf-8",
+        )
+        # API key in a workspace .env so ws.env() finds it but
+        # os.environ doesn't unless we explicitly pass it.
+        (ws_dst / ".env").write_text(
+            "ATTIO_API_KEY=from-workspace-env\n", encoding="utf-8",
+        )
+        env = {k: v for k, v in os.environ.items() if k != "ATTIO_API_KEY"}
+        res = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "check_ready.py"),
+             "--workspace", ws, "--for", "attio"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        # The attio_config check must surface OK now -- the API key
+        # came from the workspace .env, and the flat YAML shape is
+        # accepted. Other checks (mode=fixture, no approved drafts)
+        # will still block; we only need attio_config to be GREEN.
+        assert "attio_config: OK" in res.stdout, res.stdout
+
+
 def test_for_gmail_includes_scheduling_and_oauth_checks():
     """--for gmail adds scheduling + Gmail OAuth on top of send-mode
     checks. Earlier modes (review, send) skip them."""
