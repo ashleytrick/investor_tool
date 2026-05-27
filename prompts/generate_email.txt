@@ -45,6 +45,9 @@ Founder voice:
 Operator voice samples (real emails the operator has previously sent; mirror cadence, sentence-length, register, signoff -- do NOT copy phrases or content):
 {OPERATOR_VOICE_SAMPLES}
 
+Channel: {CHANNEL}
+{CHANNEL_STYLE_NOTE}
+
 STEP 1: SELECT STRATEGIES
 
 Score each of the 6 strategies for this partner 0-3:

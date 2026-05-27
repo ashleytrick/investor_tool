@@ -173,7 +173,8 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
                       composite_score, round_fit_score, round_fit_reasoning,
                       lead_likelihood_score, axes_summary, fund_kill_signals,
                       signals_for_partner, deals_for_partner,
-                      examples_dir, operator_voice_samples="") -> str:
+                      examples_dir, operator_voice_samples="",
+                      channel="email") -> str:
     """Thin wrapper: reads the prompt template from PROMPT_PATH and
     forwards everything else to core.email.prompt.build_live_prompt
     so that function stays pure (no side-effecting file reads) and is
@@ -194,6 +195,7 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
         deals_for_partner=deals_for_partner,
         examples_dir=examples_dir,
         operator_voice_samples=operator_voice_samples,
+        channel=channel,
     )
 
 
@@ -392,6 +394,9 @@ def main() -> int:
                     # (hard block) in the routing decision.
                     partners.c.email.label("partner_email"),
                     partners.c.do_not_contact,
+                    # Batch H: surface channel_pref so build_live_prompt
+                    # can dispatch to the right CHANNEL_STYLE_NOTE.
+                    partners.c.channel_pref,
                     # Slice 7: relationship suppression inputs.
                     partners.c.relationship_status,
                     partners.c.last_contacted_at,
@@ -641,6 +646,14 @@ def main() -> int:
                         f"{ax_id} ({score:.1f})" for ax_id, score in axes_for_p
                         if score is not None
                     )
+                    # Batch H: read partner.channel_pref so the
+                    # prompt picks the right channel style. None /
+                    # missing → 'email' default. 'both' falls back
+                    # to email-style for the primary draft; a
+                    # parallel LinkedIn variant pass is a follow-up.
+                    partner_channel = (
+                        getattr(row, "channel_pref", None) or "email"
+                    ).strip().lower()
                     prompt = build_live_prompt(
                         company_cfg=ws.company,
                         partner_name=row.partner_name,
@@ -656,6 +669,7 @@ def main() -> int:
                         deals_for_partner=p_deals,
                         examples_dir=ws.examples_dir,
                         operator_voice_samples=voice_samples_block,
+                        channel=partner_channel,
                     )
                     output: EmailOutput = llm.complete_json(
                         prompt=prompt,
