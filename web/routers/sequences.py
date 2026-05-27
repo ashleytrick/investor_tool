@@ -258,7 +258,21 @@ def skip_sequence(
             )
         # If next_touch_due_at is unset (initial state pre-FR-4),
         # interpret 'skip' as "schedule next touch for now+N days".
-        base = row.next_touch_due_at or now.replace(tzinfo=None)
+        #
+        # P1 audit fix: if the existing next_touch_due_at is already
+        # in the past (sequence was overdue when the operator hit
+        # skip), use `now` as the base. Without this, `base + N`
+        # could land in the past too -- e.g. a 20-day-overdue
+        # sequence + skip 3 days = still 17 days overdue, so the
+        # row reappears in the Today queue immediately. The
+        # operator's intent on skip is "defer N days from now",
+        # not "defer N days from the missed deadline".
+        now_naive = now.replace(tzinfo=None)
+        existing_due = row.next_touch_due_at
+        if existing_due is None or existing_due < now_naive:
+            base = now_naive
+        else:
+            base = existing_due
         new_due = base + _dt.timedelta(days=body.days)
         conn.execute(
             sequences.update()

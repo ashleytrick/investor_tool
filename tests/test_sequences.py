@@ -269,6 +269,48 @@ def test_skip_rejects_zero_or_negative(client) -> None:
     assert res.status_code == 422
 
 
+def test_skip_on_overdue_sequence_rebases_from_now(client) -> None:
+    """P1 audit fix: a sequence with next_touch_due_at 20 days in
+    the past, then skipped +3 days, must NOT land 17 days in the
+    past (which would re-trigger the row in the Today queue
+    immediately). The operator's intent is "defer 3 days from
+    now", not "defer 3 days from the missed deadline"."""
+    captured = _capture(client)
+    partner_id = captured["partner_id"]
+    seq_id = client.get(
+        f"/sequences/{partner_id}", headers=_auth(),
+    ).json()["sequence_id"]
+    # Set next_touch_due_at to 20 days in the past, bypassing the
+    # endpoint (which won't let us set a past date directly).
+    import os
+    from core.db import get_engine, sequences
+    eng = get_engine(
+        f"sqlite:///{os.environ['INVESTOR_WORKSPACE']}/data/pipeline.db"
+    )
+    past_due = _dt.datetime.utcnow() - _dt.timedelta(days=20)
+    with eng.begin() as conn:
+        conn.execute(
+            sequences.update()
+            .where(sequences.c.sequence_id == seq_id)
+            .values(next_touch_due_at=past_due)
+        )
+    res = client.post(
+        f"/sequences/{seq_id}/skip",
+        json={"days": 3},
+        headers=_auth(),
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    due = _dt.datetime.fromisoformat(body["next_touch_due_at"])
+    now = _dt.datetime.utcnow()
+    # Must be ~3 days in the FUTURE (not 17 days in the past).
+    assert due > now, f"skip on overdue must land in future; got {due!r}"
+    delta = due - now
+    assert _dt.timedelta(days=2) < delta < _dt.timedelta(days=4), (
+        f"skip+3 on overdue should land ~3 days from now; got {delta}"
+    )
+
+
 def test_skip_requires_auth(client) -> None:
     assert client.post(
         "/sequences/seq_abc/skip", json={"days": 3},

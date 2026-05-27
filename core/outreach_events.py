@@ -687,6 +687,7 @@ def reconcile_drafts_for_workspace(ws) -> ReconcileResult:
             unread_replies=0,
             error=f"engine_failed: {exc}",
         )
+    from core.db import sequences as _sequences_tbl
     from core.sequences import auto_stop_sequence_if_active
     with engine.begin() as conn:
         row = conn.execute(
@@ -698,18 +699,35 @@ def reconcile_drafts_for_workspace(ws) -> ReconcileResult:
                 outreach_events.c.unread.is_(True),
             )
         ).first()
-        # FR-4b: scan every reply event with an attached partner_id
-        # and attempt an auto-stop. Idempotency lives in the helper
-        # (sequence must be active; cadence setting must allow);
-        # already-stopped sequences are a no-op so we don't need
-        # to dedupe per-partner here.
+        # FR-4b: auto-stop only on replies that arrived AFTER the
+        # active sequence was created. Without this filter, a newly
+        # captured partner who happened to email the operator months
+        # ago would be auto-stopped the instant `/investors/capture`
+        # seeded their sequence. The post-audit fix joins to
+        # `sequences.created_at` so we only consider new-relative-to-
+        # this-sequence reply events.
+        #
+        # The helper is still idempotent on the sequence side -- once
+        # stopped, subsequent passes are no-ops -- so we don't have
+        # to track "which reply we already processed". `distinct()`
+        # on partner_id keeps us from calling the helper N times
+        # for one partner with N replies.
         reply_partner_ids = [
             r.partner_id for r in conn.execute(
                 select(outreach_events.c.partner_id)
+                .select_from(
+                    outreach_events.join(
+                        _sequences_tbl,
+                        _sequences_tbl.c.partner_id
+                        == outreach_events.c.partner_id,
+                    )
+                )
                 .where(
                     outreach_events.c.source == "gmail",
                     outreach_events.c.event_type == "replied",
                     outreach_events.c.partner_id.is_not(None),
+                    outreach_events.c.occurred_at
+                    >= _sequences_tbl.c.created_at,
                 )
                 .distinct()
             )

@@ -240,3 +240,67 @@ def test_capture_defaults_source_to_qr(client) -> None:
     )
     assert res.status_code == 200
     assert res.json()["source"] == "qr"
+
+
+# ---------- P2 audit fixes ----------
+
+def test_capture_dedups_across_linkedin_url_format_variants(client) -> None:
+    """P2 audit fix: same person captured via two URL formats
+    (with/without www, http vs https, trailing slash) should
+    dedupe to one partner_id, not 500 on a collision."""
+    res1 = client.post(
+        "/investors/capture",
+        json=_payload(
+            partner_name="Mira Patel", firm="Acme Ventures",
+            linkedin_url="https://www.linkedin.com/in/mira-patel/",
+        ),
+        headers=_auth(),
+    )
+    assert res1.status_code == 200, res1.text
+    pid1 = res1.json()["partner_id"]
+    # Same profile, different surface URL.
+    res2 = client.post(
+        "/investors/capture",
+        json=_payload(
+            partner_name="Mira Patel", firm="Acme Ventures",
+            linkedin_url="http://linkedin.com/in/mira-patel",
+        ),
+        headers=_auth(),
+    )
+    assert res2.status_code == 200, res2.text
+    assert res2.json()["status"] == "already_in_pipeline"
+    assert res2.json()["partner_id"] == pid1
+
+
+def test_capture_handles_partner_id_collision_with_suffix(client) -> None:
+    """P2 audit fix: two DIFFERENT partners with same firm + same
+    name slug (different LinkedIn URLs) used to 500 on the second
+    insert because partner_id is deterministic from (domain,
+    name). Now the second one gets a `-2` suffix and succeeds.
+    """
+    res1 = client.post(
+        "/investors/capture",
+        json=_payload(
+            partner_name="Alex Kim", firm="Beta Capital",
+            linkedin_url="https://linkedin.com/in/alex-kim-vc",
+        ),
+        headers=_auth(),
+    )
+    assert res1.status_code == 200, res1.text
+    pid1 = res1.json()["partner_id"]
+    # A different Alex Kim at the same fund.
+    res2 = client.post(
+        "/investors/capture",
+        json=_payload(
+            partner_name="Alex Kim", firm="Beta Capital",
+            linkedin_url="https://linkedin.com/in/alex-kim-2",
+        ),
+        headers=_auth(),
+    )
+    assert res2.status_code == 200, res2.text
+    assert res2.json()["status"] == "created"
+    pid2 = res2.json()["partner_id"]
+    assert pid1 != pid2
+    assert pid2.endswith("-2"), (
+        f"expected suffix collision-resolver, got {pid2!r}"
+    )

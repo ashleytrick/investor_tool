@@ -332,6 +332,77 @@ def _slug_unclaimed_domain(firm: str) -> str:
     return f"{cleaned}.unclaimed" if cleaned else ""
 
 
+def _normalize_linkedin_url(url: str) -> str:
+    """Canonicalize a LinkedIn profile URL so dedup catches the
+    same profile across formatting variants.
+
+    P2 audit fix: without this, `https://www.linkedin.com/in/jane`
+    and `https://linkedin.com/in/jane/` are stored as two distinct
+    partners + can later hit a partner_id collision (same firm +
+    same partner_name slug -> same deterministic partner_id ->
+    integrity error on the second insert).
+
+    Normalization rules:
+      - lowercase
+      - drop scheme (`http://`, `https://`)
+      - drop leading `www.`
+      - drop trailing slash
+      - drop query string + fragment
+    """
+    v = (url or "").strip().lower()
+    if not v:
+        return ""
+    # Strip scheme.
+    for prefix in ("https://", "http://"):
+        if v.startswith(prefix):
+            v = v[len(prefix):]
+            break
+    # Strip leading www.
+    if v.startswith("www."):
+        v = v[4:]
+    # Strip query / fragment.
+    for sep in ("?", "#"):
+        if sep in v:
+            v = v.split(sep, 1)[0]
+    # Strip trailing slash.
+    return v.rstrip("/")
+
+
+def _allocate_unique_partner_id(conn, *, base_partner_id: str) -> str:
+    """Return `base_partner_id` if free; otherwise append `-2`,
+    `-3`, ... until we find an unused slot.
+
+    P2 audit fix: the deterministic `partner_id_for(domain, name)`
+    collides when two captures share a firm + name slug (e.g. two
+    `Jane Smith`s at the same fund). Pre-fix that hit a SQLite
+    IntegrityError and bubbled as a 500. This function is only
+    reached AFTER linkedin-url dedup has rejected the "same
+    person" case, so any collision here is a genuinely different
+    partner.
+    """
+    existing = conn.execute(
+        select(partners.c.partner_id).where(
+            partners.c.partner_id == base_partner_id,
+        )
+    ).first()
+    if existing is None:
+        return base_partner_id
+    for n in range(2, 100):
+        candidate = f"{base_partner_id}-{n}"
+        hit = conn.execute(
+            select(partners.c.partner_id).where(
+                partners.c.partner_id == candidate,
+            )
+        ).first()
+        if hit is None:
+            return candidate
+    raise HTTPException(
+        500,
+        f"could not allocate a unique partner_id under "
+        f"{base_partner_id} after 100 attempts",
+    )
+
+
 @router.post(
     "/investors/capture",
     response_model=InvestorCaptureResult,
@@ -377,9 +448,16 @@ def capture_investor(
             f"got {body.source!r}",
         )
 
-    linkedin_url = (body.linkedin_url or "").strip()
-    if not linkedin_url:
+    linkedin_url_raw = (body.linkedin_url or "").strip()
+    if not linkedin_url_raw:
         raise HTTPException(422, "linkedin_url is empty")
+    # P2 audit fix: canonicalize the URL so dedup catches
+    # formatting variants (http vs https, www, trailing slash,
+    # query string). We persist the normalized form so future
+    # lookups stay consistent.
+    linkedin_url = _normalize_linkedin_url(linkedin_url_raw)
+    if not linkedin_url:
+        raise HTTPException(422, "linkedin_url normalizes to empty")
     partner_name = body.partner_name.strip()
     firm = body.firm.strip()
 
@@ -387,13 +465,27 @@ def capture_investor(
     now = _dt.datetime.now(_dt.timezone.utc)
 
     with engine.begin() as conn:
-        # 1) Dedup on linkedin_url.
+        # 1) Dedup on normalized linkedin_url. The raw column may
+        # hold legacy un-normalized values from pre-fix captures;
+        # compare both columns for safety.
         existing_partner = conn.execute(
             select(partners.c.partner_id, partners.c.fund_id,
                    partners.c.name, partners.c.linkedin_url,
                    partners.c.channel_pref, partners.c.source)
             .where(partners.c.linkedin_url == linkedin_url)
         ).first()
+        if existing_partner is None:
+            # Fall back to scanning + comparing normalized URLs so
+            # pre-normalization rows don't double-insert.
+            for row in conn.execute(
+                select(partners.c.partner_id, partners.c.fund_id,
+                       partners.c.name, partners.c.linkedin_url,
+                       partners.c.channel_pref, partners.c.source)
+                .where(partners.c.linkedin_url.is_not(None))
+            ):
+                if _normalize_linkedin_url(row.linkedin_url) == linkedin_url:
+                    existing_partner = row
+                    break
         if existing_partner is not None:
             # Look up the firm name from the funds row.
             fund_name_row = conn.execute(
@@ -420,7 +512,15 @@ def capture_investor(
                 422, f"could not derive a domain from firm={firm!r}",
             )
         fund_id = fund_id_for(pseudo_domain)
-        partner_id = partner_id_for(pseudo_domain, partner_name)
+        base_partner_id = partner_id_for(pseudo_domain, partner_name)
+        # P2 audit fix: handle collisions on the deterministic
+        # partner_id (same firm + name slug, different people).
+        # The earlier linkedin-url dedup already returned for the
+        # same-person case, so any collision here is genuinely a
+        # new partner that needs a unique id.
+        partner_id = _allocate_unique_partner_id(
+            conn, base_partner_id=base_partner_id,
+        )
 
         existing_fund = conn.execute(
             select(funds.c.fund_id).where(

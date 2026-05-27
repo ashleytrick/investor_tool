@@ -222,6 +222,42 @@ def test_reconcile_drafts_auto_stops_on_reply(workspace, engine) -> None:
     assert row.stopped_reason == "reply"
 
 
+def test_reconcile_drafts_ignores_replies_predating_sequence(
+    workspace, engine,
+) -> None:
+    """P1 audit fix: a partner who emailed the operator months
+    BEFORE being captured should NOT have their freshly-seeded
+    sequence auto-stopped. The reconcile pass must only consider
+    reply events whose occurred_at >= the sequence's created_at."""
+    seq_id = _seed_partner_with_active_sequence(engine)
+    # Old reply: arrived a month before the sequence was created.
+    from core.db import outreach_events, sequences
+    from sqlalchemy import select
+    with engine.begin() as conn:
+        seq_created = conn.execute(
+            select(sequences.c.created_at).where(
+                sequences.c.sequence_id == seq_id,
+            )
+        ).scalar()
+    old_reply = seq_created - _dt.timedelta(days=30)
+    with engine.begin() as conn:
+        conn.execute(outreach_events.insert().values(
+            source="gmail", event_type="replied",
+            external_id="<old-reply@gmail.com>",
+            thread_id="thread-old", partner_id="p_jane",
+            occurred_at=old_reply, unread=False,
+            created_at=old_reply,
+        ))
+    from core.outreach_events import reconcile_drafts_for_workspace
+    ws = MagicMock()
+    ws.path = workspace
+    result = reconcile_drafts_for_workspace(ws)
+    # The old reply must NOT auto-stop the sequence.
+    assert result.sequences_stopped == 0
+    row = _read_sequence(engine, seq_id)
+    assert row.state == "active"
+
+
 def test_reconcile_drafts_skips_when_reply_auto_stop_disabled(
     workspace, engine,
 ) -> None:
