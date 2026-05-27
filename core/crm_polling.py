@@ -569,12 +569,12 @@ def _import_investor_row(
     return created
 
 
-def _slug_unclaimed(firm: str) -> str:
-    cleaned = ''.join(
-        ch if ch.isalnum() else '-'
-        for ch in (firm or '').strip().lower()
-    ).strip('-')
-    return f'{cleaned}.unclaimed' if cleaned else ''
+# Audit-review batch F: was a 5-line local copy of the slug rule.
+# Delegated to the canonical helper so a future change to the
+# slug shape (collapse-dashes, unicode handling, suffix swap) lands
+# in one place. fund_id_for(domain) is deterministic on the slug
+# output -- divergence here produces duplicate fund rows.
+from core.discovery import slug_unclaimed_domain as _slug_unclaimed  # noqa: E402
 
 
 def poll_crm_investors_for_workspace(

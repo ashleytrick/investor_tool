@@ -186,24 +186,14 @@ def set_investor_channel(
 
 # ---------- snooze alias ----------
 
+# Audit-review batch F: was a local duplicate of the future-ISO
+# parser (explicitly flagged as temporary in its docstring).
+# Delegated to the canonical helper; preserves the 'until' field
+# name in 422 messages so existing tests + frontend error UX
+# stay byte-identical.
 def _parse_future_iso_naive_utc(value: str):
-    """Parse an ISO datetime, require it's in the future, return
-    tz-NAIVE UTC (the convention used end-to-end since FR fixup
-    #4). Local duplicate so investors.py is self-contained and
-    can ship before the coach router lands."""
-    try:
-        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            422, f"until must be ISO 8601: {exc}",
-        )
-    if dt.tzinfo is None:
-        utc_aware = dt.replace(tzinfo=_dt.timezone.utc)
-    else:
-        utc_aware = dt.astimezone(_dt.timezone.utc)
-    if utc_aware <= _dt.datetime.now(_dt.timezone.utc):
-        raise HTTPException(422, "until must be in the future")
-    return utc_aware.replace(tzinfo=None)
+    from web.deps import parse_future_iso_naive_utc as _shared
+    return _shared(value, field_name="until")
 
 
 @router.post(
@@ -322,14 +312,10 @@ class InvestorCaptureResult(BaseModel):
     note: str | None = None
 
 
-def _slug_unclaimed_domain(firm: str) -> str:
-    """firm -> firm-slug.unclaimed. Same logic as core.discovery's
-    fallback used by /discovery/claim."""
-    cleaned = "".join(
-        ch if ch.isalnum() else "-"
-        for ch in (firm or "").strip().lower()
-    ).strip("-")
-    return f"{cleaned}.unclaimed" if cleaned else ""
+# Audit-review batch F: was a third copy of the slug rule. Delegate
+# to the canonical helper in core.discovery; see slug_unclaimed_domain
+# docstring for why this needs to be one source of truth.
+from core.discovery import slug_unclaimed_domain as _slug_unclaimed_domain  # noqa: E402
 
 
 def _normalize_linkedin_url(url: str) -> str:

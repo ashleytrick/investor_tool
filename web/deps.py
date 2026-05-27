@@ -108,6 +108,45 @@ def serialize_draft(
     )
 
 
+def parse_future_iso_naive_utc(value: str, *, field_name: str = "value"):
+    """Parse an ISO datetime, require it's in the future, return
+    tz-NAIVE UTC. Shared parser for any endpoint accepting a
+    future-deadline-style timestamp (snooze, schedule, defer).
+
+    Audit-review batch F: was previously duplicated as
+    `_parse_future_iso` in coach.py and `_parse_future_iso_naive_utc`
+    in investors.py, differing only by error-message field name.
+    The investors.py docstring explicitly flagged itself as a
+    temporary local copy.
+
+    Args:
+        value: caller-supplied ISO 8601 string.
+        field_name: name shown in 422 messages (e.g. 'snoozed_until',
+            'until'). Lets the operator see WHICH field was rejected.
+
+    Returns:
+        A tz-NAIVE UTC datetime. Convention end-to-end since FR
+        fixup #4 -- SQLite stores DateTime without tzinfo so the
+        symmetry helps a future Postgres migration.
+    """
+    import datetime as _dt
+    try:
+        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            422, f"{field_name} must be ISO 8601: {exc}",
+        )
+    if dt.tzinfo is None:
+        utc_aware = dt.replace(tzinfo=_dt.timezone.utc)
+    else:
+        utc_aware = dt.astimezone(_dt.timezone.utc)
+    if utc_aware <= _dt.datetime.now(_dt.timezone.utc):
+        raise HTTPException(
+            422, f"{field_name} must be in the future",
+        )
+    return utc_aware.replace(tzinfo=None)
+
+
 def rationale_by_partner(conn) -> dict[str, str]:
     """Map partner_id -> Stage 6 recommendation_reasoning.
 
