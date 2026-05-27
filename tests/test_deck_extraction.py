@@ -359,6 +359,52 @@ def test_extract_endpoint_requires_auth() -> None:
     assert res.status_code == 401
 
 
+def test_extract_endpoint_refuses_stub_data_in_production_mode(
+    workspace: Path, monkeypatch,
+) -> None:
+    """P1 production-safety fix: when the workspace is in
+    production mode AND no ANTHROPIC_API_KEY is configured, the
+    endpoint MUST NOT return the local stub profile ("Stub Co" et
+    al). Instead it should surface extraction_failed=True so the
+    UI shows the manual-entry fallback banner. Pre-fix, an
+    operator who hadn't set up the LLM key got fake prefilled
+    company data presented as a successful extraction.
+    """
+    # Flip the test workspace into production mode.
+    cy = workspace / "config" / "company.yaml"
+    text = cy.read_text()
+    text = text.replace("mode: fixture", "mode: production")
+    cy.write_text(text)
+
+    monkeypatch.setenv("API_KEY", "test-api-key")
+    monkeypatch.setenv("INVESTOR_WORKSPACE", str(workspace))
+    monkeypatch.setenv("CORS_ORIGINS", "")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")  # stub LLM
+    import importlib
+    import web.api as api_mod
+    importlib.reload(api_mod)
+    cli = TestClient(api_mod.app)
+    pdf_bytes = _make_pdf_bytes([_REALISTIC_DECK_PAGE])
+    res = cli.post(
+        "/config/company/extract-from-deck",
+        headers=_auth_headers(),
+        files={"file": ("acme.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # Refusal must surface extraction_failed=True so the UI banner fires.
+    assert body["extraction_failed"] is True
+    # AND no stub data must leak through.
+    assert body["profile"].get("name") != "Stub Co"
+    assert not body["extracted_fields"], (
+        "production+no-key path must NOT prefill any extracted fields"
+    )
+    # Warning string should mention the missing key so the operator
+    # knows how to fix it.
+    warnings_blob = " ".join(body["warnings"]).lower()
+    assert "anthropic_api_key" in warnings_blob
+
+
 def test_openapi_lists_extract_endpoint(client: TestClient) -> None:
     """Lovable regenerates types from /openapi.json; refuse a
     regression that drops the path."""

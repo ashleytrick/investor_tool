@@ -1215,6 +1215,38 @@ async def extract_from_deck(
 
     _, ws = _engine_and_ws()
     llm = LLMClient(workspace=ws)
+    # P1 fix: in production (mode='production'), refuse to fall back
+    # to stub data when no ANTHROPIC_API_KEY is configured. Otherwise
+    # the operator would silently get fake "Stub Co" extraction
+    # results presented as if the model actually ran. Surface
+    # extraction_failed=True so the UI shows the manual-entry
+    # fallback banner instead of prefilled garbage. Fixture +
+    # dry_run modes keep their stub behavior since those exist
+    # precisely for offline / no-key testing.
+    if llm.stub and ws.mode == "production":
+        from schemas.deck_extraction import DeckLLMOutput
+        empty_response = _build_extraction_response(
+            filename=file.filename or "",
+            extracted_text=extracted,
+            llm_output=DeckLLMOutput(
+                extracted_fields=[],
+                warnings=[
+                    "LLM is not configured (no ANTHROPIC_API_KEY); "
+                    "deck extraction is disabled in production. Fill "
+                    "the company profile manually, or set the key in "
+                    "Fly secrets to enable auto-extraction."
+                ],
+            ),
+            llm_warnings=[
+                "ANTHROPIC_API_KEY not configured -- deck "
+                "extraction disabled in production. Fill the "
+                "company profile manually, or set the key in Fly "
+                "secrets to enable auto-extraction.",
+            ],
+        )
+        empty_response.extraction_failed = True
+        return empty_response
+
     stub = _deck_stub_response() if llm.stub else None
     try:
         llm_output = extract_profile_draft(
