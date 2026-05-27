@@ -54,6 +54,41 @@ class _CRMClient(Protocol):
         ...
 
 
+def _attio_extract_value(raw) -> str | None:
+    """Attio attribute values come back as arrays of dicts. The
+    actual scalar can live under several shapes depending on the
+    attribute type:
+
+      - text:       [{'value': 'lead'}]
+      - select:     [{'option': {'title': 'lead'}}]
+      - email:      [{'email_address': 'sam@acme.com'}]
+      - currency:   [{'currency_value': 1000000}]
+      - rich-text:  [{'value': '...'}]
+
+    Returns the first non-empty string we can extract, or None.
+    Resilient to None / non-list / unknown shapes.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw or None
+    if not isinstance(raw, list):
+        return None
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        for key in ("value", "email_address", "phone_number"):
+            v = item.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        opt = item.get("option")
+        if isinstance(opt, dict):
+            title = opt.get("title")
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+    return None
+
+
 # ---------- provider client: Attio ----------
 
 class AttioCRMClient:
@@ -157,13 +192,126 @@ class AttioCRMClient:
               "updated_at":     datetime UTC,
               "notes":          str | None
             }
+
+        Reads Attio deal records updated since `after`. Attio's
+        data model is per-workspace (operators rename objects +
+        attributes), so we fall back to env-overridable defaults
+        for the deal object slug and the relevant attribute names:
+
+          ATTIO_DEALS_OBJECT      default: 'deals'
+          ATTIO_STAGE_ATTR        default: 'stage'
+          ATTIO_PEOPLE_LINK_ATTR  default: 'associated_people'
+          ATTIO_NOTES_ATTR        default: 'notes'
+
+        Operators with a custom-named deal object set the env on
+        Fly; default Attio templates work without override.
+
+        Caller (poll_crm_pipeline_for_workspace) compares the
+        returned stage to partner_pipeline.stage and only fires
+        auto-stop when it actually changed (post-audit fix).
         """
-        # Attio's deals endpoint with stage + linked person. We
-        # leave this returning [] for now -- the real schema needs
-        # mapping the operator's deals workspace which varies per
-        # tenant. Operators will need to configure mapping in a
-        # future PR.
-        return []
+        try:
+            import httpx
+        except ImportError:
+            return []
+        import os as _os
+        deals_obj = _os.environ.get("ATTIO_DEALS_OBJECT") or "deals"
+        stage_attr = _os.environ.get("ATTIO_STAGE_ATTR") or "stage"
+        people_attr = (
+            _os.environ.get("ATTIO_PEOPLE_LINK_ATTR")
+            or "associated_people"
+        )
+        notes_attr = _os.environ.get("ATTIO_NOTES_ATTR") or "notes"
+
+        # Attio v2 query endpoint -- POST /v2/objects/{slug}/records/query
+        # with a filter on updated_at. Pagination via `cursor` (we
+        # cap at 200 records per pass since the cron fires every
+        # 30 min and Attio's deal volume per tenant is bounded).
+        url = f"{self.BASE}/objects/{deals_obj}/records/query"
+        payload = {
+            "filter": {
+                "updated_at": {"$gte": after.isoformat()},
+            },
+            "limit": 200,
+            "sorts": [{"attribute": "updated_at", "direction": "desc"}],
+        }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    url, json=payload, headers=self._headers(),
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise CRMPollError(f"attio_deals_http_failed: {exc}") from exc
+        if resp.status_code == 404:
+            # Operator's Attio doesn't have a 'deals' object (or
+            # they renamed it). Silent no-op -- the cron will keep
+            # firing harmlessly until they set ATTIO_DEALS_OBJECT.
+            return []
+        if resp.status_code >= 400:
+            raise CRMPollError(
+                f"attio_deals_http_{resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise CRMPollError(
+                f"attio_deals_bad_json: {exc}",
+            ) from exc
+
+        out: list[dict] = []
+        data = body.get("data") or []
+        for record in data:
+            if not isinstance(record, dict):
+                continue
+            values = record.get("values") or {}
+            # Stage: Attio attribute values are arrays of
+            # {value, ...} or {option: {title, ...}} depending on
+            # whether the attribute is text vs select. Tolerate
+            # both shapes.
+            stage = _attio_extract_value(values.get(stage_attr))
+            if not stage:
+                continue
+            # People link: array of records; take the first one's
+            # email (deals frequently link to multiple stakeholders;
+            # for sequence-auto-stop purposes any matching email is
+            # a hit since the upsert is keyed on partner_id).
+            people = values.get(people_attr) or []
+            partner_email = None
+            for p in people if isinstance(people, list) else []:
+                if not isinstance(p, dict):
+                    continue
+                # Attio nests person values under target_object_id /
+                # target_record_id; the operator's people object
+                # usually exposes 'email_addresses' as the attr.
+                target = p.get("target_record") or {}
+                email = _attio_extract_value(
+                    (target.get("values") or {}).get("email_addresses"),
+                )
+                if email:
+                    partner_email = email
+                    break
+            if not partner_email:
+                continue
+            # updated_at: top-level on the record envelope.
+            occurred_raw = record.get("updated_at")
+            try:
+                occurred_at = (
+                    _dt.datetime.fromisoformat(
+                        occurred_raw.replace("Z", "+00:00")
+                    )
+                    if occurred_raw
+                    else _dt.datetime.now(_dt.timezone.utc)
+                )
+            except (TypeError, ValueError, AttributeError):
+                continue
+            notes = _attio_extract_value(values.get(notes_attr))
+            out.append({
+                "partner_email": partner_email.strip().lower(),
+                "stage": stage,
+                "updated_at": occurred_at,
+                "notes": notes,
+            })
+        return out
 
     # ---------- B7/B8/B9 read surfaces ----------
     #
