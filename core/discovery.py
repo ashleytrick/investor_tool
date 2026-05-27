@@ -368,12 +368,27 @@ def _email_domain(email: str) -> str:
     return email.split("@", 1)[1].strip()
 
 
-def _slug_domain(firm: str) -> str:
-    """Last-resort domain for a firm with no email + no enriched
+def slug_unclaimed_domain(firm: str) -> str:
+    """Canonical firm -> `{slug}.unclaimed` pseudo-domain builder.
+
+    Last-resort domain for a firm with no email + no enriched
     domain. Produces a stable slug-shaped pseudo-domain that
-    sorts uniquely; the operator can edit the funds row later."""
+    sorts uniquely; the operator can edit the funds row later.
+
+    Audit-review fix (batch F): this is the ONE canonical
+    implementation. Previously three callers had their own copies
+    (`core/discovery._slug_domain`, `core/crm_polling._slug_unclaimed`,
+    `web/routers/investors._slug_unclaimed_domain`) -- if the
+    rule ever diverged (collapse dashes, unicode, change suffix),
+    the deterministic `fund_id_for(domain)` would silently disagree
+    and produce duplicate fund rows for the same firm.
+    """
     cleaned = "".join(
         ch if ch.isalnum() else "-"
         for ch in (firm or "").strip().lower()
     ).strip("-")
     return f"{cleaned}.unclaimed" if cleaned else ""
+
+
+# Back-compat alias so existing callers in this module keep working.
+_slug_domain = slug_unclaimed_domain

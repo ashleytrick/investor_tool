@@ -277,27 +277,16 @@ class ReplyItem(BaseModel):
 # ---------- snooze validation ----------
 
 def _parse_future_iso(value: str):
-    """Parse an ISO datetime and require it's in the future.
+    """Snooze-flavored alias for the shared future-ISO parser.
 
-    Returns a tz-NAIVE UTC datetime so writers + readers agree
-    explicitly. (SQLAlchemy strips tzinfo on SQLite anyway, but
-    the symmetry helps future Postgres deploys.)
+    Audit-review batch F: delegates to
+    `web.deps.parse_future_iso_naive_utc` so the parsing rule
+    has ONE definition. Kept as a thin wrapper because existing
+    callers + tests key on the 'snoozed_until' field name in 422
+    messages.
     """
-    try:
-        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            422, f"snoozed_until must be ISO 8601: {exc}",
-        )
-    if dt.tzinfo is None:
-        utc_aware = dt.replace(tzinfo=_dt.timezone.utc)
-    else:
-        utc_aware = dt.astimezone(_dt.timezone.utc)
-    if utc_aware <= _dt.datetime.now(_dt.timezone.utc):
-        raise HTTPException(
-            422, "snoozed_until must be in the future",
-        )
-    return utc_aware.replace(tzinfo=None)
+    from web.deps import parse_future_iso_naive_utc as _shared
+    return _shared(value, field_name="snoozed_until")
 
 
 def _load_follow_ups(conn, *, ws, engine) -> list[TodayPickView]:
