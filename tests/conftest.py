@@ -174,15 +174,52 @@ def _scored_workspace_source(tmp_path_factory) -> Path:
     per-test copy), not the cached source. The source is read-only
     by convention; tests must not mutate it (pytest's session scope
     + the copytree pattern enforces this in practice).
+
+    CI speedup paths:
+      1. PYTEST_SCORED_WS_CACHE env var: pin the cache to a stable
+         path so actions/cache can persist it across CI runs (one
+         build per code change, not one build per CI invocation).
+      2. xdist worker sharing: every pytest-xdist worker spawns its
+         own session, so without coordination each worker would
+         re-run stages 1-6. We use a filelock so the first worker
+         builds and the rest block until the .built marker appears,
+         then everyone copytree's from the shared cache.
     """
-    src = REPO_ROOT / "clients" / "test_workspace"
-    cache_root = tmp_path_factory.mktemp("scored_ws_cache")
+    cache_env = os.environ.get("PYTEST_SCORED_WS_CACHE")
+    if cache_env:
+        cache_root = Path(cache_env)
+        cache_root.mkdir(parents=True, exist_ok=True)
+    else:
+        cache_root = tmp_path_factory.mktemp("scored_ws_cache")
     dst = cache_root / "test_workspace"
-    shutil.copytree(src, dst)
-    db = dst / "data" / "pipeline.db"
-    if db.exists():
-        db.unlink()
-    run_pipeline_through_stage_6(dst)
+    marker = cache_root / ".built"
+
+    # Lock so concurrent xdist workers don't race the build.
+    # filelock is a tiny pure-Python dep; only required when xdist
+    # workers OR cross-run caches are in play. Fall back to no-op
+    # locking if it isn't installed (single-process local runs).
+    try:
+        from filelock import FileLock  # type: ignore
+        lock_ctx = FileLock(str(cache_root / ".build.lock"))
+    except ImportError:
+        from contextlib import nullcontext
+        lock_ctx = nullcontext()
+
+    with lock_ctx:
+        if marker.exists() and dst.exists():
+            # Cache hit (cross-run via PYTEST_SCORED_WS_CACHE OR
+            # a sibling xdist worker already finished the build).
+            return dst
+        # Cache miss: build into dst.
+        if dst.exists():
+            shutil.rmtree(dst)
+        src = REPO_ROOT / "clients" / "test_workspace"
+        shutil.copytree(src, dst)
+        db = dst / "data" / "pipeline.db"
+        if db.exists():
+            db.unlink()
+        run_pipeline_through_stage_6(dst)
+        marker.touch()
     return dst
 
 

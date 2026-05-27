@@ -62,6 +62,15 @@ dev-dependencies = [
     # on a 4+ core machine it's 3x+. Tests are already
     # tmp_path-isolated so per-worker collisions don't happen.
     "pytest-xdist>=3.6",
+    # pytest-split shards the suite across multiple GHA matrix
+    # jobs (`--splits N --group K`). CI uses this to cut wall-time
+    # from one ~7min job to four parallel ~2min jobs.
+    "pytest-split>=0.10",
+    # filelock coordinates the session-scoped `_scored_workspace_source`
+    # fixture across pytest-xdist workers + actions/cache restores so
+    # only one worker re-runs stages 1-6 per shard (instead of one per
+    # worker). See tests/conftest.py.
+    "filelock>=3.13",
 ]
 
 [tool.pytest.ini_options]

@@ -7,3 +7,8 @@ __pycache__/
 clients/*/data/pipeline.db
 clients/*/exports/*.csv
 .uv/
+# CI fixture cache (used by tests/conftest.py + .github/workflows/ci.yml).
+# Built lazily per CI run; checked-in copies would rot against the code
+# that produces them. The .test_durations file IS checked in -- it's
+# stable across runs and only updated intentionally via --store-durations.
+.scored_ws_cache/
