@@ -79,11 +79,19 @@ def _seed_partner_with_sequence(
     partner_id: str = "p_followup",
     current_touch: int = 1,
     next_due_offset_days: int = -1,  # default: due yesterday
+    seed_sent_event: bool = True,
+    sent_offset_days: int = -3,
 ) -> str:
     """Insert fund + partner + initial email_draft + active
-    sequence. Returns sequence_id."""
+    sequence. Returns sequence_id.
+
+    `seed_sent_event=True` (default) also inserts an
+    `outreach_events` 'sent' row for the partner so the builder's
+    prior-send gate passes. Tests that want to exercise the
+    no-prior-send skip path pass False.
+    """
     from core.db import (
-        email_drafts, funds, partners, sequences,
+        email_drafts, funds, outreach_events, partners, sequences,
     )
     now = _dt.datetime.now(_dt.timezone.utc)
     next_due = (now + _dt.timedelta(
@@ -105,6 +113,17 @@ def _seed_partner_with_sequence(
             body="Hey Fern, original outreach body here, citing a signal.",
             approval_status="sent",
         ))
+        if seed_sent_event:
+            sent_at = (now + _dt.timedelta(
+                days=sent_offset_days,
+            )).replace(tzinfo=None)
+            conn.execute(outreach_events.insert().values(
+                source="gmail", event_type="sent",
+                external_id=f"<seed-{partner_id}@gmail.com>",
+                partner_id=partner_id,
+                occurred_at=sent_at,
+                unread=False, created_at=sent_at,
+            ))
         conn.execute(sequences.insert().values(
             sequence_id=seq_id, partner_id=partner_id,
             state="active", current_touch=current_touch,
@@ -250,6 +269,46 @@ def test_build_skips_stopped_sequence(workspace, engine) -> None:
             sequences.update()
             .where(sequences.c.sequence_id == seq_id)
             .values(state="stopped", stopped_reason="reply")
+        )
+    from core.followup_builder import build_follow_ups_for_workspace
+    ws = _stub_ws_with_path(workspace)
+    result = build_follow_ups_for_workspace(ws)
+    assert result.generated == 0
+
+
+def test_build_skips_when_touch_1_not_yet_sent(workspace, engine) -> None:
+    """Audit-review fix: a freshly captured sequence (no
+    `outreach_events.sent` row for the partner) should NOT get a
+    touch-2 follow-up generated -- touch 1 hasn't gone out yet.
+    Pre-fix, `next_touch_due_at=NULL` was interpreted as 'due now'
+    and a 'Following up on my note from 0 days ago' body was
+    written on day 0."""
+    _seed_cadence(engine)
+    _seed_partner_with_sequence(engine, seed_sent_event=False)
+    from core.followup_builder import build_follow_ups_for_workspace
+    ws = _stub_ws_with_path(workspace)
+    result = build_follow_ups_for_workspace(ws)
+    assert result.generated == 0
+    assert result.skipped_no_prior_send == 1
+
+
+def test_build_skips_when_implied_due_at_is_future(
+    workspace, engine,
+) -> None:
+    """Audit-review fix: when next_touch_due_at is NULL but a
+    prior-send event exists, the implied due-at is sent_at +
+    cadence_touches[next_touch].gap_days. If that's in the
+    future, skip."""
+    _seed_cadence(engine)
+    # Sent yesterday + gap_days=3 for position 2 -> due in 2 days.
+    _seed_partner_with_sequence(
+        engine, sent_offset_days=-1, next_due_offset_days=0,
+    )
+    # Clear the explicit next_touch_due_at so the implied path runs.
+    from core.db import sequences
+    with engine.begin() as conn:
+        conn.execute(
+            sequences.update().values(next_touch_due_at=None)
         )
     from core.followup_builder import build_follow_ups_for_workspace
     ws = _stub_ws_with_path(workspace)

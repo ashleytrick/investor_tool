@@ -359,6 +359,46 @@ def test_poll_crm_pipeline_auto_stops_on_stage_advance(
     assert row.stopped_reason == "pipeline"
 
 
+def test_poll_crm_pipeline_skips_when_stage_unchanged(
+    workspace, engine,
+) -> None:
+    """Audit-review fix: list_pipeline_updates_since uses a 30-day
+    lookback and re-yields existing stage rows. The auto-stop
+    should only fire when the stage actually changed, otherwise a
+    just-captured sequence gets killed on the first poll because
+    the partner already has a CRM stage on file."""
+    from core.db import partner_pipeline as _partner_pipeline
+    seq_id = _seed_partner_with_active_sequence(engine)
+    _seed_crm_connection(engine)
+    # Pre-existing pipeline row at stage='lead'.
+    now = _dt.datetime.now(_dt.timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(_partner_pipeline.insert().values(
+            partner_id="p_jane", stage="lead", notes=None,
+            updated_at=now, updated_by="crm:attio",
+        ))
+    fake_client = MagicMock()
+    # Same stage as already on file -- no advance.
+    fake_client.list_pipeline_updates_since.return_value = [
+        {
+            "partner_email": "p_jane@acme.com",
+            "stage": "lead",
+            "notes": None,
+            "updated_at": now,
+        }
+    ]
+    from core.crm_polling import poll_crm_pipeline_for_workspace
+    ws = MagicMock()
+    ws.path = workspace
+    poll_crm_pipeline_for_workspace(
+        ws, client_factory=lambda *_a, **_kw: fake_client,
+    )
+    row = _read_sequence(engine, seq_id)
+    assert row.state == "active", (
+        "auto-stop must NOT fire when the CRM stage didn't change"
+    )
+
+
 def test_poll_crm_pipeline_skips_when_disabled(
     workspace, engine,
 ) -> None:
