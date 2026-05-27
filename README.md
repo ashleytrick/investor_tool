@@ -102,7 +102,7 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 - *Coming soon: pipeline / investors / relationships / lists / deals pollers — the wiring is in place; each needs per-tenant Attio workspace schema mapping before it returns real data.*
 
 **Onboarding**
-- 5-stage guided wizard
+- Guided setup wizard
 - Deck extraction (PDF / PPTX) → drafted company profile
 - Source-file upload + header validation
 - One-button pipeline kick-off
@@ -115,7 +115,7 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 
 **Platform**
 - Supabase JWT (HS256) auth + legacy API_KEY fallback for migration
-- 50+ REST endpoints, OpenAPI auto-generated at `/openapi.json`
+- 45+ REST endpoints, OpenAPI auto-generated at `/openapi.json`
 - 9 cron-style hook endpoints (`X-Hook-Secret` auth, fail-closed)
 - Fly.io deployable (Dockerfile + fly.toml, persistent SQLite volume at `/data`)
 - 8-shard parallel CI (~90s wall time on PR feedback)
