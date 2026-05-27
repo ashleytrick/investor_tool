@@ -51,6 +51,11 @@ class BuildResult:
     skipped_existing: int  # already had a draft for this touch
     skipped_no_cadence: int  # no cadence_touches row for the next position
     errors: list[str]
+    # Audit-review fix: sequences skipped because touch 1 hasn't
+    # been sent yet (no outreach_events 'sent' row for the partner).
+    # Pre-fix, NULL next_touch_due_at was treated as "due now"
+    # and a touch-2 follow-up was generated on day 0 after capture.
+    skipped_no_prior_send: int = 0
 
 
 def build_follow_ups_for_workspace(ws) -> BuildResult:
@@ -113,6 +118,7 @@ def build_follow_ups_for_workspace(ws) -> BuildResult:
     skipped_done = 0
     skipped_existing = 0
     skipped_no_cadence = 0
+    skipped_no_prior_send = 0
 
     for seq_row in due_rows:
         next_touch = int(seq_row.current_touch) + 1
@@ -120,18 +126,51 @@ def build_follow_ups_for_workspace(ws) -> BuildResult:
         if next_touch > max_touches:
             skipped_done += 1
             continue
-        # 2) Due-at gate. NULL means "due now" (just-captured
-        # sequences before the daily build job has stamped a due
-        # date on them).
-        due_at = seq_row.next_touch_due_at
-        if due_at is not None and due_at > now_naive:
+        # 2) Prior-send gate. Audit-review fix: we should NOT
+        # generate touch 2 until touch 1 has actually gone out --
+        # otherwise a fresh capture (next_touch_due_at=NULL,
+        # current_touch=1) gets a follow-up before its initial
+        # outreach exists. The signal that touch 1 went out is a
+        # `sent` row in outreach_events for this partner.
+        with engine.begin() as conn:
+            last_sent = conn.execute(
+                select(outreach_events.c.occurred_at).where(
+                    outreach_events.c.partner_id == seq_row.partner_id,
+                    outreach_events.c.event_type == "sent",
+                ).order_by(outreach_events.c.occurred_at.desc())
+            ).first()
+        if last_sent is None:
+            skipped_no_prior_send += 1
             continue
-        # 3) Cadence touch config for this position.
+        # 3) Due-at gate. NULL is interpreted as "use the prior
+        # send + cadence gap" rather than the previous "due now",
+        # so a sequence whose builder has never stamped a due
+        # date doesn't fire on day 0.
+        due_at = seq_row.next_touch_due_at
+        if due_at is None:
+            cad_preview = touches_by_position.get(next_touch)
+            if cad_preview is None:
+                # Skip-no-cadence handled below; fall through.
+                pass
+            else:
+                gap = int(cad_preview.get("gap_days") or 0)
+                last_sent_naive = (
+                    last_sent.occurred_at.replace(tzinfo=None)
+                    if last_sent.occurred_at and last_sent.occurred_at.tzinfo
+                    else last_sent.occurred_at
+                )
+                if last_sent_naive is not None:
+                    implied_due = last_sent_naive + _dt.timedelta(days=gap)
+                    if implied_due > now_naive:
+                        continue
+        elif due_at > now_naive:
+            continue
+        # 4) Cadence touch config for this position.
         cad = touches_by_position.get(next_touch)
         if cad is None:
             skipped_no_cadence += 1
             continue
-        # 4) Don't double-generate.
+        # 5) Don't double-generate.
         with engine.begin() as conn:
             existing = conn.execute(
                 select(follow_up_drafts.c.follow_up_id).where(
@@ -190,6 +229,7 @@ def build_follow_ups_for_workspace(ws) -> BuildResult:
         skipped_existing=skipped_existing,
         skipped_no_cadence=skipped_no_cadence,
         errors=errors,
+        skipped_no_prior_send=skipped_no_prior_send,
     )
 
 

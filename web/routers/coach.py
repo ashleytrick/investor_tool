@@ -33,7 +33,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_ as sqlalchemy_or_, select
 
 from core.approval.gate import can_approve_draft
 from core.approval.persistence import REVIEWABLE_STATES
@@ -338,6 +338,17 @@ def _load_follow_ups(conn, *, ws, engine) -> list[TodayPickView]:
         .where(
             follow_up_drafts.c.status == "draft",
             sequences.c.state == "active",
+            # Audit-review fix: honor the cadence gap. A follow-up
+            # whose sequences.next_touch_due_at is still in the
+            # future shouldn't surface in Today yet (that's the
+            # whole point of `gap_days`). NULL is treated as "due
+            # now" -- legacy rows from before the builder stamped
+            # next_touch_due_at still show up so the operator's
+            # backlog doesn't silently disappear.
+            sqlalchemy_or_(
+                sequences.c.next_touch_due_at.is_(None),
+                sequences.c.next_touch_due_at <= now_naive,
+            ),
         )
     ))
     if not rows:

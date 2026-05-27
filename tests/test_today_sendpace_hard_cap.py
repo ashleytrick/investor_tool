@@ -244,6 +244,54 @@ def test_follow_ups_roll_over_uncapped(
     assert fu["follow_up"]["days_since_last_touch"] == 3
 
 
+def test_follow_ups_respect_next_touch_due_at_in_the_future(
+    client, workspace_with_drafts: Path,
+) -> None:
+    """Audit-review fix: follow-up drafts whose sequences.next_touch_due_at
+    is in the FUTURE should NOT surface in Today.follow_ups. The
+    cadence gap is real; pre-fix the join filtered only by
+    status+state and ignored due-at."""
+    import os
+    import secrets
+    from core.db import (
+        follow_up_drafts, funds, get_engine, partners as _partners,
+        sequences as _sequences,
+    )
+    eng = get_engine(
+        f"sqlite:///{os.environ['INVESTOR_WORKSPACE']}/data/pipeline.db"
+    )
+    now = _dt.datetime.utcnow()
+    future = now + _dt.timedelta(days=5)
+    seq_id = "seq_" + secrets.token_hex(8)
+    with eng.begin() as conn:
+        conn.execute(funds.insert().values(
+            fund_id="future.com", name="Future Capital",
+            domain="future.com", is_active=True,
+        ))
+        conn.execute(_partners.insert().values(
+            partner_id="p_future", fund_id="future.com",
+            name="Felix Future",
+        ))
+        conn.execute(_sequences.insert().values(
+            sequence_id=seq_id, partner_id="p_future",
+            state="active", current_touch=1,
+            next_touch_due_at=future,
+            created_at=now - _dt.timedelta(days=2),
+            updated_at=now - _dt.timedelta(days=2),
+        ))
+        conn.execute(follow_up_drafts.insert().values(
+            sequence_id=seq_id, touch_number=2, angle="new_signal",
+            why_now="precomputed but not yet due",
+            body="Followup body, scheduled for 5 days from now.",
+            status="draft",
+            created_at=now - _dt.timedelta(days=1),
+        ))
+    body = client.get("/today", headers=_auth()).json()
+    assert not any(
+        fu["partner_id"] == "p_future" for fu in body["follow_ups"]
+    ), "future-due follow-up leaked into Today.follow_ups"
+
+
 # ---------- auth ----------
 
 def test_today_envelope_requires_auth(client) -> None:

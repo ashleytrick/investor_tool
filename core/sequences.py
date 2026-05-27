@@ -48,11 +48,21 @@ def _auto_stop_allowed(conn, reason: str) -> bool:
             cadence_settings.c.key == "default",
         )
     ).first()
+    # Defaults (mirrors cadence.py seeds): reply / pipeline /
+    # manual default-on; fund_news default-off.
+    default = col != "auto_stop_on_fund_news"
     if row is None:
-        # Seed defaults (mirrors cadence.py): reply / pipeline /
-        # manual default-on; fund_news default-off.
-        return col != "auto_stop_on_fund_news"
-    return bool(getattr(row, col, True))
+        return default
+    # Audit-review fix: `getattr(row, col, True)` returns the
+    # actual attr value when the column exists on the row even if
+    # the value is NULL -- so a partially-seeded settings row
+    # (NULL toggle) silently flipped auto-stop OFF despite the
+    # default-True contract. Explicit None check restores the
+    # default.
+    raw = getattr(row, col, None)
+    if raw is None:
+        return default
+    return bool(raw)
 
 
 def auto_stop_sequence_if_active(

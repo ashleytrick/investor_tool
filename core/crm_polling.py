@@ -466,6 +466,18 @@ def poll_crm_pipeline_for_workspace(
             if not partner_id or not stage:
                 continue
             with engine.begin() as conn:
+                # Audit-review fix: only auto-stop when the stage
+                # CHANGED. list_pipeline_updates_since uses a 30-day
+                # lookback and re-yields existing rows; without this
+                # guard, the first poll after a capture sees the
+                # partner's pre-existing CRM stage and kills the
+                # just-seeded sequence.
+                prior_row = conn.execute(
+                    select(partner_pipeline.c.stage).where(
+                        partner_pipeline.c.partner_id == partner_id,
+                    )
+                ).first()
+                prior_stage = (prior_row.stage if prior_row else "") or ""
                 upsert(
                     conn, partner_pipeline, ["partner_id"],
                     {
@@ -482,9 +494,10 @@ def poll_crm_pipeline_for_workspace(
                 # -- stop the outreach sequence so we don't keep
                 # nagging someone who's already in active dialogue.
                 # Gated by cadence_settings.auto_stop_on_pipeline_advance.
-                auto_stop_sequence_if_active(
-                    conn, partner_id=partner_id, reason="pipeline",
-                )
+                if stage != prior_stage:
+                    auto_stop_sequence_if_active(
+                        conn, partner_id=partner_id, reason="pipeline",
+                    )
                 applied += 1
         results.append(PollResult(
             workspace=ws_path_str, provider=provider,
