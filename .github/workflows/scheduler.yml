@@ -1,0 +1,115 @@
+name: Scheduler — call cron hooks on a schedule
+
+# Every hook endpoint declares its expected cadence in the hooks.py
+# docstring (B2/B3/B6/B7/B8/FR-5). This workflow drives them.
+#
+# Required GitHub repo secrets:
+#   HOOK_BASE_URL  — e.g. https://investor-outreach-api-trick.fly.dev
+#   HOOK_SECRET    — same value as the HOOK_SECRET Fly secret on the API
+#
+# How to set:
+#   gh secret set HOOK_BASE_URL --body "https://your-api.fly.dev"
+#   gh secret set HOOK_SECRET   --body "$(fly secrets list -j | jq -r '.[] | select(.Name==\"HOOK_SECRET\") | .Digest')"
+#
+# Or via the GitHub UI: Settings → Secrets and variables → Actions.
+
+on:
+  schedule:
+    # Every 10 minutes: gmail sent + replies (B2 / B3).
+    - cron: "*/10 * * * *"
+    # Every 15 minutes: CRM activity (B6, real Attio pipeline).
+    - cron: "*/15 * * * *"
+    # Every 30 minutes: reconcile-drafts + CRM pipeline.
+    - cron: "*/30 * * * *"
+    # Every hour: CRM lists + deals (B8).
+    - cron: "0 * * * *"
+    # Every 6 hours: CRM investors + relationships (B7).
+    - cron: "0 */6 * * *"
+    # Daily at 06:00 UTC: build follow-up drafts (FR-5).
+    - cron: "0 6 * * *"
+  # Manual trigger for testing.
+  workflow_dispatch:
+    inputs:
+      hook:
+        description: "Hook path to fire (e.g. poll-gmail-sent)"
+        required: true
+
+# Don't pile up scheduler runs. If a previous run is still going,
+# skip rather than queue -- a 10-minute hook taking 5 minutes is
+# fine; piling on 5 more would just thrash.
+concurrency:
+  group: scheduler
+  cancel-in-progress: false
+
+jobs:
+  fire-hooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sanity-check secrets are configured
+        env:
+          BASE: ${{ secrets.HOOK_BASE_URL }}
+          SECRET: ${{ secrets.HOOK_SECRET }}
+        run: |
+          if [ -z "$BASE" ]; then
+            echo "::error::HOOK_BASE_URL secret not set. See docs/SCHEDULER.md."
+            exit 1
+          fi
+          if [ -z "$SECRET" ]; then
+            echo "::error::HOOK_SECRET secret not set. See docs/SCHEDULER.md."
+            exit 1
+          fi
+
+      - name: Fire hooks for this schedule
+        env:
+          BASE: ${{ secrets.HOOK_BASE_URL }}
+          SECRET: ${{ secrets.HOOK_SECRET }}
+          SCHEDULE: ${{ github.event.schedule }}
+          MANUAL_HOOK: ${{ github.event.inputs.hook }}
+        run: |
+          set -e
+          # Each entry: "<schedule-string>:<comma-separated hook paths>"
+          # Schedule strings match the `cron:` triggers above; on a
+          # given fire we only call the hooks that map to THIS
+          # schedule, so the per-cadence intervals stay honest.
+          declare -A SCHEDULE_HOOKS=(
+            ["*/10 * * * *"]="poll-gmail-sent,poll-gmail-replies"
+            ["*/15 * * * *"]="poll-crm-activity"
+            ["*/30 * * * *"]="reconcile-drafts,poll-crm-pipeline"
+            ["0 * * * *"]="poll-crm-lists,poll-crm-deals"
+            ["0 */6 * * *"]="poll-crm-investors,poll-crm-relationships"
+            ["0 6 * * *"]="build-follow-ups"
+          )
+
+          if [ -n "$MANUAL_HOOK" ]; then
+            HOOKS="$MANUAL_HOOK"
+            echo "Manual trigger: firing $HOOKS"
+          else
+            HOOKS="${SCHEDULE_HOOKS[$SCHEDULE]:-}"
+            if [ -z "$HOOKS" ]; then
+              echo "::warning::No hooks mapped to schedule '$SCHEDULE'. Did the cron list and the SCHEDULE_HOOKS map drift?"
+              exit 0
+            fi
+            echo "Schedule '$SCHEDULE' -> firing: $HOOKS"
+          fi
+
+          IFS=',' read -ra HOOK_ARR <<< "$HOOKS"
+          FAIL=0
+          for hook in "${HOOK_ARR[@]}"; do
+            url="${BASE}/api/public/hooks/${hook}"
+            echo ""
+            echo "POST $url"
+            # -sS = silent except errors; -o saves body; -w prints status.
+            # Fail-soft on per-hook errors so one bad hook doesn't take
+            # the whole schedule offline.
+            status=$(curl -sS -o /tmp/body.json -w "%{http_code}" \
+              -X POST -H "X-Hook-Secret: $SECRET" "$url" || echo "000")
+            echo "Status: $status"
+            head -c 600 /tmp/body.json || true
+            echo ""
+            if [ "$status" != "200" ]; then
+              echo "::error::Hook $hook returned $status"
+              FAIL=1
+            fi
+          done
+          exit $FAIL
