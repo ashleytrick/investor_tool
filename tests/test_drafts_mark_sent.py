@@ -290,6 +290,90 @@ def test_clear_sent_requires_auth(client) -> None:
     assert res.status_code == 401
 
 
+# ---------- audit-review fixes (#9, #10) ----------
+
+def test_mark_sent_writes_audit_row_on_non_approved_starting_state(
+    client, workspace,
+) -> None:
+    """Audit-review fix #9: mark-sent on a needs_review draft
+    must write a draft_approvals row. Pre-fix, the bypass path
+    stamped email_drafts.approval_status directly without an
+    audit record."""
+    _, draft_id = _seed_partner_and_draft(
+        workspace, approval_status="needs_review",
+    )
+    client.post(
+        f"/drafts/{draft_id}/mark-sent",
+        json={"channel": "linkedin"}, headers=_auth(),
+    )
+    from sqlalchemy import select
+    from core.db import draft_approvals, get_engine
+    eng = get_engine(f"sqlite:///{workspace}/data/pipeline.db")
+    with eng.begin() as conn:
+        rows = list(conn.execute(
+            select(
+                draft_approvals.c.event_type,
+                draft_approvals.c.actor,
+                draft_approvals.c.notes,
+            ).where(draft_approvals.c.draft_id == draft_id)
+        ))
+    sent_rows = [r for r in rows if r.event_type == "sent"]
+    assert len(sent_rows) == 1, (
+        f"expected exactly one 'sent' audit row; got {rows}"
+    )
+    assert sent_rows[0].actor == "ui:mark_sent"
+    assert "channel=linkedin" in (sent_rows[0].notes or "")
+    assert "needs_review" in (sent_rows[0].notes or "")
+
+
+def test_clear_sent_audit_row_uses_at_send_hash(
+    client, workspace,
+) -> None:
+    """Audit-review fix #10: clear-sent's reversal audit row must
+    record the hash on file AT mark-sent time, not the current
+    body. Edit between mark-sent and clear-sent and assert the
+    reversal carries the original hash."""
+    _, draft_id = _seed_partner_and_draft(workspace)
+    from sqlalchemy import select
+    from core.db import draft_approvals, email_drafts, get_engine
+    eng = get_engine(f"sqlite:///{workspace}/data/pipeline.db")
+    with eng.begin() as conn:
+        conn.execute(
+            email_drafts.update()
+            .where(email_drafts.c.draft_id == draft_id)
+            .values(draft_hash="HASH-AT-SEND")
+        )
+    client.post(
+        f"/drafts/{draft_id}/mark-sent",
+        json={"channel": "linkedin"}, headers=_auth(),
+    )
+    # Operator edits the body, hash drifts.
+    with eng.begin() as conn:
+        conn.execute(
+            email_drafts.update()
+            .where(email_drafts.c.draft_id == draft_id)
+            .values(
+                body="edited after sending",
+                draft_hash="HASH-AFTER-EDIT",
+            )
+        )
+    client.delete(
+        f"/drafts/{draft_id}/mark-sent", headers=_auth(),
+    )
+    with eng.begin() as conn:
+        rev = conn.execute(
+            select(draft_approvals.c.draft_hash).where(
+                draft_approvals.c.draft_id == draft_id,
+                draft_approvals.c.actor == "ui:clear_sent",
+            )
+        ).first()
+    assert rev is not None
+    assert rev.draft_hash == "HASH-AT-SEND", (
+        f"clear-sent audit must use AT-SEND hash, not current; "
+        f"got {rev.draft_hash!r}"
+    )
+
+
 # ---------- channel column on outreach_events ----------
 
 def test_outreach_events_channel_column_defaults_to_email(workspace) -> None:
