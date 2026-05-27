@@ -180,6 +180,14 @@ partners = Table(
     Column("linkedin_url", Text),
     Column("twitter_handle", Text),
     Column("bio", Text),
+    # Frontend Requirements #6 + §8: per-investor channel
+    # preference for outreach. Defaults to 'email'; the
+    # PUT /investors/{partner_id}/channel endpoint flips it.
+    # Valid values: 'email' | 'linkedin' | 'both'.
+    Column("channel_pref", Text, default="email"),
+    # Frontend Requirements #6: how this partner row was created.
+    # Values: 'qr' | 'manual' | 'import' | (NULL = legacy/stage 2).
+    Column("source", Text),
     Column("employment_status", Text, default="uncertain"),
     Column("employment_verification_source_urls", Text),
     Column("employment_verification_date", Date),
@@ -1171,6 +1179,100 @@ crm_deals = Table(
     Column("amount", Float),
     Column("updated_at", DateTime, nullable=False),
     Index("ix_crm_deals_partner", "partner_id"),
+)
+
+
+# FR-2: per-tenant follow-up cadence configuration. Each
+# workspace file IS the tenant so we don't need a user_id PK --
+# there's exactly one row with key='default'. Future per-investor
+# overrides would live in a separate sequence_overrides sidecar
+# (deferred per the spec §4).
+cadence_settings = Table(
+    "cadence_settings", metadata,
+    Column("key", Text, primary_key=True),  # always 'default' for now
+    Column("enabled", Boolean, default=True),
+    Column("paused", Boolean, default=False),
+    Column("max_touches", Integer, default=4),
+    # 0-100, share of today's queue spent on new outreach (the
+    # rest goes to follow-ups). The Today endpoint mixed-payload
+    # logic (FR-4) reads this.
+    Column("daily_mix_new_pct", Integer, default=60),
+    Column("auto_stop_on_reply", Boolean, default=True),
+    Column("auto_stop_on_pipeline_advance", Boolean, default=True),
+    Column("auto_stop_on_manual_pass", Boolean, default=True),
+    Column("auto_stop_on_fund_news", Boolean, default=False),
+    Column("updated_at", DateTime),
+)
+
+
+# FR-2: ordered follow-up touches (touch 1 = initial outreach;
+# rows here are touch 2..N). Position is the 1-indexed touch
+# number; gap_days is days after the PREVIOUS touch (cumulative
+# is the caller's problem). angle is the per-touch directive --
+# see spec §2.2 for the enum.
+cadence_touches = Table(
+    "cadence_touches", metadata,
+    Column("position", Integer, primary_key=True),  # 2, 3, 4...
+    Column("gap_days", Integer, nullable=False),
+    Column("angle", Text, nullable=False),
+    Column("custom_prompt", Text),
+    Column("updated_at", DateTime),
+)
+
+
+# FR-3: one row per partner with an in-flight outreach sequence.
+# state values: 'active' | 'stopped' | 'completed'.
+# stopped_reason: 'reply' | 'pipeline' | 'manual' | 'max_touches'
+#                 | 'fund_news' | 'user' | NULL when state != 'stopped'.
+# current_touch starts at 1 (the initial outreach in email_drafts).
+# next_touch_due_at is when the follow-up should land in Today.
+sequences = Table(
+    "sequences", metadata,
+    Column("sequence_id", Text, primary_key=True),  # hex(secrets.token_hex(8))
+    # CASCADE: dropping the partner drops its sequence.
+    Column(
+        "partner_id", Text,
+        ForeignKey("partners.partner_id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("thread_id", Text),  # Gmail thread for this sequence
+    Column("state", Text, nullable=False, default="active"),
+    Column("stopped_reason", Text),
+    Column("current_touch", Integer, nullable=False, default=1),
+    Column("next_touch_due_at", DateTime),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+    Index("ux_sequences_partner_id", "partner_id", unique=True),
+    Index("ix_sequences_next_due", "next_touch_due_at"),
+    Index("ix_sequences_state", "state"),
+)
+
+
+# FR-3: every drafted / sent follow-up (touch 2+). touch 1 lives
+# in email_drafts; follow-ups are kept in their own table so the
+# Stage 7 supersede + approval state machine doesn't have to
+# learn the sequence concept.
+# status values: 'draft' | 'approved' | 'sent' | 'skipped' | 'killed'
+follow_up_drafts = Table(
+    "follow_up_drafts", metadata,
+    Column("follow_up_id", Integer, primary_key=True, autoincrement=True),
+    # CASCADE: dropping the sequence drops its follow-up rows.
+    Column(
+        "sequence_id", Text,
+        ForeignKey("sequences.sequence_id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("touch_number", Integer, nullable=False),  # 2..N
+    Column("angle", Text, nullable=False),
+    Column("why_now", Text),  # the trigger that justified this touch
+    Column("variant_index", Integer, nullable=False, default=0),
+    Column("subject", Text),  # empty = reuse thread subject
+    Column("body", Text, nullable=False),
+    Column("status", Text, nullable=False, default="draft"),
+    Column("created_at", DateTime, nullable=False),
+    Column("sent_at", DateTime),
+    Index("ix_follow_up_drafts_sequence", "sequence_id"),
+    Index("ix_follow_up_drafts_status", "status"),
 )
 
 

@@ -659,6 +659,11 @@ def mark_reply_read(engine: Any, *, event_id: int) -> bool:
 class ReconcileResult:
     workspace: str
     unread_replies: int
+    # FR-4b: count of sequences this pass auto-stopped on reply.
+    # The actual mutation is in core.sequences.auto_stop_sequence_if_active,
+    # gated by cadence_settings.auto_stop_on_reply. Exposed in
+    # the result so the hook log shows what fired.
+    sequences_stopped: int = 0
     error: Optional[str] = None
 
 
@@ -667,11 +672,10 @@ def reconcile_drafts_for_workspace(ws) -> ReconcileResult:
     unread reply events per workspace so the hook caller can
     monitor / alert on inbox backlog.
 
-    Read-only on purpose for B3 -- a future PR can decide whether
-    to auto-mutate draft state when a partner replies (the policy
-    is non-trivial: do we silently mark approved_to_send drafts
-    'replied'? Surface a review task instead?). Wiring the hook
-    now lets the scheduler attach to a real endpoint.
+    FR-4b: also auto-stops the partner's sequence on the first
+    reply (when `cadence_settings.auto_stop_on_reply=True`). The
+    helper is idempotent so re-running this hook on the same
+    backlog is safe; the first stop wins on `stopped_reason`.
     """
     ws_path_str = str(getattr(ws, "path", ws))
     try:
@@ -683,6 +687,8 @@ def reconcile_drafts_for_workspace(ws) -> ReconcileResult:
             unread_replies=0,
             error=f"engine_failed: {exc}",
         )
+    from core.db import sequences as _sequences_tbl
+    from core.sequences import auto_stop_sequence_if_active
     with engine.begin() as conn:
         row = conn.execute(
             select(func.count())
@@ -693,8 +699,51 @@ def reconcile_drafts_for_workspace(ws) -> ReconcileResult:
                 outreach_events.c.unread.is_(True),
             )
         ).first()
+        # FR-4b: auto-stop only on replies that arrived AFTER the
+        # active sequence was created. Without this filter, a newly
+        # captured partner who happened to email the operator months
+        # ago would be auto-stopped the instant `/investors/capture`
+        # seeded their sequence. The post-audit fix joins to
+        # `sequences.created_at` so we only consider new-relative-to-
+        # this-sequence reply events.
+        #
+        # The helper is still idempotent on the sequence side -- once
+        # stopped, subsequent passes are no-ops -- so we don't have
+        # to track "which reply we already processed". `distinct()`
+        # on partner_id keeps us from calling the helper N times
+        # for one partner with N replies.
+        reply_partner_ids = [
+            r.partner_id for r in conn.execute(
+                select(outreach_events.c.partner_id)
+                .select_from(
+                    outreach_events.join(
+                        _sequences_tbl,
+                        _sequences_tbl.c.partner_id
+                        == outreach_events.c.partner_id,
+                    )
+                )
+                .where(
+                    outreach_events.c.source == "gmail",
+                    outreach_events.c.event_type == "replied",
+                    outreach_events.c.partner_id.is_not(None),
+                    outreach_events.c.occurred_at
+                    >= _sequences_tbl.c.created_at,
+                )
+                .distinct()
+            )
+        ]
+        stopped = 0
+        for pid in reply_partner_ids:
+            if auto_stop_sequence_if_active(
+                conn, partner_id=pid, reason="reply",
+            ):
+                stopped += 1
     n = int(row[0]) if row else 0
-    return ReconcileResult(workspace=ws_path_str, unread_replies=n)
+    return ReconcileResult(
+        workspace=ws_path_str,
+        unread_replies=n,
+        sequences_stopped=stopped,
+    )
 
 
 def list_sent_events(engine: Any, *, limit: int = 100) -> list[dict]:

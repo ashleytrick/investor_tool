@@ -1,25 +1,26 @@
 """Investor-management router (FR-1 frontend wins).
 
-  PUT /investors/{partner_id}/status   — manual pipeline-stage
-                                          override. Alias for the
-                                          coach router's POST
-                                          /partners/{id}/pipeline
-                                          so the frontend's
-                                          existing setStatus()
-                                          call site works.
-  PUT /investors/{partner_id}/channel  — set channel_pref
+  PUT  /investors/{partner_id}/status   — manual pipeline-stage
+                                          override. Writes the
+                                          stage into the same
+                                          partner_pipeline row B4
+                                          writes, stamped
+                                          updated_by='ui:status_picker'
+                                          for audit.
+  PUT  /investors/{partner_id}/channel  — set channel_pref
                                           ('email' | 'linkedin' |
-                                          'both'). Defaults to
-                                          'email' if never set.
-  POST /drafts/{draft_id}/snooze       — alias for POST
-                                          /snoozes/{draft_id};
-                                          frontend uses both
-                                          shapes.
+                                          'both'). Persists on
+                                          partners.channel_pref.
+  POST /drafts/{draft_id}/snooze        — alias for POST
+                                          /snoozes/{draft_id}.
+                                          Frontend's setSnooze()
+                                          uses this URL shape.
+                                          Accepts {until: null}
+                                          to clear the snooze.
 
 Per FR-1 §10: pipeline status override policy is "local-only for
-v1". When a CRM is connected the push-through to the CRM happens
-inside the existing partner_pipeline write path; the operator's
-local override sits in the same table.
+v1". Push-through to a connected CRM is deferred until we wire
+the outbound write path.
 """
 from __future__ import annotations
 
@@ -29,11 +30,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from core.db import draft_snoozes, email_drafts, partner_pipeline, partners, upsert
-from web.deps import CommandResult, _engine_and_ws, require_auth
-from web.routers.coach import (
-    SnoozeBody, SnoozeView, _parse_future_iso, set_snooze,
+from core.db import (
+    draft_snoozes, email_drafts, funds, partner_pipeline, partners,
+    upsert,
 )
+from core.ids import fund_id_for, partner_id_for
+from web.deps import _engine_and_ws, require_auth
 
 
 _VALID_CHANNELS = {"email", "linkedin", "both"}
@@ -45,8 +47,7 @@ class InvestorStatusBody(BaseModel):
         description=(
             "Pipeline stage / status. Free-form string; "
             "conventional values: 'contacted', 'meeting_set', "
-            "'passed', 'invested', etc. Matches the values "
-            "accepted by POST /partners/{id}/pipeline.stage."
+            "'passed', 'invested'."
         ),
     )
 
@@ -65,18 +66,41 @@ class InvestorChannelBody(BaseModel):
 
 class InvestorChannelView(BaseModel):
     partner_id: str
-    channel_pref: str  # always set; defaults to 'email' if never written
+    channel_pref: str
+
+
+class SnoozeAliasBody(BaseModel):
+    """Either ISO future datetime to snooze, or null to unsnooze.
+    Matches the frontend's `setSnooze(draftId, untilIso | null)`
+    mock shape."""
+    until: str | None = Field(
+        default=None,
+        description=(
+            "ISO datetime in the future, or null to clear an "
+            "existing snooze on this draft."
+        ),
+    )
+    reason: str | None = None
+
+
+class SnoozeAliasView(BaseModel):
+    draft_id: int
+    snoozed_until: str | None = None
+    reason: str | None = None
+    created_at: str | None = None
 
 
 router = APIRouter(tags=["investors"])
 
+
+# ---------- status ----------
 
 @router.put(
     "/investors/{partner_id}/status",
     response_model=InvestorStatusView,
     summary=(
         "Set the partner's pipeline status (alias for POST "
-        "/partners/{id}/pipeline.stage)"
+        "/partners/{id}/pipeline, stamped 'ui:status_picker')"
     ),
 )
 def set_investor_status(
@@ -84,13 +108,9 @@ def set_investor_status(
     body: InvestorStatusBody,
     _auth: None = Depends(require_auth),
 ) -> InvestorStatusView:
-    """FR-1 §10. Writes the override into `partner_pipeline.stage`
-    -- same table B4's POST /partners/{id}/pipeline writes -- so
-    Today / review surfaces see the change immediately.
-
-    Policy (FR-1 §10 option C): local-only for v1. Push-through to
-    the connected CRM is deferred until we wire OutboundAttioClient.
-    """
+    """FR-1 §10 option C: local-only for v1. Writes into
+    partner_pipeline so Today / review surfaces see it
+    immediately. Future PR will push-through to a connected CRM."""
     engine, _ = _engine_and_ws()
     now = _dt.datetime.now(_dt.timezone.utc)
     with engine.begin() as conn:
@@ -120,6 +140,8 @@ def set_investor_status(
     )
 
 
+# ---------- channel ----------
+
 @router.put(
     "/investors/{partner_id}/channel",
     response_model=InvestorChannelView,
@@ -130,10 +152,9 @@ def set_investor_channel(
     body: InvestorChannelBody,
     _auth: None = Depends(require_auth),
 ) -> InvestorChannelView:
-    """FR-1 §8. Persists `partners.channel_pref`. Returns 422 on
-    invalid values (the whitelist is server-side; frontend can
-    only render the three valid options anyway, but a stale
-    cached client could send something else)."""
+    """FR-1 §8. Persists partners.channel_pref. 422 on invalid
+    values; the whitelist is server-side because a stale cached
+    client could send something unsupported."""
     pref = (body.channel_pref or "").strip().lower()
     if pref not in _VALID_CHANNELS:
         raise HTTPException(
@@ -163,32 +184,398 @@ def set_investor_channel(
     )
 
 
+# ---------- snooze alias ----------
+
+def _parse_future_iso_naive_utc(value: str):
+    """Parse an ISO datetime, require it's in the future, return
+    tz-NAIVE UTC (the convention used end-to-end since FR fixup
+    #4). Local duplicate so investors.py is self-contained and
+    can ship before the coach router lands."""
+    try:
+        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            422, f"until must be ISO 8601: {exc}",
+        )
+    if dt.tzinfo is None:
+        utc_aware = dt.replace(tzinfo=_dt.timezone.utc)
+    else:
+        utc_aware = dt.astimezone(_dt.timezone.utc)
+    if utc_aware <= _dt.datetime.now(_dt.timezone.utc):
+        raise HTTPException(422, "until must be in the future")
+    return utc_aware.replace(tzinfo=None)
+
+
 @router.post(
     "/drafts/{draft_id}/snooze",
-    response_model=SnoozeView,
+    response_model=SnoozeAliasView,
     summary=(
         "Snooze a draft (alias for POST /snoozes/{draft_id}; "
-        "frontend uses both URL shapes)"
+        "pass until=null to clear)"
     ),
 )
 def snooze_draft_alias(
     draft_id: int,
-    body: SnoozeBody | None = None,
+    body: SnoozeAliasBody,
     _auth: None = Depends(require_auth),
-) -> SnoozeView:
+) -> SnoozeAliasView:
     """FR-1 §9. Frontend's mockApi.setSnooze() targets
-    /drafts/{id}/snooze rather than /snoozes/{id}. Behaviourally
-    identical to the coach router's endpoint, plus an `until: null`
-    convenience for unsnooze in the same call site.
+    /drafts/{id}/snooze with `{until: ISO | null}`:
+
+      - until=null  -> clear any existing snooze, return empty view
+      - until=ISO   -> 422 if past, 404 if draft doesn't exist,
+                       else upsert + return the populated view
     """
-    if body is None or not body.snoozed_until:
-        # Unsnooze shortcut: { "until": null }.
-        engine, _ = _engine_and_ws()
-        with engine.begin() as conn:
+    engine, _ = _engine_and_ws()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    with engine.begin() as conn:
+        draft_row = conn.execute(
+            select(email_drafts.c.draft_id).where(
+                email_drafts.c.draft_id == draft_id,
+            )
+        ).first()
+        if draft_row is None:
+            raise HTTPException(
+                404, f"unknown draft_id: {draft_id}",
+            )
+
+        if body.until is None:
             conn.execute(
                 draft_snoozes.delete().where(
                     draft_snoozes.c.draft_id == draft_id,
                 )
             )
-        return SnoozeView(draft_id=draft_id)
-    return set_snooze(draft_id=draft_id, body=body, _auth=None)
+            return SnoozeAliasView(draft_id=draft_id)
+
+        snoozed_until = _parse_future_iso_naive_utc(body.until)
+        upsert(
+            conn, draft_snoozes, ["draft_id"],
+            {
+                "draft_id": draft_id,
+                "snoozed_until": snoozed_until,
+                "reason": body.reason,
+                "created_at": now,
+                "created_by": None,
+            },
+        )
+    return SnoozeAliasView(
+        draft_id=draft_id,
+        snoozed_until=snoozed_until.isoformat(),
+        reason=body.reason,
+        created_at=now.isoformat(),
+    )
+
+
+# ---------- FR-1b: POST /investors/capture (QR-flow seed) ----------
+
+_VALID_CAPTURE_CHANNELS = {"email", "linkedin", "both"}
+_VALID_CAPTURE_SOURCES = {"qr", "manual", "import"}
+
+
+class InvestorCaptureBody(BaseModel):
+    """Frontend's `POST /investors/capture` body. Matches the
+    QR-scan flow + the "manual add" flow at the same endpoint."""
+    linkedin_url: str = Field(
+        description=(
+            "Canonical LinkedIn profile URL. De-duped per workspace; "
+            "re-capturing returns the existing row with "
+            "status='already_in_pipeline'."
+        ),
+    )
+    partner_name: str = Field(min_length=1)
+    firm: str = Field(
+        min_length=1,
+        description=(
+            "Firm/fund name. We slug it to firm-slug.unclaimed if "
+            "we don't already know the real domain; operators can "
+            "fix the domain on the fund row later."
+        ),
+    )
+    channel: str = Field(
+        default="email",
+        description="email | linkedin | both",
+    )
+    cadence_key: str | None = Field(
+        default=None,
+        description=(
+            "warm | cold | NULL. Ignored in FR-1b -- the sequence "
+            "seed lands in FR-3; we store the choice for then."
+        ),
+    )
+    note: str | None = None
+    source: str = Field(
+        default="qr",
+        description="qr | manual | import",
+    )
+
+
+class InvestorCaptureResult(BaseModel):
+    """One investor row + a status the frontend renders."""
+    status: str  # 'created' | 'already_in_pipeline'
+    partner_id: str
+    fund_id: str
+    name: str
+    firm: str
+    linkedin_url: str | None = None
+    channel_pref: str | None = None
+    source: str | None = None
+    note: str | None = None
+
+
+def _slug_unclaimed_domain(firm: str) -> str:
+    """firm -> firm-slug.unclaimed. Same logic as core.discovery's
+    fallback used by /discovery/claim."""
+    cleaned = "".join(
+        ch if ch.isalnum() else "-"
+        for ch in (firm or "").strip().lower()
+    ).strip("-")
+    return f"{cleaned}.unclaimed" if cleaned else ""
+
+
+def _normalize_linkedin_url(url: str) -> str:
+    """Canonicalize a LinkedIn profile URL so dedup catches the
+    same profile across formatting variants.
+
+    P2 audit fix: without this, `https://www.linkedin.com/in/jane`
+    and `https://linkedin.com/in/jane/` are stored as two distinct
+    partners + can later hit a partner_id collision (same firm +
+    same partner_name slug -> same deterministic partner_id ->
+    integrity error on the second insert).
+
+    Normalization rules:
+      - lowercase
+      - drop scheme (`http://`, `https://`)
+      - drop leading `www.`
+      - drop trailing slash
+      - drop query string + fragment
+    """
+    v = (url or "").strip().lower()
+    if not v:
+        return ""
+    # Strip scheme.
+    for prefix in ("https://", "http://"):
+        if v.startswith(prefix):
+            v = v[len(prefix):]
+            break
+    # Strip leading www.
+    if v.startswith("www."):
+        v = v[4:]
+    # Strip query / fragment.
+    for sep in ("?", "#"):
+        if sep in v:
+            v = v.split(sep, 1)[0]
+    # Strip trailing slash.
+    return v.rstrip("/")
+
+
+def _allocate_unique_partner_id(conn, *, base_partner_id: str) -> str:
+    """Return `base_partner_id` if free; otherwise append `-2`,
+    `-3`, ... until we find an unused slot.
+
+    P2 audit fix: the deterministic `partner_id_for(domain, name)`
+    collides when two captures share a firm + name slug (e.g. two
+    `Jane Smith`s at the same fund). Pre-fix that hit a SQLite
+    IntegrityError and bubbled as a 500. This function is only
+    reached AFTER linkedin-url dedup has rejected the "same
+    person" case, so any collision here is a genuinely different
+    partner.
+    """
+    existing = conn.execute(
+        select(partners.c.partner_id).where(
+            partners.c.partner_id == base_partner_id,
+        )
+    ).first()
+    if existing is None:
+        return base_partner_id
+    for n in range(2, 100):
+        candidate = f"{base_partner_id}-{n}"
+        hit = conn.execute(
+            select(partners.c.partner_id).where(
+                partners.c.partner_id == candidate,
+            )
+        ).first()
+        if hit is None:
+            return candidate
+    raise HTTPException(
+        500,
+        f"could not allocate a unique partner_id under "
+        f"{base_partner_id} after 100 attempts",
+    )
+
+
+@router.post(
+    "/investors/capture",
+    response_model=InvestorCaptureResult,
+    summary=(
+        "Create a partner row from a QR-scanned LinkedIn profile "
+        "(or manual entry). Idempotent on linkedin_url within the "
+        "workspace."
+    ),
+)
+def capture_investor(
+    body: InvestorCaptureBody,
+    _auth: None = Depends(require_auth),
+) -> InvestorCaptureResult:
+    """FR-1 §6. Frontend uses this from the QR scanner + the
+    manual-add form. Dedup contract:
+
+      - linkedin_url already on a partner row in this workspace
+        -> return that row with status='already_in_pipeline',
+        DO NOT overwrite any of its fields.
+      - otherwise -> create a new partner + (if needed) a new
+        provisional `funds` row at `{firm-slug}.unclaimed`. Same
+        DNC + is_provisional treatment as /discovery/claim for
+        pseudo-domain rows so cold outreach can't accidentally
+        ship before the operator fills in a real fund domain.
+
+    Sequence seed (FR-1 §6: "newly-seeded sequence enqueued on the
+    chosen cadence_key") is deferred to FR-3 when the sequences
+    table lands; the cadence_key on the body is accepted now so the
+    frontend doesn't have to change shape later.
+    """
+    channel = (body.channel or "email").strip().lower()
+    if channel not in _VALID_CAPTURE_CHANNELS:
+        raise HTTPException(
+            422,
+            f"channel must be one of {sorted(_VALID_CAPTURE_CHANNELS)}; "
+            f"got {body.channel!r}",
+        )
+    source = (body.source or "qr").strip().lower()
+    if source not in _VALID_CAPTURE_SOURCES:
+        raise HTTPException(
+            422,
+            f"source must be one of {sorted(_VALID_CAPTURE_SOURCES)}; "
+            f"got {body.source!r}",
+        )
+
+    linkedin_url_raw = (body.linkedin_url or "").strip()
+    if not linkedin_url_raw:
+        raise HTTPException(422, "linkedin_url is empty")
+    # P2 audit fix: canonicalize the URL so dedup catches
+    # formatting variants (http vs https, www, trailing slash,
+    # query string). We persist the normalized form so future
+    # lookups stay consistent.
+    linkedin_url = _normalize_linkedin_url(linkedin_url_raw)
+    if not linkedin_url:
+        raise HTTPException(422, "linkedin_url normalizes to empty")
+    partner_name = body.partner_name.strip()
+    firm = body.firm.strip()
+
+    engine, _ = _engine_and_ws()
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    with engine.begin() as conn:
+        # 1) Dedup on normalized linkedin_url. The raw column may
+        # hold legacy un-normalized values from pre-fix captures;
+        # compare both columns for safety.
+        existing_partner = conn.execute(
+            select(partners.c.partner_id, partners.c.fund_id,
+                   partners.c.name, partners.c.linkedin_url,
+                   partners.c.channel_pref, partners.c.source)
+            .where(partners.c.linkedin_url == linkedin_url)
+        ).first()
+        if existing_partner is None:
+            # Fall back to scanning + comparing normalized URLs so
+            # pre-normalization rows don't double-insert.
+            for row in conn.execute(
+                select(partners.c.partner_id, partners.c.fund_id,
+                       partners.c.name, partners.c.linkedin_url,
+                       partners.c.channel_pref, partners.c.source)
+                .where(partners.c.linkedin_url.is_not(None))
+            ):
+                if _normalize_linkedin_url(row.linkedin_url) == linkedin_url:
+                    existing_partner = row
+                    break
+        if existing_partner is not None:
+            # Look up the firm name from the funds row.
+            fund_name_row = conn.execute(
+                select(funds.c.name).where(
+                    funds.c.fund_id == existing_partner.fund_id,
+                )
+            ).first()
+            return InvestorCaptureResult(
+                status="already_in_pipeline",
+                partner_id=existing_partner.partner_id,
+                fund_id=existing_partner.fund_id,
+                name=existing_partner.name,
+                firm=fund_name_row.name if fund_name_row else "",
+                linkedin_url=existing_partner.linkedin_url,
+                channel_pref=existing_partner.channel_pref,
+                source=existing_partner.source,
+            )
+
+        # 2) Create the fund row (provisional, pseudo-domain).
+        # Operator-edited firms with real domains can come later.
+        pseudo_domain = _slug_unclaimed_domain(firm)
+        if not pseudo_domain:
+            raise HTTPException(
+                422, f"could not derive a domain from firm={firm!r}",
+            )
+        fund_id = fund_id_for(pseudo_domain)
+        base_partner_id = partner_id_for(pseudo_domain, partner_name)
+        # P2 audit fix: handle collisions on the deterministic
+        # partner_id (same firm + name slug, different people).
+        # The earlier linkedin-url dedup already returned for the
+        # same-person case, so any collision here is genuinely a
+        # new partner that needs a unique id.
+        partner_id = _allocate_unique_partner_id(
+            conn, base_partner_id=base_partner_id,
+        )
+
+        existing_fund = conn.execute(
+            select(funds.c.fund_id).where(
+                funds.c.fund_id == fund_id,
+            )
+        ).first()
+        if existing_fund is None:
+            conn.execute(funds.insert().values(
+                fund_id=fund_id,
+                name=firm,
+                domain=pseudo_domain,
+                is_active=True,
+                is_provisional=True,
+                last_updated=now,
+            ))
+
+        # 3) Create the partner row. Mark do_not_contact since the
+        # firm domain is a slug; operator must fix it before
+        # outreach. Same treatment as discovery_claim_pseudo_domain.
+        conn.execute(partners.insert().values(
+            partner_id=partner_id,
+            fund_id=fund_id,
+            name=partner_name,
+            linkedin_url=linkedin_url,
+            channel_pref=channel,
+            source=source,
+            is_provisional=True,
+            do_not_contact=True,
+            do_not_contact_reason=(
+                "captured without a real fund domain "
+                f"({pseudo_domain}); edit the fund's domain "
+                "before contacting"
+            ),
+            do_not_contact_source="capture_pseudo_domain",
+            do_not_contact_set_at=now,
+            bio=body.note,  # operator's QR-time note lands as bio
+            last_updated=now,
+        ))
+
+        # FR-3: seed the sequence row so the daily build loop has
+        # something to advance. body.cadence_key is currently
+        # informational (FR-3 only tracks ONE active sequence per
+        # partner regardless of warm/cold path; the per-key cadence
+        # config is FR-7's parallel-channel work).
+        from web.routers.sequences import seed_sequence_for_partner
+        seed_sequence_for_partner(conn, partner_id=partner_id)
+
+    return InvestorCaptureResult(
+        status="created",
+        partner_id=partner_id,
+        fund_id=fund_id,
+        name=partner_name,
+        firm=firm,
+        linkedin_url=linkedin_url,
+        channel_pref=channel,
+        source=source,
+        note=body.note,
+    )

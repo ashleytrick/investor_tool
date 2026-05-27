@@ -135,7 +135,9 @@ def test_full_authenticated_per_user_e2e(client, e2e_env: Path) -> None:
     # Step 4: /today is empty (no Stage 7 drafts yet).
     r = client.get("/today", headers=_auth(_ALICE))
     assert r.status_code == 200
-    assert r.json() == []
+    body = r.json()
+    assert body["drafts"] == []
+    assert body["total_remaining"] == 0
 
     # Step 5: Operator connects a CRM (encrypted at rest).
     r = client.post(
@@ -157,7 +159,7 @@ def test_full_authenticated_per_user_e2e(client, e2e_env: Path) -> None:
     assert bob_crm == []
 
     # Step 7: Today queue still empty for Bob.
-    assert client.get("/today", headers=_auth(_BOB)).json() == []
+    assert client.get("/today", headers=_auth(_BOB)).json()["drafts"] == []
 
     # Step 8: Seed Alice's workspace with one partner + one draft so
     # the review/today flow has data. We inject directly into the
@@ -193,8 +195,8 @@ def test_full_authenticated_per_user_e2e(client, e2e_env: Path) -> None:
     r = client.get("/today", headers=_auth(_ALICE))
     assert r.status_code == 200
     today = r.json()
-    assert len(today) == 1
-    pick = today[0]
+    assert len(today["drafts"]) == 1
+    pick = today["drafts"][0]
     assert pick["partner_id"] == "p_zara"
     assert pick["draft_id"] == 101
     assert "fintech" in (pick["rationale"] or "")
@@ -235,7 +237,7 @@ def test_full_authenticated_per_user_e2e(client, e2e_env: Path) -> None:
     # Step 13: /today now drops the snoozed draft.
     r = client.get("/today", headers=_auth(_ALICE))
     assert r.status_code == 200
-    assert all(p["draft_id"] != 101 for p in r.json())
+    assert all(p["draft_id"] != 101 for p in r.json()["drafts"])
 
     # Step 14: Sent + Replies tabs are still empty (we haven't
     # sent anything yet).

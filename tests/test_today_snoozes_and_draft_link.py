@@ -78,7 +78,7 @@ def test_today_excludes_snoozed_drafts_on_first_materialization(client) -> None:
     )
     assert res.status_code == 200, res.text
 
-    today = client.get("/today", headers=_auth()).json()
+    today = client.get("/today", headers=_auth()).json()["drafts"]
     assert all(t["draft_id"] != victim["draft_id"] for t in today), (
         "snoozed draft leaked into Today's picks"
     )
@@ -90,7 +90,7 @@ def test_today_excludes_snoozed_drafts_added_after_picks_materialize(
     """Build the pick set first, THEN snooze one of the picks.
     Reading /today again should drop the row even though it's
     still in today_picks."""
-    today_before = client.get("/today", headers=_auth()).json()
+    today_before = client.get("/today", headers=_auth()).json()["drafts"]
     if not today_before:
         pytest.skip("no Today picks materialized")
     victim = today_before[0]
@@ -99,7 +99,7 @@ def test_today_excludes_snoozed_drafts_added_after_picks_materialize(
         json={"snoozed_until": _future_iso(48)},
         headers=_auth(),
     )
-    today_after = client.get("/today", headers=_auth()).json()
+    today_after = client.get("/today", headers=_auth()).json()["drafts"]
     assert all(t["draft_id"] != victim["draft_id"] for t in today_after)
 
 
@@ -116,7 +116,7 @@ def test_today_refills_when_every_pick_is_snoozed_but_more_drafts_exist(
         "/settings/send-pace", json={"value": 1}, headers=_auth(),
     )
     assert res.status_code == 200
-    initial = client.get("/today", headers=_auth()).json()
+    initial = client.get("/today", headers=_auth()).json()["drafts"]
     if len(initial) < 1:
         pytest.skip("fixture didn't materialize a pick to snooze")
     victim = initial[0]
@@ -134,14 +134,14 @@ def test_today_refills_when_every_pick_is_snoozed_but_more_drafts_exist(
     )
     # Re-fetch /today with pace=1 -- the snoozed pick should be
     # gone AND a fresh non-snoozed draft should take its place.
-    refill = client.get("/today", headers=_auth()).json()
+    refill = client.get("/today", headers=_auth()).json()["drafts"]
     assert all(p["draft_id"] != victim["draft_id"] for p in refill), (
         "snoozed draft leaked back"
     )
 
 
 def test_clearing_snooze_brings_draft_back_to_today(client) -> None:
-    today_before = client.get("/today", headers=_auth()).json()
+    today_before = client.get("/today", headers=_auth()).json()["drafts"]
     if not today_before:
         pytest.skip("no Today picks materialized")
     victim = today_before[0]
@@ -151,11 +151,11 @@ def test_clearing_snooze_brings_draft_back_to_today(client) -> None:
         headers=_auth(),
     )
     # Snoozed -> filtered out.
-    after_snooze = client.get("/today", headers=_auth()).json()
+    after_snooze = client.get("/today", headers=_auth()).json()["drafts"]
     assert all(t["draft_id"] != victim["draft_id"] for t in after_snooze)
     # Clear snooze.
     client.delete(f"/snoozes/{victim['draft_id']}", headers=_auth())
-    after_clear = client.get("/today", headers=_auth()).json()
+    after_clear = client.get("/today", headers=_auth()).json()["drafts"]
     assert any(t["draft_id"] == victim["draft_id"] for t in after_clear)
 
 
@@ -165,7 +165,7 @@ def test_past_dated_snooze_does_not_filter(client) -> None:
     # We can't POST a past snooze (the endpoint rejects it), so
     # write directly to the DB to simulate an elapsed snooze.
     import os
-    today_before = client.get("/today", headers=_auth()).json()
+    today_before = client.get("/today", headers=_auth()).json()["drafts"]
     if not today_before:
         pytest.skip("no Today picks materialized")
     victim = today_before[0]
@@ -181,7 +181,7 @@ def test_past_dated_snooze_does_not_filter(client) -> None:
             reason="elapsed",
             created_at=past,
         ))
-    today_after = client.get("/today", headers=_auth()).json()
+    today_after = client.get("/today", headers=_auth()).json()["drafts"]
     assert any(t["draft_id"] == victim["draft_id"] for t in today_after)
 
 
