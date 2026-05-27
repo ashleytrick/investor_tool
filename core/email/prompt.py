@@ -66,6 +66,39 @@ def meeting_slot(company_block: dict, idx: int) -> str:
 _meeting_slot = meeting_slot  # back-compat alias
 
 
+_CHANNEL_STYLE_NOTES = {
+    "email": (
+        "OUTPUT FORMAT: standard cold email -- subject line + 4-sentence "
+        "body. Follow the existing structure (sentence 1: opener; 2: "
+        "company hook; 3: why this partner / round hook; 4: meeting "
+        "ask with CTA). Signoff as the founder."
+    ),
+    "linkedin": (
+        "OUTPUT FORMAT: LinkedIn DM -- NO subject line (emit empty "
+        "string for `subject`), 3 sentences MAX, casual register, no "
+        "formal signoff. The signal in sentence 1 must be short and "
+        "specific. Sentence 2: one-line company description. Sentence 3: "
+        "the meeting ask (\"open to 15 min next week?\" style -- NOT "
+        "calendar links, LinkedIn DMs read worse with embedded URLs)."
+    ),
+    "both": (
+        "OUTPUT FORMAT: standard cold email (see email format). The "
+        "operator's channel preference is 'both' so this body will be "
+        "used as the email; a separate LinkedIn DM will be generated "
+        "in a follow-up pass."
+    ),
+}
+
+
+def channel_style_note(channel: str) -> str:
+    """Return the LLM-facing instruction block for a given
+    channel preference. Falls back to email for any unknown value."""
+    return _CHANNEL_STYLE_NOTES.get(
+        (channel or "email").strip().lower(),
+        _CHANNEL_STYLE_NOTES["email"],
+    )
+
+
 def build_live_prompt(
     *,
     prompt_template: str,
@@ -83,6 +116,7 @@ def build_live_prompt(
     deals_for_partner: list[dict],
     examples_dir,
     operator_voice_samples: str = "",
+    channel: str = "email",
 ) -> str:
     """Fill every placeholder in the operator's prompt template.
 
@@ -95,6 +129,13 @@ def build_live_prompt(
     string when the operator hasn't uploaded anything; the prompt
     template handles that gracefully by falling back to the
     `founder_voice.style` hint.
+
+    `channel` (batch H): 'email' | 'linkedin' | 'both'. Drives the
+    `{CHANNEL_STYLE_NOTE}` placeholder so the LLM emits a body shape
+    suitable for the operator's chosen channel. 'linkedin' → short
+    casual DM (3 sentences, no subject); 'email' → existing format;
+    'both' → email-style (a parallel LinkedIn-variant pass is a
+    follow-up).
     """
     c = company_cfg["company"]
     rc = company_cfg["raise_context"]
@@ -179,6 +220,11 @@ def build_live_prompt(
             or "(no operator-uploaded samples yet; "
                "mirror the style hint above)",
         )
+        # Batch H: channel-specific format instruction injected at
+        # render time. Default 'email' keeps existing behavior;
+        # 'linkedin' steers the LLM toward a short, no-subject DM.
+        .replace("{CHANNEL_STYLE_NOTE}", channel_style_note(channel))
+        .replace("{CHANNEL}", (channel or "email").strip().lower())
         # Inject the actual file contents AND keep the legacy
         # {EXAMPLES_DIR} token for backward-compatibility with any
         # custom prompts that still reference the directory path.
