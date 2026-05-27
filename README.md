@@ -11,6 +11,9 @@ This collapses that work into a few hours, without trading away the part that ma
 - **A scored target list of partners, not firms.** Sector, stage, and geography fit weighed against each partner's recent activity, deal history, and stated thesis.
 - **Drafts in your own voice.** Upload a few examples; every draft hooks into a real signal — a recent investment, a post, a podcast quote — not boilerplate.
 - **No auto-send. Ever.** Approved drafts land in your Gmail Drafts folder. You hit Send. Or you export a CSV and send from wherever you already work.
+- **A Today queue that stays honest.** A ranked daily batch capped at the number of new outreach emails *you* set per day, with a "next up" preview and a remaining-count badge. Follow-ups show up alongside and roll over until handled — they don't burn your daily budget.
+- **Follow-ups that know when to stop.** Per-partner sequences with configurable cadence (standard / patient / aggressive) that auto-halt the moment someone replies, advances in your CRM, or you manually pass.
+- **A QR-based capture at events.** Scan a partner's LinkedIn from your phone; they're deduped and in your pipeline before you leave the booth.
 - **Meeting prep when you need it.** When a partner replies or books, you get a dossier — how they think, firm snapshot, fit framing, likely objections — pushed to your Drive as a Google Doc.
 - **CRM sync if you want it.** Optional Attio integration keeps approved outreach, replies, and outcomes in your existing pipeline. Skip it and the rest works the same.
 
@@ -34,6 +37,88 @@ This is built around the opposite stance:
 - **Deliverability discipline built in.** Daily caps, do-not-contact lists, duplicate-recipient checks, and stale-approval invalidation when the underlying evidence changes.
 - **Honest about scope.** Cold email gets you the meeting. The dossier gets you ready for it. A cold email shouldn't run 600 words.
 - **Quality bar enforced.** Drafts that fail internal QA (off-voice, unsupported claim, missing hook) never reach your inbox.
+
+## Under the hood
+
+The full capability surface, grouped. Skip to the parts that matter to you.
+
+**Discovery & enrichment**
+- Multi-source ingest: OpenVC exports, Apollo email lists, CSV / XLSX upload, RSS, funding-announcement feeds
+- LLM fund enrichment (thesis, sectors, stage focus, check-size, current partners) via HTTP scraping of a fixed set of fund pages (homepage / `/portfolio` / `/team` / `/about` / `/thesis` / `/news`). Sitemap-driven discovery is future work.
+- Per-partner signal harvesting from LinkedIn, podcasts, blogs
+- Live re-verification of every cited signal before it counts
+- Deal attribution links funding announcements back to funds + partners (ambiguous-attribution review queue + confidence scoring)
+- Provisional-fund handling for incomplete domains (DNC'd until claimed)
+- QR-based capture with LinkedIn-URL dedup + collision handling
+
+**Scoring**
+- Composite thesis fit (LLM)
+- Round fit (deterministic stage + check-size match)
+- Lead likelihood (seniority + tenure)
+- Combined "send-now" priority
+- "Why now" rationale rendered on every recommendation card
+
+**Drafting & QA**
+- LLM email generation per partner with two variants
+- Six strategy frameworks scored for eligibility per-partner (`signal_led`, `portfolio_led`, `round_pattern_led`, `market_shift_led`, `contrarian_thesis_led`, `traction_led`)
+- Batch QA: pairwise similarity, template-smell distribution, hard / soft gates
+- Stale-after-approval state machine when underlying evidence shifts (partner email changed, DNC set, relationship advanced, score moved)
+
+**The Today queue**
+- Stable per-day ranked batch
+- Envelope payload: `drafts` + `follow_ups` + `next_drafts` preview + `total_remaining` badge
+- Per-pick gate hydrated server-side (no second round-trip from the UI)
+- **Send-pace as a hard daily cap on new outreach** (1-20 / day, per-workspace). Follow-ups roll over daily and don't count against the cap.
+- Approve / reject with audit-required notes; override flag for soft blockers
+- Snooze with ISO-future expiry; `until: null` clears
+
+**Sequences & follow-ups**
+- Per-partner state machine: active / stopped / completed
+- Configurable cadence: max-touches, per-touch gap_days + angle, daily mix
+- Three presets: standard (4 touches), patient (5), aggressive (4 tight)
+- Four toggleable auto-stop signals: reply, CRM pipeline-advance, manual pass, fund news
+- Operator skip (defer N days without consuming a touch) + stop (whitelist reason, idempotent)
+- Touch angles: `new_signal` / `specific_ask` / `soft_check_in` / `graceful_close` / `custom`
+
+**Sending & reconciliation (Gmail)**
+- Approved drafts pushed to Gmail Drafts; operator hits Send
+- Sent box polled every 10 min → `outreach_events`
+- Inbox polled every 10 min for replies + LLM classifier (positive / negative / neutral)
+- Unread reply count surfaced via `/replies`
+- First reply auto-stops the sequence (configurable)
+
+**Meeting prep**
+- Auto-dossier when a partner moves to `replied` / `interested` / `meeting_booked`
+- One unified brief: firm snapshot, fit framing, likely objections, Q&A prep, suggested next-step ask
+- Pushed to operator's Google Drive as a Google Doc; idempotent (skips upload if the same signal-set hash has already been pushed)
+- Caching keyed on the partner's signal hash so re-running is free until something material changes
+
+**CRM (optional Attio)**
+- Outbound push of partners, scores, outreach status (Stage 8)
+- Activity polling (15 min) — pulls notes / tasks / comments into `outreach_events`
+- One-shot bulk import on connect
+- Manual-override + preserve-on-outreach respected so the CRM stays in charge of fields it owns
+- Encrypted credential storage (Fernet)
+- *Coming soon: pipeline / investors / relationships / lists / deals pollers — the wiring is in place; each needs per-tenant Attio workspace schema mapping before it returns real data.*
+
+**Onboarding**
+- Guided setup wizard
+- Deck extraction (PDF / PPTX) → drafted company profile
+- Source-file upload + header validation
+- One-button pipeline kick-off
+
+**Privacy & multi-tenancy**
+- Per-user SQLite workspace (the workspace IS the tenant boundary — nothing leaks across)
+- Per-tenant discovery-pool opt-in, default OFF
+- Operator kill switch (`INVESTORS_GLOBAL_DISABLED=true`)
+- Per-partner do-not-contact enforced at the approval gate, with audit metadata
+
+**Platform**
+- Supabase JWT (HS256) auth + legacy API_KEY fallback for migration
+- 45+ REST endpoints, OpenAPI auto-generated at `/openapi.json`
+- 9 cron-style hook endpoints (`X-Hook-Secret` auth, fail-closed)
+- Fly.io deployable (Dockerfile + fly.toml, persistent SQLite volume at `/data`)
+- 8-shard parallel CI (~90s wall time on PR feedback)
 
 ## What it does *not* do
 
