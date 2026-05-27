@@ -11,7 +11,7 @@ This collapses that work into a few hours, without trading away the part that ma
 - **A scored target list of partners, not firms.** Sector, stage, and geography fit weighed against each partner's recent activity, deal history, and stated thesis.
 - **Drafts in your own voice.** Upload a few examples; every draft hooks into a real signal — a recent investment, a post, a podcast quote — not boilerplate.
 - **No auto-send. Ever.** Approved drafts land in your Gmail Drafts folder. You hit Send. Or you export a CSV and send from wherever you already work.
-- **A Today queue that stays honest.** A ranked daily batch sized to your send-pace, with a "next up" preview and a remaining-count badge so you always know where you stand. Snooze any draft to push it forward.
+- **A Today queue that stays honest.** A ranked daily batch capped at the number of new outreach emails *you* set per day, with a "next up" preview and a remaining-count badge. Follow-ups show up alongside and roll over until handled — they don't burn your daily budget.
 - **Follow-ups that know when to stop.** Per-partner sequences with configurable cadence (standard / patient / aggressive) that auto-halt the moment someone replies, advances in your CRM, or you manually pass.
 - **A QR-based capture at events.** Scan a partner's LinkedIn from your phone; they're deduped and in your pipeline before you leave the booth.
 - **Meeting prep when you need it.** When a partner replies or books, you get a dossier — how they think, firm snapshot, fit framing, likely objections — pushed to your Drive as a Google Doc.
@@ -50,7 +50,6 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 - Deal attribution links funding announcements back to funds + partners
 - Provisional-fund handling for incomplete domains (DNC'd until claimed)
 - QR-based capture with LinkedIn-URL dedup
-- Per-partner channel preference (email / LinkedIn / both)
 
 **Scoring**
 - Composite thesis fit (LLM)
@@ -68,9 +67,9 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 
 **The Today queue**
 - Stable per-day ranked batch
-- Envelope payload: `drafts` + `next_drafts` preview + `total_remaining` badge
+- Envelope payload: `drafts` + `follow_ups` + `next_drafts` preview + `total_remaining` badge
 - Per-pick gate hydrated server-side (no second round-trip from the UI)
-- Send-pace control (1-20 / day, per-workspace)
+- **Send-pace as a hard daily cap on new outreach** (1-20 / day, per-workspace). Follow-ups roll over daily and don't count against the cap.
 - Approve / reject with audit-required notes; override flag for soft blockers
 - Snooze with ISO-future expiry; `until: null` clears
 
@@ -96,10 +95,11 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 
 **CRM (optional Attio)**
 - Outbound push of partners, scores, outreach status (Stage 8)
-- Six background pollers: activity (15 min), pipeline (30 min, auto-stops sequences), investors (6 h), relationships (6 h), lists (1 h), deals (1 h)
+- Activity polling (15 min) — pulls notes / tasks / comments into `outreach_events`
 - One-shot bulk import on connect
 - Manual-override + preserve-on-outreach respected so the CRM stays in charge of fields it owns
 - Encrypted credential storage (Fernet)
+- *Coming soon: pipeline / investors / relationships / lists / deals pollers — the wiring is in place; each needs per-tenant Attio workspace schema mapping before it returns real data.*
 
 **Onboarding**
 - 5-stage guided wizard
