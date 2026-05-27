@@ -119,7 +119,13 @@ def test_send_pace_requires_auth(client) -> None:
 def test_today_returns_ranked_picks(client) -> None:
     res = client.get("/today", headers=_auth())
     assert res.status_code == 200, res.text
-    picks = res.json()
+    body = res.json()
+    # FR-4 envelope shape.
+    assert isinstance(body, dict)
+    assert "date" in body and "send_pace" in body
+    assert "drafts" in body and "next_drafts" in body
+    assert "total_remaining" in body
+    picks = body["drafts"]
     assert isinstance(picks, list)
     if not picks:
         pytest.skip(
@@ -135,6 +141,9 @@ def test_today_returns_ranked_picks(client) -> None:
     assert sample["partner_id"]
     assert sample["draft_id"] > 0
     assert sample["pick_date"]  # ISO date string
+    # FR-4 fields default to None on initial-outreach (touch 1).
+    assert sample["follow_up"] is None
+    assert "snoozed_until" in sample
     # The draft is fully hydrated (gate + subject + body), saving a
     # second round-trip from the Today tab.
     if sample["draft"] is not None:
@@ -145,8 +154,8 @@ def test_today_returns_ranked_picks(client) -> None:
 def test_today_is_stable_across_repeated_reads(client) -> None:
     """Spec: picks 'stable per day'. Two GETs in a row must return
     the same partner_ids in the same order."""
-    a = client.get("/today", headers=_auth()).json()
-    b = client.get("/today", headers=_auth()).json()
+    a = client.get("/today", headers=_auth()).json()["drafts"]
+    b = client.get("/today", headers=_auth()).json()["drafts"]
     assert [p["partner_id"] for p in a] == [p["partner_id"] for p in b]
     assert [p["rank"] for p in a] == [p["rank"] for p in b]
 
@@ -154,7 +163,7 @@ def test_today_is_stable_across_repeated_reads(client) -> None:
 def test_today_respects_limit_query_param(client) -> None:
     res = client.get("/today?limit=2", headers=_auth())
     assert res.status_code == 200
-    assert len(res.json()) <= 2
+    assert len(res.json()["drafts"]) <= 2
 
 
 def test_today_falls_back_to_send_pace_when_limit_omitted(client) -> None:
@@ -165,9 +174,10 @@ def test_today_falls_back_to_send_pace_when_limit_omitted(client) -> None:
     )
     res = client.get("/today", headers=_auth())
     assert res.status_code == 200
-    # Pick set was already materialized by earlier tests potentially;
-    # the limit applies even when serving cached picks.
-    assert len(res.json()) <= 1
+    body = res.json()
+    # The limit applies even when serving cached picks.
+    assert len(body["drafts"]) <= 1
+    assert body["send_pace"] == 1
 
 
 def test_today_requires_auth(client) -> None:
