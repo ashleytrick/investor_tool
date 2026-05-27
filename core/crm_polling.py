@@ -457,6 +457,7 @@ def poll_crm_pipeline_for_workspace(
                 error=str(exc),
             )
             continue
+        from core.sequences import auto_stop_sequence_if_active
         applied = 0
         for u in updates:
             email = (u.get("partner_email") or "").strip().lower()
@@ -475,6 +476,14 @@ def poll_crm_pipeline_for_workspace(
                             or _dt.datetime.now(_dt.timezone.utc),
                         "updated_by": f"crm:{provider}",
                     },
+                )
+                # FR-4b: a stage advance is a signal that this
+                # partner has moved into the operator's CRM funnel
+                # -- stop the outreach sequence so we don't keep
+                # nagging someone who's already in active dialogue.
+                # Gated by cadence_settings.auto_stop_on_pipeline_advance.
+                auto_stop_sequence_if_active(
+                    conn, partner_id=partner_id, reason="pipeline",
                 )
                 applied += 1
         results.append(PollResult(
