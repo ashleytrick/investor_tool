@@ -7,19 +7,23 @@ on:
 
 jobs:
   smoke:
-    # Test sharding via pytest-split: 4 GHA jobs run in parallel,
-    # each handling 1/4 of the suite. Wall-clock = max(shard) rather
-    # than sum(all), so a 7min serial run becomes ~2min parallel.
+    # Test sharding via pytest-split: 8 GHA jobs run in parallel,
+    # each handling 1/8 of the suite. Wall-clock = max(shard) rather
+    # than sum(all), so a 7min serial run becomes ~1min parallel.
     #
-    # Each shard runs on its own ubuntu-latest (2 vCPU) so total
-    # billed minutes go up ~25% (4 jobs * ~2min vs 1 job * 7min),
-    # but PR feedback is ~3.5x faster. Upgrade to ubuntu-latest-4-core
-    # (paid larger runner) if the per-shard time still bites.
+    # Each shard runs on its own ubuntu-latest (2 vCPU). Total billed
+    # minutes go up vs serial (8 jobs * ~1min vs 1 job * 7min ≈ +14%
+    # compute) but PR feedback is ~7x faster. Diminishing returns
+    # past 8 shards because the per-shard fixture build + uv install
+    # overhead starts to dominate vs the actual test time.
+    #
+    # Upgrade to ubuntu-latest-4-core (paid larger runner) if the
+    # per-shard 2-core runner becomes the bottleneck.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
-    name: smoke (shard ${{ matrix.shard }}/4)
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    name: smoke (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
     # Per-shard timeout. Whole suite serial was ~15 min; a single
     # shard is a quarter of that plus the fixture build, so 10 is
@@ -60,7 +64,7 @@ jobs:
           key: scored-ws-${{ runner.os }}-${{ hashFiles('core/**/*.py', 'scripts/0[1-6]_*.py', 'clients/test_workspace/**', 'prompts/**', 'schemas/**') }}
           restore-keys: |
             scored-ws-${{ runner.os }}-
-      - name: Run smoke tests (shard ${{ matrix.shard }}/4)
+      - name: Run smoke tests (shard ${{ matrix.shard }}/8)
         env:
           # Force stub mode so no real API calls are made during CI.
           ANTHROPIC_API_KEY: ""
@@ -72,25 +76,25 @@ jobs:
           PYTEST_SCORED_WS_CACHE: ${{ github.workspace }}/.scored_ws_cache
         run: |
           set +e
-          # `--splits 4 --group N`: pytest-split assigns roughly
-          # equal-duration test buckets per group (using a stored
-          # `.test_durations` file if present, otherwise size-based
-          # fallback). Each group runs `-n auto` inside (xdist still
-          # parallelizes within the shard on the 2 cores GHA gives).
+          # `--splits 8 --group N`: pytest-split assigns roughly
+          # equal-duration test buckets per group (using the
+          # checked-in `.test_durations` file). Each group runs
+          # `-n auto` inside (xdist still parallelizes within the
+          # shard on the 2 cores GHA gives).
           #
           # `--tb=short -ra` keeps the same failure-output verbosity
           # as before. `-q` replaces `-v` because xdist's per-worker
           # output makes -v unreadable; the durations + failure tail
           # are what reviewers actually scan.
           uv run pytest tests/ \
-            --splits 4 --group ${{ matrix.shard }} \
+            --splits 8 --group ${{ matrix.shard }} \
             -n auto -q --tb=short -ra --durations=15 \
             2>&1 | tee pytest.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
-            echo "::error::pytest exited $rc (shard ${{ matrix.shard }}/4)"
+            echo "::error::pytest exited $rc (shard ${{ matrix.shard }}/8)"
             {
-              echo "## Pytest output (tail) -- shard ${{ matrix.shard }}/4"
+              echo "## Pytest output (tail) -- shard ${{ matrix.shard }}/8"
               echo ""
               echo '```'
               tail -200 pytest.log
