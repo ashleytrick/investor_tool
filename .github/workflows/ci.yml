@@ -2,11 +2,36 @@ name: CI
 
 on:
   pull_request:
+    # Re-trigger when a draft is marked ready (the `if:` guard
+    # below skips the smoke job while the PR is still a draft, so
+    # this event is what kicks CI when the operator hits 'ready
+    # for review').
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 
+# Cancel any in-progress run for the same ref when a new push
+# lands. Without this, a series of force-pushes to a PR branch
+# would queue up N copies of the 8-shard matrix even though only
+# the latest is useful. `cancel-in-progress: true` kills the
+# stale run so the queue stays bounded by (#open PRs × shards),
+# not (#open PRs × shards × #force-pushes-per-PR).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   smoke:
+    # Skip the matrix entirely while the PR is a draft. CI re-
+    # triggers on the `ready_for_review` event above when the
+    # operator marks it ready -- so the signal still arrives,
+    # just at the point it actually matters.
+    #
+    # Pushes to main always run (github.event.pull_request is
+    # null on push events, and the `==` against False evaluates
+    # truthy in GHA expressions; the explicit `!=` against the
+    # draft boolean keeps it readable).
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     # Test sharding via pytest-split: 8 GHA jobs run in parallel,
     # each handling 1/8 of the suite. Wall-clock = max(shard) rather
     # than sum(all), so a 7min serial run becomes ~1min parallel.
