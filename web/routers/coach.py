@@ -425,23 +425,34 @@ def get_today(
     tomorrow.
     """
     engine, ws = _engine_and_ws()
-    today_iso = _dt.date.today()
+    # Audit-review fix: use the UTC date everywhere so the
+    # sent_today cap aligns with the today_picks cache key. Mixing
+    # local-date (today()) with UTC-time created a midnight-UTC-
+    # of-local-date threshold that double-counted sends near the
+    # day boundary for non-UTC operators.
+    today_iso = _dt.datetime.now(_dt.timezone.utc).date()
 
     with engine.begin() as conn:
         send_pace = _read_send_pace(conn)
 
         # FR-4c: count today's NEW-outreach sends so we can apply
-        # the hard daily cap. `outreach_events.draft_id` currently
-        # only points at email_drafts rows (touch 1); when FR-5
-        # adds follow-up-draft sends, this needs to learn to only
-        # count touch-1 sends.
+        # the hard daily cap. Counts both source='gmail' (Gmail
+        # poller-confirmed) AND source='app' (FR-7 LinkedIn manual
+        # mark-sent). Audit-review fix #5: pre-fix the filter was
+        # source='gmail' only, letting operators bypass the cap
+        # by routing sends through LinkedIn.
+        #
+        # `outreach_events.draft_id` currently only points at
+        # email_drafts rows (touch 1); when FR-5 adds follow-up
+        # sends with draft_id pointing at follow_up_drafts, this
+        # needs to learn to only count touch-1 sends.
         today_start_utc = _dt.datetime.combine(
-            today_iso, _dt.time.min, tzinfo=_dt.timezone.utc,
-        ).replace(tzinfo=None)
+            today_iso, _dt.time.min,
+        )  # already-naive UTC midnight; today_iso is now UTC date.
         sent_today = conn.execute(
             select(func.count()).select_from(outreach_events)
             .where(
-                outreach_events.c.source == "gmail",
+                outreach_events.c.source.in_(["gmail", "app"]),
                 outreach_events.c.event_type == "sent",
                 outreach_events.c.occurred_at >= today_start_utc,
                 outreach_events.c.draft_id.is_not(None),
