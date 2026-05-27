@@ -175,6 +175,85 @@ def test_limit_query_can_only_lower_not_raise_above_pace(
     )
 
 
+def test_linkedin_mark_sent_counts_against_send_pace(
+    client, workspace_with_drafts: Path,
+) -> None:
+    """Audit-review fix #5: LinkedIn manual mark-sent writes
+    outreach_events with source='app'. Pre-fix, sent_today
+    filtered source='gmail' only, letting operators bypass the
+    daily cap by routing sends through LinkedIn. Post-fix, both
+    sources count."""
+    import os
+    from core.db import get_engine, outreach_events
+    eng = get_engine(
+        f"sqlite:///{os.environ['INVESTOR_WORKSPACE']}/data/pipeline.db"
+    )
+    client.post(
+        "/settings/send-pace", json={"value": 3}, headers=_auth(),
+    )
+    body = client.get("/today", headers=_auth()).json()
+    if not body["drafts"]:
+        pytest.skip("no drafts in fixture")
+    target_draft_id = body["drafts"][0]["draft_id"]
+    # Simulate FR-7 mark-sent: source='app', channel='linkedin'.
+    now = _dt.datetime.utcnow()
+    with eng.begin() as conn:
+        for i in range(3):
+            conn.execute(outreach_events.insert().values(
+                source="app", event_type="sent",
+                external_id=f"<ln-{i}@app>",
+                partner_id=None,
+                draft_id=target_draft_id,
+                channel="linkedin",
+                occurred_at=now,
+                unread=False, created_at=now,
+            ))
+    body2 = client.get("/today", headers=_auth()).json()
+    assert body2["sent_today"] == 3, (
+        f"LinkedIn sends must count against send_pace; "
+        f"got sent_today={body2['sent_today']}"
+    )
+    assert body2["drafts"] == [], "cap hit, drafts must be empty"
+
+
+def test_sent_today_uses_utc_date_boundary(
+    client, workspace_with_drafts: Path,
+) -> None:
+    """Audit-review fix #6: today_start_utc must align with the
+    UTC date boundary, not midnight-UTC-of-local-date. A sent
+    event timestamped 2h ago (always within the last UTC day)
+    should always be counted as today's send regardless of the
+    operator's timezone."""
+    import os
+    from core.db import get_engine, outreach_events
+    eng = get_engine(
+        f"sqlite:///{os.environ['INVESTOR_WORKSPACE']}/data/pipeline.db"
+    )
+    body = client.get("/today", headers=_auth()).json()
+    if not body["drafts"]:
+        pytest.skip("no drafts in fixture")
+    target_draft_id = body["drafts"][0]["draft_id"]
+    # 2 hours ago (UTC). Should always count toward "today" no
+    # matter what the OS-local date is right now.
+    two_hours_ago = (
+        _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=2)
+    ).replace(tzinfo=None)
+    with eng.begin() as conn:
+        conn.execute(outreach_events.insert().values(
+            source="gmail", event_type="sent",
+            external_id="<utc-bound@gmail.com>",
+            partner_id=None,
+            draft_id=target_draft_id,
+            occurred_at=two_hours_ago,
+            unread=False, created_at=two_hours_ago,
+        ))
+    body2 = client.get("/today", headers=_auth()).json()
+    assert body2["sent_today"] >= 1, (
+        f"a send 2h ago must always count as today (UTC date "
+        f"boundary); got sent_today={body2['sent_today']}"
+    )
+
+
 # ---------- follow_ups split ----------
 
 def test_follow_ups_empty_when_no_follow_up_drafts(client) -> None:
