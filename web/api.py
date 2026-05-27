@@ -49,7 +49,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -70,12 +70,14 @@ from core.db import (  # noqa: E402
     crm_connections,
     draft_snoozes,
     email_drafts,
+    follow_up_drafts,
     get_engine,
     outreach_events,
     partner_pipeline,
     partner_score_summaries,
     partners,
     runs,
+    sequences as sequences_tbl,
     today_picks,
     workspace_settings,
 )
@@ -634,16 +636,55 @@ def reject_draft(
 
 # ---------- B1: Today flow ----------
 
+class FollowUpContext(BaseModel):
+    """FR-4: hydrated context for a follow-up touch (touch 2..N).
+    Initial outreach (touch 1) draws from email_drafts; follow-ups
+    draw from follow_up_drafts + sequences. The frontend
+    distinguishes the two via `follow_up != None` -- the renderer
+    shows the thread preview, days-since, and angle on follow-up
+    cards."""
+    touch_number: int  # 2..N
+    max_touches: int
+    days_since_last_touch: int
+    angle: str  # new_signal | specific_ask | soft_check_in | graceful_close | custom
+    why_now: str | None = None
+    thread_preview: str | None = None
+    thread_sent_at: str | None = None  # ISO datetime
+    sequence_id: str
+
+
 class TodayPickView(BaseModel):
-    """One pick on the daily Today queue."""
+    """One pick on the daily Today queue. After FR-4 the same
+    shape carries both initial outreach (`follow_up is None`) and
+    follow-up touches (`follow_up` populated)."""
     pick_date: str  # ISO date (YYYY-MM-DD)
     rank: int
     partner_id: str
     draft_id: int
     rationale: str | None = None
+    # FR-4: when the operator snoozed this draft but the snooze
+    # window already elapsed (or hasn't started yet for the current
+    # day), surface the timestamp so the UI can render a "was
+    # snoozed until X" hint. None when no snooze is on file.
+    snoozed_until: str | None = None
+    # FR-4: populated for follow-up touches; None for initial
+    # outreach. See FollowUpContext.
+    follow_up: FollowUpContext | None = None
     # Convenience: hydrate the draft + partner email + gate so the
     # frontend doesn't have to round-trip /review/pending separately.
     draft: DraftView | None = None
+
+
+class TodayResponse(BaseModel):
+    """FR-4 envelope wrapping today's picks. Replaces the legacy
+    `list[TodayPickView]` shape so the frontend can render the
+    daily batch + a "next up" preview + a remaining-count badge
+    without round-tripping."""
+    date: str  # ISO date YYYY-MM-DD
+    send_pace: int  # operator's configured daily pace
+    drafts: list[TodayPickView]  # the batch to work on now (<= effective_limit)
+    next_drafts: list[TodayPickView]  # preview of the next batch
+    total_remaining: int  # eligible drafts not yet shown in `drafts`
 
 
 class SendPaceBody(BaseModel):
@@ -662,20 +703,20 @@ class SendPaceView(BaseModel):
 
 @app.get(
     "/today",
-    response_model=list[TodayPickView],
-    summary="Today's ranked draft batch (stable per day)",
+    response_model=TodayResponse,
+    summary="Today's ranked draft batch (stable per day, FR-4 envelope)",
     tags=["coach"],
 )
 def get_today(
     limit: int | None = Query(
         None, ge=1, le=_SEND_PACE_MAX,
         description=(
-            "Optional batch size. Defaults to the workspace's "
-            "`send_pace` setting (1..20)."
+            "Optional batch size for the `drafts` array. Defaults "
+            "to the workspace's `send_pace` setting (1..20)."
         ),
     ),
     _auth: None = Depends(require_auth),
-) -> list[TodayPickView]:
+) -> TodayResponse:
     """Returns the operator's daily draft batch, ranked.
 
     The pick set is materialized once per (workspace, date) and
@@ -690,13 +731,24 @@ def get_today(
     today's persisted pick row stays; the consumer should join
     today_picks -> email_drafts to know whether the draft has since
     moved to approved/rejected.
+
+    FR-4 envelope shape: returns
+    `{date, send_pace, drafts, next_drafts, total_remaining}`.
+    `drafts` is the top `effective_limit` picks, `next_drafts` is
+    the next batch preview (also `send_pace`-sized), and
+    `total_remaining` is the count of eligible drafts NOT yet in
+    `drafts`. Follow-up touches (touch 2+, sourced from
+    `follow_up_drafts`) will mix into the same arrays once the
+    daily build job lands -- for now `follow_up` is always None
+    until FR-5 generates touch-2+ rows.
     """
     import datetime as _dt
     engine, ws = _engine_and_ws()
     today_iso = _dt.date.today()
 
     with engine.begin() as conn:
-        effective_limit = limit if limit is not None else _read_send_pace(conn)
+        send_pace = _read_send_pace(conn)
+        effective_limit = limit if limit is not None else send_pace
 
         # Review item #14: filter snoozed drafts out of the read
         # path too -- if the operator snoozes a draft AFTER today's
@@ -721,6 +773,11 @@ def get_today(
             )
         }
 
+        # FR-4: materialize headroom so the envelope can carry a
+        # `next_drafts` preview. We aim for drafts + next_drafts
+        # = effective_limit + send_pace materialized rows.
+        target_materialize = effective_limit + send_pace
+
         # 1) Existing picks for today, with snoozes filtered out.
         # Branch on whether the FILTERED set has any rows -- if
         # the operator snoozed every persisted pick, we want to
@@ -734,7 +791,7 @@ def get_today(
             if r.draft_id not in active_snooze_ids
         ]
         if existing:
-            picks_rows = existing[:effective_limit]
+            picks_rows = existing[:target_materialize]
         else:
             # 2) Materialize today's picks from the reviewable queue
             #    ordered by send_now_priority DESC. Stage 7 normally
@@ -788,7 +845,7 @@ def get_today(
                     continue
                 seen.add(row.partner_id)
                 candidates.append(row)
-                if len(candidates) >= effective_limit:
+                if len(candidates) >= target_materialize:
                     break
             now = _dt.datetime.now(_dt.timezone.utc)
             from core.db import upsert as _upsert
@@ -815,13 +872,40 @@ def get_today(
                     .order_by(today_picks.c.rank)
                 )
                 if r.draft_id not in active_snooze_ids
-            ][:effective_limit]
+            ][:target_materialize]
+
+        # FR-4: total_remaining counts eligible drafts in the pool
+        # (reviewable, not superseded, not currently snoozed) so
+        # the frontend can show "X more in the pipeline". Computed
+        # fresh on every call -- this is the true pool size, not
+        # the materialized snapshot.
+        snoozed_subq_count = (
+            select(draft_snoozes.c.draft_id)
+            .where(draft_snoozes.c.snoozed_until > now_dt)
+        )
+        total_eligible_partners = conn.execute(
+            select(func.count(func.distinct(email_drafts.c.partner_id)))
+            .where(
+                email_drafts.c.approval_status.in_(
+                    list(REVIEWABLE_STATES)
+                ),
+                email_drafts.c.superseded_at.is_(None),
+                ~email_drafts.c.draft_id.in_(snoozed_subq_count),
+            )
+        ).scalar() or 0
 
         if not picks_rows:
-            return []
+            return TodayResponse(
+                date=today_iso.isoformat(),
+                send_pace=send_pace,
+                drafts=[],
+                next_drafts=[],
+                total_remaining=int(total_eligible_partners),
+            )
 
-        # Hydrate draft + partner_email + gate so the frontend renders
-        # the card without a second round-trip.
+        # Hydrate draft + partner_email + gate + last-snooze-on-
+        # file so the frontend renders the card without a second
+        # round-trip.
         partner_ids = [p.partner_id for p in picks_rows]
         draft_ids = [int(p.draft_id) for p in picks_rows if p.draft_id]
         drafts_by_id: dict[int, Any] = {
@@ -839,8 +923,21 @@ def get_today(
                 .where(partners.c.partner_id.in_(partner_ids))
             )
         }
+        # Snoozes by draft_id -- if a draft has been snoozed (even
+        # if the window already elapsed), surface the timestamp so
+        # the UI can show the history. Active snoozes wouldn't
+        # appear in picks_rows anyway (filtered above).
+        snoozes_by_draft = {
+            r.draft_id: r.snoozed_until
+            for r in conn.execute(
+                select(
+                    draft_snoozes.c.draft_id,
+                    draft_snoozes.c.snoozed_until,
+                ).where(draft_snoozes.c.draft_id.in_(draft_ids))
+            )
+        }
 
-    result: list[TodayPickView] = []
+    all_picks: list[TodayPickView] = []
     for p in picks_rows:
         d = drafts_by_id.get(int(p.draft_id)) if p.draft_id else None
         draft_view: DraftView | None = None
@@ -855,15 +952,36 @@ def get_today(
                 gate=_gate_to_dict(gate),
                 rationale=p.rationale,
             )
-        result.append(TodayPickView(
+        snoozed_until_ts = snoozes_by_draft.get(int(p.draft_id)) if p.draft_id else None
+        all_picks.append(TodayPickView(
             pick_date=str(p.pick_date),
             rank=int(p.rank),
             partner_id=str(p.partner_id),
             draft_id=int(p.draft_id) if p.draft_id else 0,
             rationale=p.rationale,
+            snoozed_until=(
+                snoozed_until_ts.isoformat()
+                if snoozed_until_ts else None
+            ),
+            # FR-4: touch 1 (initial outreach) is sourced from
+            # email_drafts and has no follow-up context. Touch 2+
+            # follow-ups (FR-5) will populate this field.
+            follow_up=None,
             draft=draft_view,
         ))
-    return result
+
+    drafts_now = all_picks[:effective_limit]
+    drafts_next = all_picks[effective_limit:effective_limit + send_pace]
+    total_remaining = max(
+        0, int(total_eligible_partners) - len(drafts_now),
+    )
+    return TodayResponse(
+        date=today_iso.isoformat(),
+        send_pace=send_pace,
+        drafts=drafts_now,
+        next_drafts=drafts_next,
+        total_remaining=total_remaining,
+    )
 
 
 @app.get(
