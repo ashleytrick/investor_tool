@@ -43,13 +43,13 @@ This is built around the opposite stance:
 The full capability surface, grouped. Skip to the parts that matter to you.
 
 **Discovery & enrichment**
-- Multi-source ingest: OpenVC, Apollo, CSV upload, RSS, funding-announcement feeds
-- LLM fund enrichment (thesis, sectors, stage focus, check-size, current partners) via Firecrawl-scraped homepage / portfolio / team / thesis pages
+- Multi-source ingest: OpenVC exports, Apollo email lists, CSV / XLSX upload, RSS, funding-announcement feeds
+- LLM fund enrichment (thesis, sectors, stage focus, check-size, current partners) via HTTP scraping of a fixed set of fund pages (homepage / `/portfolio` / `/team` / `/about` / `/thesis` / `/news`). Sitemap-driven discovery is future work.
 - Per-partner signal harvesting from LinkedIn, podcasts, blogs
 - Live re-verification of every cited signal before it counts
-- Deal attribution links funding announcements back to funds + partners
+- Deal attribution links funding announcements back to funds + partners (ambiguous-attribution review queue + confidence scoring)
 - Provisional-fund handling for incomplete domains (DNC'd until claimed)
-- QR-based capture with LinkedIn-URL dedup
+- QR-based capture with LinkedIn-URL dedup + collision handling
 
 **Scoring**
 - Composite thesis fit (LLM)
@@ -60,10 +60,9 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 
 **Drafting & QA**
 - LLM email generation per partner with two variants
-- Six strategy frameworks scored for eligibility per-partner
+- Six strategy frameworks scored for eligibility per-partner (`signal_led`, `portfolio_led`, `round_pattern_led`, `market_shift_led`, `contrarian_thesis_led`, `traction_led`)
 - Batch QA: pairwise similarity, template-smell distribution, hard / soft gates
-- Operator-voice mirroring from uploaded samples
-- Stale-after-approval state machine when underlying evidence shifts
+- Stale-after-approval state machine when underlying evidence shifts (partner email changed, DNC set, relationship advanced, score moved)
 
 **The Today queue**
 - Stable per-day ranked batch
@@ -89,9 +88,10 @@ The full capability surface, grouped. Skip to the parts that matter to you.
 - First reply auto-stops the sequence (configurable)
 
 **Meeting prep**
-- Auto-dossier on substantive reply or meeting booked
-- Firm snapshot, fit framing, likely objections
-- Pushed to operator's Google Drive as a Google Doc
+- Auto-dossier when a partner moves to `replied` / `interested` / `meeting_booked`
+- One unified brief: firm snapshot, fit framing, likely objections, Q&A prep, suggested next-step ask
+- Pushed to operator's Google Drive as a Google Doc; idempotent (skips upload if the same signal-set hash has already been pushed)
+- Caching keyed on the partner's signal hash so re-running is free until something material changes
 
 **CRM (optional Attio)**
 - Outbound push of partners, scores, outreach status (Stage 8)
