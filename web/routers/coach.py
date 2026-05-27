@@ -40,9 +40,12 @@ from core.approval.persistence import REVIEWABLE_STATES
 from core.db import (
     draft_snoozes,
     email_drafts,
+    follow_up_drafts,
+    outreach_events,
     partner_pipeline,
     partner_score_summaries,
     partners,
+    sequences,
     today_picks,
     upsert,
     workspace_settings,
@@ -160,15 +163,28 @@ class TodayPickView(BaseModel):
 
 
 class TodayResponse(BaseModel):
-    """FR-4 envelope wrapping today's picks. Replaces the legacy
-    `list[TodayPickView]` shape so the frontend can render the
-    daily batch + a "next up" preview + a remaining-count badge
-    without round-tripping."""
+    """FR-4 envelope wrapping today's picks.
+
+    Send-pace semantics: `send_pace` is a HARD daily cap on NEW
+    outreach. As the operator sends, `sent_today` counts up and
+    `drafts` shrinks (the cap effectively closes the queue when
+    they hit it). Follow-ups don't count against this cap and
+    they roll over -- a follow-up that wasn't acted on yesterday
+    appears today, every day, until handled or auto-stopped.
+    """
     date: str  # ISO date YYYY-MM-DD
-    send_pace: int  # operator's configured daily pace
-    drafts: list[TodayPickView]  # the batch to work on now (<= effective_limit)
-    next_drafts: list[TodayPickView]  # preview of the next batch
-    total_remaining: int  # eligible drafts not yet shown in `drafts`
+    send_pace: int  # operator's configured daily cap on NEW outreach
+    # FR-4c: how many NEW-outreach drafts the operator has already
+    # sent today (counted from outreach_events). UI reads this +
+    # send_pace to render "you've used X/Y of today's pace".
+    sent_today: int
+    drafts: list[TodayPickView]  # NEW outreach, capped at (send_pace - sent_today)
+    # FR-4c: pending follow-up touches. No cap; rolls over daily
+    # until the operator acts on each. Empty until FR-5's daily
+    # build job populates follow_up_drafts.
+    follow_ups: list[TodayPickView]
+    next_drafts: list[TodayPickView]  # preview of NEW outreach beyond the cap
+    total_remaining: int  # eligible NEW outreach not yet shown in `drafts`
 
 
 class SendPaceBody(BaseModel):
@@ -284,6 +300,92 @@ def _parse_future_iso(value: str):
     return utc_aware.replace(tzinfo=None)
 
 
+def _load_follow_ups(conn, *, ws, engine) -> list[TodayPickView]:
+    """FR-4c: list all pending follow-up touches as TodayPickView
+    rows with `follow_up` populated. No cap; rolls over daily
+    until handled or the sequence is stopped.
+
+    Touches with `next_touch_due_at` in the future are not shown
+    (the operator hasn't reached the gap yet). NULL `next_touch_due_at`
+    is treated as "due now" so the daily build job (FR-5) doesn't
+    need to stamp dates synchronously.
+
+    Currently `follow_up_drafts` is empty in production -- FR-5
+    populates it. The shape is here for forward compatibility so
+    the frontend can render follow-up cards the moment FR-5 ships.
+    """
+    now_naive = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    rows = list(conn.execute(
+        select(
+            follow_up_drafts.c.follow_up_id,
+            follow_up_drafts.c.sequence_id,
+            follow_up_drafts.c.touch_number,
+            follow_up_drafts.c.angle,
+            follow_up_drafts.c.why_now,
+            follow_up_drafts.c.subject,
+            follow_up_drafts.c.body,
+            follow_up_drafts.c.created_at,
+            sequences.c.partner_id,
+            sequences.c.thread_id,
+            sequences.c.next_touch_due_at,
+        )
+        .select_from(
+            follow_up_drafts.join(
+                sequences,
+                sequences.c.sequence_id == follow_up_drafts.c.sequence_id,
+            )
+        )
+        .where(
+            follow_up_drafts.c.status == "draft",
+            sequences.c.state == "active",
+        )
+    ))
+    if not rows:
+        return []
+    # Read cadence max_touches once so we don't re-query per row.
+    from core.db import cadence_settings as _cadence_settings
+    max_touches = 4
+    cad_row = conn.execute(
+        select(_cadence_settings.c.max_touches)
+        .where(_cadence_settings.c.key == "default")
+    ).first()
+    if cad_row and cad_row.max_touches:
+        max_touches = int(cad_row.max_touches)
+    out: list[TodayPickView] = []
+    for r in rows:
+        # Days since the previous touch (rough proxy: created_at).
+        days_since = 0
+        if r.created_at:
+            delta = now_naive - r.created_at
+            days_since = max(0, int(delta.total_seconds() // 86400))
+        out.append(TodayPickView(
+            pick_date=str(_dt.date.today()),
+            rank=int(r.touch_number),
+            partner_id=str(r.partner_id),
+            # Negative draft_id sentinel so the frontend can
+            # distinguish follow-up entries from email_drafts ids
+            # without changing the schema. Real follow-up routing
+            # uses `follow_up.sequence_id` + touch_number.
+            draft_id=-int(r.follow_up_id),
+            rationale=r.why_now,
+            snoozed_until=None,
+            follow_up=FollowUpContext(
+                touch_number=int(r.touch_number),
+                max_touches=max_touches,
+                days_since_last_touch=days_since,
+                angle=r.angle,
+                why_now=r.why_now,
+                thread_preview=None,
+                thread_sent_at=None,
+                sequence_id=r.sequence_id,
+            ),
+            # Stage 7 follow-up body, raw -- no DraftView gate
+            # check (gates apply to initial outreach).
+            draft=None,
+        ))
+    return out
+
+
 router = APIRouter(tags=["coach"])
 
 
@@ -298,29 +400,66 @@ def get_today(
     limit: int | None = Query(
         None, ge=1, le=_SEND_PACE_MAX,
         description=(
-            "Optional batch size for `drafts`. Defaults to the "
-            "workspace's `send_pace` setting (1..20)."
+            "Optional cap on `drafts` size for a single call. "
+            "Defaults to (send_pace - sent_today). Cannot exceed "
+            "the remaining daily pace."
         ),
     ),
     _auth: None = Depends(require_auth),
 ) -> TodayResponse:
-    """FR-4 envelope: `{date, send_pace, drafts, next_drafts,
-    total_remaining}`. `drafts` is the batch to work on now,
-    `next_drafts` previews what's coming, `total_remaining`
-    counts eligible partners not yet in `drafts` so a "X more
-    in the pipeline" badge stays honest.
+    """FR-4c: `send_pace` is a HARD daily cap on NEW outreach.
 
-    Materialization aims for `effective_limit + send_pace` rows
-    so headroom is reserved for the preview without a second
-    query. Follow-up touches (touch 2+) will populate the
-    per-pick `follow_up` field once FR-5's daily build job lands.
+    The operator sets a daily budget (e.g. 10 new outreach / day).
+    As they send through the day, `sent_today` counts up and the
+    `drafts` array shrinks. When they hit the cap, `drafts` is
+    empty -- no more NEW work for today. Tomorrow it resets.
+
+    Follow-ups don't count against the cap and they roll over: a
+    follow-up that wasn't acted on yesterday appears today, every
+    day, until handled or the sequence is stopped. They live in
+    a separate `follow_ups` array so the UI can render them
+    distinctly from new outreach.
+
+    `next_drafts` previews the next chunk of NEW outreach beyond
+    today's cap so the operator can see what's queued up for
+    tomorrow.
     """
     engine, ws = _engine_and_ws()
     today_iso = _dt.date.today()
 
     with engine.begin() as conn:
         send_pace = _read_send_pace(conn)
-        effective_limit = limit if limit is not None else send_pace
+
+        # FR-4c: count today's NEW-outreach sends so we can apply
+        # the hard daily cap. `outreach_events.draft_id` currently
+        # only points at email_drafts rows (touch 1); when FR-5
+        # adds follow-up-draft sends, this needs to learn to only
+        # count touch-1 sends.
+        today_start_utc = _dt.datetime.combine(
+            today_iso, _dt.time.min, tzinfo=_dt.timezone.utc,
+        ).replace(tzinfo=None)
+        sent_today = conn.execute(
+            select(func.count()).select_from(outreach_events)
+            .where(
+                outreach_events.c.source == "gmail",
+                outreach_events.c.event_type == "sent",
+                outreach_events.c.occurred_at >= today_start_utc,
+                outreach_events.c.draft_id.is_not(None),
+            )
+        ).scalar() or 0
+        sent_today = int(sent_today)
+
+        remaining_pace = max(0, send_pace - sent_today)
+        # `limit` query param can only LOWER the cap, never raise
+        # it above today's remaining pace. Once the operator has
+        # hit send_pace, no value of `limit` gets them more.
+        if limit is not None:
+            effective_limit = min(limit, remaining_pace)
+        else:
+            effective_limit = remaining_pace
+        # Materialize enough headroom for drafts + the next-batch
+        # preview. Preview is a full send_pace beyond the cap so
+        # the operator sees tomorrow's queue.
         target_materialize = effective_limit + send_pace
 
         now_dt = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
@@ -421,11 +560,19 @@ def get_today(
             )
         ).scalar() or 0
 
+        # FR-4c: load pending follow-up touches. No cap (rolls
+        # over until handled). Currently `follow_up_drafts` is
+        # empty in production -- FR-5's daily build job will fill
+        # it. The shape is here for forward compatibility.
+        follow_ups_list = _load_follow_ups(conn, ws=ws, engine=engine)
+
         if not picks_rows:
             return TodayResponse(
                 date=today_iso.isoformat(),
                 send_pace=send_pace,
+                sent_today=sent_today,
                 drafts=[],
+                follow_ups=follow_ups_list,
                 next_drafts=[],
                 total_remaining=int(total_eligible_partners),
             )
@@ -505,7 +652,9 @@ def get_today(
     return TodayResponse(
         date=today_iso.isoformat(),
         send_pace=send_pace,
+        sent_today=sent_today,
         drafts=drafts_now,
+        follow_ups=follow_ups_list,
         next_drafts=drafts_next,
         total_remaining=total_remaining,
     )
