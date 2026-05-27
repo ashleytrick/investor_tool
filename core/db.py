@@ -1356,7 +1356,19 @@ def get_engine(db_url: str) -> Engine:
 
 
 def _sync_columns_with_metadata(engine: Engine) -> None:
-    """SQLite: ADD COLUMN for any metadata column that is missing on disk."""
+    """SQLite: ADD COLUMN for any metadata column that is missing on disk.
+
+    Audit-review fix: emit a DEFAULT clause when the SQLAlchemy
+    column declares a scalar default. SQLite's `ALTER TABLE ADD
+    COLUMN ... DEFAULT <literal>` adds the column AND backfills
+    existing rows with that literal -- without it, every legacy
+    row got NULL and the SQLAlchemy Python-side default only
+    applied to NEW inserts. (Pre-fix, outreach_events.channel
+    column existed but every Gmail-poll row written before this
+    PR had channel=NULL, so the mark_draft_sent dedup path's
+    `existing_event.channel or 'linkedin'` fallback returned
+    'linkedin' for legacy gmail sends -- wrong.)
+    """
     for table in metadata.sorted_tables:
         with engine.begin() as conn:
             existing = {
@@ -1367,9 +1379,40 @@ def _sync_columns_with_metadata(engine: Engine) -> None:
             for col in table.columns:
                 if col.name not in existing:
                     sql_type = col.type.compile(dialect=engine.dialect)
+                    default_clause = _ddl_default_clause(col)
                     conn.exec_driver_sql(
-                        f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sql_type}"
+                        f"ALTER TABLE {table.name} ADD COLUMN "
+                        f"{col.name} {sql_type}{default_clause}"
                     )
+
+
+def _ddl_default_clause(col) -> str:
+    """Render a `DEFAULT <literal>` SQL fragment from a SQLAlchemy
+    Column's scalar default, or '' when there's nothing to emit.
+
+    Only handles scalar defaults (string / number / bool); callable
+    defaults (e.g. `datetime.now`) are skipped because SQLite has
+    no portable way to evaluate them at ALTER time. The schema's
+    `created_at` / `updated_at` fields use callable defaults at the
+    application layer; nothing else relies on those being applied
+    at the DB level.
+    """
+    d = getattr(col, "default", None)
+    if d is None:
+        return ""
+    arg = getattr(d, "arg", None)
+    if callable(arg):
+        return ""
+    if arg is None:
+        return ""
+    if isinstance(arg, bool):
+        return f" DEFAULT {1 if arg else 0}"
+    if isinstance(arg, (int, float)):
+        return f" DEFAULT {arg}"
+    if isinstance(arg, str):
+        escaped = arg.replace("'", "''")
+        return f" DEFAULT '{escaped}'"
+    return ""
 
 
 def upsert(conn, table: Table, pk_cols: list[str], values: dict) -> None:
