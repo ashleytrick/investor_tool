@@ -92,12 +92,17 @@ class PollGmailRepliesResult(BaseModel):
 class ReconcileItem(BaseModel):
     workspace: str
     unread_replies: int
+    # FR-4b: sequences this pass auto-stopped on reply (gated by
+    # cadence_settings.auto_stop_on_reply).
+    sequences_stopped: int = 0
     error: str | None = None
 
 
 class ReconcileDraftsResult(BaseModel):
     polled: int
     total_unread_replies: int
+    # FR-4b: cross-tenant rollup of auto-stops triggered this pass.
+    total_sequences_stopped: int = 0
     results: list[ReconcileItem]
 
 
@@ -285,6 +290,7 @@ def hook_reconcile_drafts(
     )
     results: list[ReconcileItem] = []
     total = 0
+    total_stopped = 0
     for ws_dir in _iter_tenants_for_hook():
         try:
             ws = _load_workspace(str(ws_dir))
@@ -299,12 +305,15 @@ def hook_reconcile_drafts(
         results.append(ReconcileItem(
             workspace=r.workspace,
             unread_replies=r.unread_replies,
+            sequences_stopped=r.sequences_stopped,
             error=r.error,
         ))
         total += r.unread_replies
+        total_stopped += r.sequences_stopped
     return ReconcileDraftsResult(
         polled=len(results),
         total_unread_replies=total,
+        total_sequences_stopped=total_stopped,
         results=results,
     )
 
