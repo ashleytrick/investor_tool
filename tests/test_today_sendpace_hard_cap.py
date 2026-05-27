@@ -242,6 +242,27 @@ def test_follow_ups_roll_over_uncapped(
     assert fu["follow_up"]["sequence_id"] == seq_id
     assert fu["follow_up"]["angle"] == "new_signal"
     assert fu["follow_up"]["days_since_last_touch"] == 3
+    # Audit-review fix #8: follow-up picks carry kind='follow_up'
+    # + follow_up_id set + draft_id=None. Pre-fix the sentinel
+    # was draft_id=-follow_up_id, which collided with positive
+    # email_drafts.draft_id when the frontend forwarded blindly.
+    assert fu["kind"] == "follow_up"
+    assert fu["draft_id"] is None
+    assert fu["follow_up_id"] is not None and fu["follow_up_id"] > 0
+
+
+def test_outreach_picks_have_kind_outreach(client) -> None:
+    """Audit-review fix #8: outreach picks (`drafts` array)
+    carry kind='outreach' + draft_id set + follow_up_id=None."""
+    body = client.get("/today", headers=_auth()).json()
+    if not body["drafts"]:
+        pytest.skip("no drafts in fixture")
+    for pick in body["drafts"]:
+        assert pick["kind"] == "outreach", (
+            f"outreach pick must have kind='outreach'; got {pick['kind']!r}"
+        )
+        assert pick["follow_up_id"] is None
+        assert pick["draft_id"] is not None and pick["draft_id"] > 0
 
 
 def test_follow_ups_respect_next_touch_due_at_in_the_future(
