@@ -700,6 +700,7 @@ def mark_draft_sent(
         event_id = int(result.inserted_primary_key[0])
 
     from core.approval.state_machine import STATE_SENT
+    from core.db import draft_approvals
     current_status = draft_row.approval_status
     if current_status != STATE_SENT:
         if current_status == "approved_to_send":
@@ -708,10 +709,32 @@ def mark_draft_sent(
                 actor="ui:mark_sent", notes=f"channel={channel}",
             )
         else:
-            # Bypass the state-machine table for unusual starting
-            # states (operator marked sent without going through
-            # approval first). Stamp the state directly.
+            # Audit-review fix #9: stamp the state directly AND
+            # write a draft_approvals audit row. Pre-fix, the
+            # bypass for non-approved starting states (needs_review,
+            # rejected, stale_after_approval) skipped the audit
+            # write entirely -- the 'sent' transition vanished from
+            # draft_approvals.list_events(draft_id), breaking
+            # provenance.
             with engine.begin() as conn:
+                draft_hash = conn.execute(
+                    select(email_drafts.c.draft_hash).where(
+                        email_drafts.c.draft_id == draft_id,
+                    )
+                ).scalar()
+                conn.execute(draft_approvals.insert().values(
+                    draft_id=draft_id,
+                    partner_id=partner_id,
+                    event_type=STATE_SENT,
+                    actor="ui:mark_sent",
+                    at=now,
+                    draft_hash=draft_hash,
+                    notes=(
+                        f"channel={channel}; "
+                        f"bypassed_state_machine_from={current_status}"
+                    ),
+                    overridden_blockers=None,
+                ))
                 conn.execute(
                     email_drafts.update()
                     .where(email_drafts.c.draft_id == draft_id)
@@ -786,13 +809,33 @@ def clear_draft_sent(
             )
         )
         if draft_row.approval_status == STATE_SENT:
+            # Audit-review fix #10: record the AT-SEND hash, not
+            # the current email_drafts.draft_hash. If the body was
+            # edited between mark-sent and clear-sent, the current
+            # hash differs from the body that actually went out.
+            # The most-recent STATE_SENT draft_approvals row (or
+            # equivalently the mark_sent transition recorded by
+            # core.approval.persistence.mark_sent) carries the
+            # at-send hash; fall back to the current hash only if
+            # no sent-event audit row exists (shouldn't happen
+            # post-#9 fix but keeps the path graceful).
+            sent_audit = conn.execute(
+                select(draft_approvals.c.draft_hash).where(
+                    draft_approvals.c.draft_id == draft_id,
+                    draft_approvals.c.event_type == STATE_SENT,
+                ).order_by(desc(draft_approvals.c.at))
+            ).first()
+            at_send_hash = (
+                sent_audit.draft_hash if sent_audit
+                else draft_row.draft_hash
+            )
             conn.execute(draft_approvals.insert().values(
                 draft_id=draft_id,
                 partner_id=draft_row.partner_id,
                 event_type=STATE_APPROVED_TO_SEND,
                 actor="ui:clear_sent",
                 at=_dt.datetime.now(_dt.timezone.utc),
-                draft_hash=draft_row.draft_hash,
+                draft_hash=at_send_hash,
                 notes="operator reverted manual mark-sent (FR-7)",
                 overridden_blockers=None,
             ))
