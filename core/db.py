@@ -982,6 +982,26 @@ workspace_settings = Table(
 )
 
 
+# Operator email samples used as voice anchors at draft-generation
+# time. Stage 7's prompt injects up to N most-recent samples into
+# the {OPERATOR_VOICE_SAMPLES} block so the LLM mirrors the
+# operator's actual cadence / sentence-length / signoff style
+# (vs. the per-strategy template anchors in {EXAMPLES_BLOCK} which
+# are about which OPENING pattern fits the partner).
+email_samples = Table(
+    "email_samples", metadata,
+    Column("sample_id", Integer, primary_key=True, autoincrement=True),
+    # Optional context: what was this email about? Helps the
+    # operator audit their own corpus from the UI; not used by
+    # the prompt today.
+    Column("subject", Text),
+    Column("body", Text, nullable=False),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+    Index("ix_email_samples_created_at", "created_at"),
+)
+
+
 # B2 (Coach Sent/Replies/Bounced): the canonical log of outreach
 # touchpoints we observe via integrations. Each row is one event we
 # saw -- a Gmail send confirmation, an Attio activity, an in-app

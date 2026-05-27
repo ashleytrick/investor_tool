@@ -173,7 +173,7 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
                       composite_score, round_fit_score, round_fit_reasoning,
                       lead_likelihood_score, axes_summary, fund_kill_signals,
                       signals_for_partner, deals_for_partner,
-                      examples_dir) -> str:
+                      examples_dir, operator_voice_samples="") -> str:
     """Thin wrapper: reads the prompt template from PROMPT_PATH and
     forwards everything else to core.email.prompt.build_live_prompt
     so that function stays pure (no side-effecting file reads) and is
@@ -193,6 +193,7 @@ def build_live_prompt(*, company_cfg, partner_name, fund_name, partner_bio,
         signals_for_partner=signals_for_partner,
         deals_for_partner=deals_for_partner,
         examples_dir=examples_dir,
+        operator_voice_samples=operator_voice_samples,
     )
 
 
@@ -358,6 +359,11 @@ def main() -> int:
         policy = WorkspacePolicy.from_workspace_and_args(ws, args)
         batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         banned = (ws.company.get("founder_voice") or {}).get("banned_phrases", []) or []
+        # Load the operator's uploaded email samples ONCE per stage
+        # run so we don't requery per-partner. Returns "" when the
+        # operator hasn't uploaded anything.
+        from web.routers.email_samples import load_voice_samples_for_prompt
+        voice_samples_block = load_voice_samples_for_prompt(engine)
         target_sectors = {
             s.lower()
             for s in (ws.company.get("company") or {}).get("target_sectors", []) or []
@@ -649,6 +655,7 @@ def main() -> int:
                         signals_for_partner=p_signals,
                         deals_for_partner=p_deals,
                         examples_dir=ws.examples_dir,
+                        operator_voice_samples=voice_samples_block,
                     )
                     output: EmailOutput = llm.complete_json(
                         prompt=prompt,
