@@ -82,12 +82,19 @@ def build_live_prompt(
     signals_for_partner: list[dict],
     deals_for_partner: list[dict],
     examples_dir,
+    operator_voice_samples: str = "",
 ) -> str:
     """Fill every placeholder in the operator's prompt template.
 
     `prompt_template` is the raw string Stage 7 read from
     prompts/generate_email.txt. Taking it as an argument (rather than
     re-reading the file here) keeps this function pure for testing.
+
+    `operator_voice_samples` is the pre-formatted block from
+    `web.routers.email_samples.load_voice_samples_for_prompt`. Empty
+    string when the operator hasn't uploaded anything; the prompt
+    template handles that gracefully by falling back to the
+    `founder_voice.style` hint.
     """
     c = company_cfg["company"]
     rc = company_cfg["raise_context"]
@@ -162,6 +169,16 @@ def build_live_prompt(
                 "banned_phrases", [],
             )
         ))
+        # Operator-uploaded voice samples (separate from the
+        # per-strategy template anchors in EXAMPLES_BLOCK). Empty
+        # when the operator hasn't uploaded; the template still
+        # has the {FOUNDER_VOICE_STYLE} hint as a fallback.
+        .replace(
+            "{OPERATOR_VOICE_SAMPLES}",
+            operator_voice_samples
+            or "(no operator-uploaded samples yet; "
+               "mirror the style hint above)",
+        )
         # Inject the actual file contents AND keep the legacy
         # {EXAMPLES_DIR} token for backward-compatibility with any
         # custom prompts that still reference the directory path.
