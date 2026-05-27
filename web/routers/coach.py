@@ -144,20 +144,37 @@ class FollowUpContext(BaseModel):
 
 
 class TodayPickView(BaseModel):
-    """One pick on the daily Today queue. After FR-4 the same
-    shape carries both initial outreach (`follow_up is None`) and
-    follow-up touches (`follow_up` populated)."""
+    """One pick on the daily Today queue. The same shape carries
+    both initial outreach (`kind='outreach'`, `draft_id` set) and
+    follow-up touches (`kind='follow_up'`, `follow_up_id` set).
+
+    Audit-review fix: replaced the negative-draft_id sentinel
+    (pre-fix `draft_id = -follow_up_id` for follow-ups) with an
+    explicit `kind` discriminator. The frontend MUST route based
+    on `kind`; never assume draft_id is non-null on a follow-up
+    pick.
+    """
     pick_date: str  # ISO date (YYYY-MM-DD)
     rank: int
     partner_id: str
-    draft_id: int
+    # 'outreach' for email_drafts-backed touch-1 picks; 'follow_up'
+    # for follow_up_drafts-backed touch-2+ picks.
+    kind: str
+    # Set when kind='outreach', NULL for follow-ups. Frontend
+    # endpoints like /drafts/{id}/snooze and /drafts/{id}/mark-sent
+    # are only valid when draft_id is non-null.
+    draft_id: int | None = None
+    # Set when kind='follow_up', NULL for outreach. Future
+    # follow-up-snooze / follow-up-mark-sent endpoints would key
+    # on this.
+    follow_up_id: int | None = None
     rationale: str | None = None
     # FR-4: most-recent snooze on file; None if never snoozed.
     # Active snoozes still filter the pick out entirely; this
     # field is for UI history hints ("previously snoozed until X").
     snoozed_until: str | None = None
-    # FR-4: populated for follow-up touches; None for initial
-    # outreach. See FollowUpContext.
+    # FR-4: populated for kind='follow_up'; None for outreach.
+    # See FollowUpContext.
     follow_up: FollowUpContext | None = None
     draft: DraftView | None = None
 
@@ -373,11 +390,14 @@ def _load_follow_ups(conn, *, ws, engine) -> list[TodayPickView]:
             pick_date=str(_dt.date.today()),
             rank=int(r.touch_number),
             partner_id=str(r.partner_id),
-            # Negative draft_id sentinel so the frontend can
-            # distinguish follow-up entries from email_drafts ids
-            # without changing the schema. Real follow-up routing
-            # uses `follow_up.sequence_id` + touch_number.
-            draft_id=-int(r.follow_up_id),
+            kind="follow_up",
+            # Audit-review fix: dropped the negative-draft_id
+            # sentinel. Follow-up picks carry follow_up_id
+            # explicitly and leave draft_id None; the frontend
+            # routes via `kind`. Real follow-up routing also has
+            # `follow_up.sequence_id` + touch_number available.
+            draft_id=None,
+            follow_up_id=int(r.follow_up_id),
             rationale=r.why_now,
             snoozed_until=None,
             follow_up=FollowUpContext(
@@ -643,14 +663,17 @@ def get_today(
             pick_date=str(p.pick_date),
             rank=int(p.rank),
             partner_id=str(p.partner_id),
-            draft_id=int(p.draft_id) if p.draft_id else 0,
+            kind="outreach",
+            draft_id=int(p.draft_id) if p.draft_id else None,
+            follow_up_id=None,
             rationale=p.rationale,
             snoozed_until=(
                 snoozed_until_ts.isoformat()
                 if snoozed_until_ts else None
             ),
-            # FR-4: touch 1 has no follow-up context. FR-5 will
-            # populate this for touch 2+ entries.
+            # Touch 1 has no follow-up context. FR-5 emits touch
+            # 2+ via follow_up_drafts which surfaces in
+            # `follow_ups`, never in `drafts`.
             follow_up=None,
             draft=(draft_view.model_dump() if draft_view else None),
         ))
