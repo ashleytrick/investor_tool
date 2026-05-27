@@ -1,10 +1,11 @@
 """Cron-hook router (refactor item #16).
 
-All 9 cron-triggered polling hooks live here:
+All 10 cron-triggered polling/build hooks live here:
 
   POST /api/public/hooks/poll-gmail-sent       (B2, 10min)
   POST /api/public/hooks/poll-gmail-replies    (B3, 10min)
   POST /api/public/hooks/reconcile-drafts      (B3, 30min)
+  POST /api/public/hooks/build-follow-ups      (FR-5, 1x/day @ 06:00)
   POST /api/public/hooks/poll-crm-activity     (B6, 15min)
   POST /api/public/hooks/poll-crm-pipeline     (B6, 30min)
   POST /api/public/hooks/poll-crm-investors    (B7, 6h)
@@ -104,6 +105,22 @@ class ReconcileDraftsResult(BaseModel):
     # FR-4b: cross-tenant rollup of auto-stops triggered this pass.
     total_sequences_stopped: int = 0
     results: list[ReconcileItem]
+
+
+# FR-5: follow-up draft generation hook output.
+class FollowUpBuildItem(BaseModel):
+    workspace: str
+    generated: int
+    skipped_done: int
+    skipped_existing: int
+    skipped_no_cadence: int
+    errors: list[str] = []
+
+
+class FollowUpBuildResult(BaseModel):
+    polled: int
+    total_generated: int
+    results: list[FollowUpBuildItem]
 
 
 class CRMPollProviderResult(BaseModel):
@@ -314,6 +331,62 @@ def hook_reconcile_drafts(
         polled=len(results),
         total_unread_replies=total,
         total_sequences_stopped=total_stopped,
+        results=results,
+    )
+
+
+@router.post(
+    "/api/public/hooks/build-follow-ups",
+    response_model=FollowUpBuildResult,
+    summary=(
+        "FR-5: daily LLM follow-up draft generation. Walks every "
+        "active sequence with elapsed next_touch_due_at and writes "
+        "a follow_up_drafts row (status='draft') for the Today "
+        "queue's `follow_ups` array."
+    ),
+)
+def hook_build_follow_ups(
+    _hook: None = Depends(_hook_secret_required),
+) -> FollowUpBuildResult:
+    from core.config_loader import load_workspace as _load_workspace
+    from core.followup_builder import (
+        build_follow_ups_for_workspace as _build,
+    )
+    results: list[FollowUpBuildItem] = []
+    total_generated = 0
+    for ws_dir in _iter_tenants_for_hook():
+        try:
+            ws = _load_workspace(str(ws_dir))
+        except Exception as exc:  # noqa: BLE001
+            results.append(FollowUpBuildItem(
+                workspace=str(ws_dir),
+                generated=0, skipped_done=0,
+                skipped_existing=0, skipped_no_cadence=0,
+                errors=[f"load_workspace_failed: {exc}"],
+            ))
+            continue
+        try:
+            r = _build(ws)
+        except Exception as exc:  # noqa: BLE001
+            results.append(FollowUpBuildItem(
+                workspace=str(ws_dir),
+                generated=0, skipped_done=0,
+                skipped_existing=0, skipped_no_cadence=0,
+                errors=[f"build_failed: {exc}"],
+            ))
+            continue
+        results.append(FollowUpBuildItem(
+            workspace=r.workspace,
+            generated=r.generated,
+            skipped_done=r.skipped_done,
+            skipped_existing=r.skipped_existing,
+            skipped_no_cadence=r.skipped_no_cadence,
+            errors=list(r.errors),
+        ))
+        total_generated += r.generated
+    return FollowUpBuildResult(
+        polled=len(results),
+        total_generated=total_generated,
         results=results,
     )
 

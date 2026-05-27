@@ -1,0 +1,48 @@
+You are drafting a FOLLOW-UP outreach email from {FOUNDER_NAME}, founder of {COMPANY_NAME}, to {PARTNER_NAME} at {FUND_NAME}.
+
+This is touch number {TOUCH_NUMBER} of at most {MAX_TOUCHES}. The previous touch went out {DAYS_SINCE_LAST_TOUCH} day(s) ago. They did not respond. The angle for this touch is: **{ANGLE}**.
+
+Previous touch (for context — do NOT repeat its hook, its phrasing, or its signal):
+Subject: {PREVIOUS_SUBJECT}
+Body:
+{PREVIOUS_BODY}
+
+Raise context:
+- Round: {ROUND}
+- Amount: {RAISE_AMOUNT}
+- Status: {RAISE_STATUS}
+- Why this round is fundable now: {WHY_THIS_ROUND_IS_FUNDABLE_NOW}
+
+Founder voice:
+- Style: {FOUNDER_VOICE_STYLE}
+- Banned phrases: {FOUNDER_BANNED_PHRASES}
+
+ANGLE-SPECIFIC INSTRUCTIONS:
+
+- **new_signal**: open with a piece of news that arrived in the {DAYS_SINCE_LAST_TOUCH} days since the first touch — a fresh deal in adjacent space, a customer signing, a metric ticking up. The signal MUST be new; do not re-use anything from the previous touch.
+
+- **specific_ask**: direct, no preamble. "Following up on my note from {DAYS_SINCE_LAST_TOUCH} days ago. Do you have 15 minutes Tuesday or Wednesday?" Cite ONE additional concrete reason this partner is the right person.
+
+- **soft_check_in**: light touch. "Wanted to make sure my last email didn't get buried." Two sentences max. Re-state the meeting ask but more casually. Do not introduce new content.
+
+- **graceful_close**: this is the LAST touch. Acknowledge they're busy. "Last note from me on this — happy to circle back next quarter if timing's wrong now." No ask. Leave the door open.
+
+- **custom**: the operator passed a custom prompt. Follow these instructions: {CUSTOM_PROMPT}
+
+UNIVERSAL RULES:
+
+Body: 3 sentences maximum (4 for new_signal). One personalization signal only. Do not re-use the signal from the previous touch.
+
+Subject line: leave empty — follow-ups should thread into the original conversation, not start a new subject thread. The frontend will detect empty subject and reply-thread.
+
+Forbidden phrases: "just following up", "bumping this up", "circling back", "checking in" (in those exact words), "I hope this finds you well", "wanted to reach out", plus anything in {FOUNDER_BANNED_PHRASES}. No em dashes. No exclamation marks. The opener must NOT start with "Just" or "Hey again".
+
+A graceful_close touch is allowed to say "circle back next quarter" once, since it's the closing-the-door phrasing.
+
+Return JSON with this shape:
+{
+  "subject": "",  // always empty for follow-ups (threading)
+  "body": "...",  // the follow-up message body
+  "rationale": "...",  // one sentence on why this touch + angle should land
+  "preempted_objection": null  // follow-ups don't typically preempt objections; leave null unless angle=specific_ask
+}
