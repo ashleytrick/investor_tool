@@ -7,43 +7,94 @@ on:
 
 jobs:
   smoke:
+    # Test sharding via pytest-split: 8 GHA jobs run in parallel,
+    # each handling 1/8 of the suite. Wall-clock = max(shard) rather
+    # than sum(all), so a 7min serial run becomes ~1min parallel.
+    #
+    # Each shard runs on its own ubuntu-latest (2 vCPU). Total billed
+    # minutes go up vs serial (8 jobs * ~1min vs 1 job * 7min ≈ +14%
+    # compute) but PR feedback is ~7x faster. Diminishing returns
+    # past 8 shards because the per-shard fixture build + uv install
+    # overhead starts to dominate vs the actual test time.
+    #
+    # Upgrade to ubuntu-latest-4-core (paid larger runner) if the
+    # per-shard 2-core runner becomes the bottleneck.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    name: smoke (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
-    # Suite runs in ~3-4 min on GHA's 2-core runner with xdist -n auto;
-    # 15 still gives headroom for cold cache + the e2e tests that
-    # subprocess-spawn the pipeline.
-    timeout-minutes: 15
+    # Per-shard timeout. Whole suite serial was ~15 min; a single
+    # shard is a quarter of that plus the fixture build, so 10 is
+    # generous headroom.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+      # Belt-and-suspenders on top of setup-uv's built-in cache.
+      # On a cold runner the install dominates the shard time;
+      # this restores the package cache directly so resolution
+      # short-circuits.
+      - name: Cache uv package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
       - name: Install dependencies
         # `web` (Streamlit) + `api` (FastAPI) extras must be pulled
         # in so their tests collect. Adding a new extra to
         # pyproject.toml? Add it here too.
-        run: uv sync --extra api --extra web
-      - name: Run smoke tests
+        run: uv sync --frozen --extra api --extra web
+      # Cache the pre-built `_scored_workspace_source` (the post-
+      # Stage-6 pipeline.db + workspace files). Cache key is a
+      # hash of every input that influences the build output:
+      # Stage 1-6 source, the LLM/pipeline core modules, and the
+      # test_workspace seed fixtures. Cache hit -> the conftest
+      # fixture short-circuits to the restored dir + skips the
+      # ~10s build per shard.
+      - name: Cache scored workspace fixture
+        uses: actions/cache@v4
+        with:
+          path: .scored_ws_cache
+          key: scored-ws-${{ runner.os }}-${{ hashFiles('core/**/*.py', 'scripts/0[1-6]_*.py', 'clients/test_workspace/**', 'prompts/**', 'schemas/**') }}
+          restore-keys: |
+            scored-ws-${{ runner.os }}-
+      - name: Run smoke tests (shard ${{ matrix.shard }}/8)
         env:
           # Force stub mode so no real API calls are made during CI.
           ANTHROPIC_API_KEY: ""
+          # Pin the conftest fixture cache to a workspace-relative
+          # path so actions/cache can save/restore it. The fixture
+          # uses filelock to coordinate xdist workers; combined with
+          # this cache, only the first shard to miss the cache pays
+          # the Stage 1-6 build cost.
+          PYTEST_SCORED_WS_CACHE: ${{ github.workspace }}/.scored_ws_cache
         run: |
           set +e
-          # `-n auto` -- pytest-xdist fans the suite out across
-          # available CPU cores. On GHA's 2-core runners that's ~1.7x
-          # speedup; on a 4+ core developer machine 3x+. Each worker
-          # gets its own subprocess + tmp_path; tests are already
-          # isolated, so no extra orchestration is needed.
+          # `--splits 8 --group N`: pytest-split assigns roughly
+          # equal-duration test buckets per group (using the
+          # checked-in `.test_durations` file). Each group runs
+          # `-n auto` inside (xdist still parallelizes within the
+          # shard on the 2 cores GHA gives).
           #
           # `--tb=short -ra` keeps the same failure-output verbosity
           # as before. `-q` replaces `-v` because xdist's per-worker
           # output makes -v unreadable; the durations + failure tail
           # are what reviewers actually scan.
-          uv run pytest tests/ -n auto -q --tb=short -ra --durations=15 2>&1 | tee pytest.log
+          uv run pytest tests/ \
+            --splits 8 --group ${{ matrix.shard }} \
+            -n auto -q --tb=short -ra --durations=15 \
+            2>&1 | tee pytest.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
-            echo "::error::pytest exited $rc"
+            echo "::error::pytest exited $rc (shard ${{ matrix.shard }}/8)"
             {
-              echo "## Pytest output (tail)"
+              echo "## Pytest output (tail) -- shard ${{ matrix.shard }}/8"
               echo ""
               echo '```'
               tail -200 pytest.log
@@ -55,6 +106,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-log
+          name: pytest-log-shard-${{ matrix.shard }}
           path: pytest.log
           if-no-files-found: warn
