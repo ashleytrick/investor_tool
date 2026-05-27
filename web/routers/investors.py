@@ -28,7 +28,7 @@ import datetime as _dt
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import desc, select
 
 from core.db import (
     draft_snoozes, email_drafts, funds, partner_pipeline, partners,
@@ -579,3 +579,229 @@ def capture_investor(
         source=source,
         note=body.note,
     )
+
+
+# ---------- FR-7 mark-sent + clear-sent (manual-paste channels) ----------
+
+_VALID_MARK_SENT_CHANNELS = {"email", "linkedin"}
+
+
+class MarkSentBody(BaseModel):
+    channel: str = Field(
+        default="linkedin",
+        description=(
+            "Channel the operator used to send. 'linkedin' is the "
+            "primary use case (operator pasted the draft into a "
+            "LinkedIn DM and sent). 'email' is here for parity "
+            "with the same UI button when the operator sent from "
+            "an email client outside Gmail Drafts. Gmail-confirmed "
+            "sends do NOT use this endpoint -- the gmail-sent "
+            "poller writes those automatically."
+        ),
+    )
+    note: str | None = Field(
+        default=None, max_length=500,
+        description="Optional operator-side audit note.",
+    )
+
+
+class MarkSentView(BaseModel):
+    draft_id: int
+    channel: str
+    event_id: int
+    sent_at: str
+
+
+@router.post(
+    "/drafts/{draft_id}/mark-sent",
+    response_model=MarkSentView,
+    summary=(
+        "Mark a draft as sent via a manual-paste channel "
+        "(LinkedIn, off-platform email, etc.)"
+    ),
+)
+def mark_draft_sent(
+    draft_id: int,
+    body: MarkSentBody | None = None,
+    _auth: None = Depends(require_auth),
+) -> MarkSentView:
+    """FR-7. Operator pasted the draft into LinkedIn (or another
+    channel that isn't Gmail) and sent it. Flip the draft's
+    approval_status to 'sent' AND log an `outreach_events` row
+    with source='app' + channel=<channel> so the audit trail
+    distinguishes manual sends from Gmail-poll-detected ones.
+
+    Idempotent on re-call.
+    """
+    from core.approval.persistence import mark_sent as _mark_sent
+    from core.db import outreach_events
+    body = body or MarkSentBody()
+    channel = (body.channel or "linkedin").strip().lower()
+    if channel not in _VALID_MARK_SENT_CHANNELS:
+        raise HTTPException(
+            422,
+            f"channel must be one of {sorted(_VALID_MARK_SENT_CHANNELS)}; "
+            f"got {body.channel!r}",
+        )
+    engine, _ = _engine_and_ws()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    with engine.begin() as conn:
+        draft_row = conn.execute(
+            select(
+                email_drafts.c.draft_id,
+                email_drafts.c.partner_id,
+                email_drafts.c.approval_status,
+                email_drafts.c.subject,
+                email_drafts.c.body,
+            ).where(email_drafts.c.draft_id == draft_id)
+        ).first()
+        if draft_row is None:
+            raise HTTPException(
+                404, f"unknown draft_id: {draft_id}",
+            )
+        partner_id = draft_row.partner_id
+
+        existing_event = conn.execute(
+            select(
+                outreach_events.c.event_id,
+                outreach_events.c.channel,
+                outreach_events.c.occurred_at,
+            ).where(
+                outreach_events.c.source == "app",
+                outreach_events.c.event_type == "sent",
+                outreach_events.c.draft_id == draft_id,
+            ).order_by(desc(outreach_events.c.occurred_at))
+        ).first()
+        if existing_event is not None:
+            return MarkSentView(
+                draft_id=draft_id,
+                channel=existing_event.channel or "linkedin",
+                event_id=int(existing_event.event_id),
+                sent_at=(
+                    existing_event.occurred_at.isoformat()
+                    if existing_event.occurred_at else now.isoformat()
+                ),
+            )
+
+        result = conn.execute(outreach_events.insert().values(
+            source="app",
+            event_type="sent",
+            partner_id=partner_id,
+            draft_id=draft_id,
+            channel=channel,
+            subject=draft_row.subject,
+            body_snippet=(
+                (draft_row.body or "")[:200] if draft_row.body else None
+            ),
+            occurred_at=now,
+            unread=False,
+            created_at=now,
+        ))
+        event_id = int(result.inserted_primary_key[0])
+
+    from core.approval.state_machine import STATE_SENT
+    current_status = draft_row.approval_status
+    if current_status != STATE_SENT:
+        if current_status == "approved_to_send":
+            _mark_sent(
+                engine, draft_id=draft_id, partner_id=partner_id,
+                actor="ui:mark_sent", notes=f"channel={channel}",
+            )
+        else:
+            # Bypass the state-machine table for unusual starting
+            # states (operator marked sent without going through
+            # approval first). Stamp the state directly.
+            with engine.begin() as conn:
+                conn.execute(
+                    email_drafts.update()
+                    .where(email_drafts.c.draft_id == draft_id)
+                    .values(approval_status=STATE_SENT)
+                )
+    return MarkSentView(
+        draft_id=draft_id,
+        channel=channel,
+        event_id=event_id,
+        sent_at=now.isoformat(),
+    )
+
+
+@router.delete(
+    "/drafts/{draft_id}/mark-sent",
+    response_model=dict,
+    summary=(
+        "Revert a manual mark-sent (operator mis-clicked, or "
+        "the LinkedIn DM didn't actually go through)"
+    ),
+)
+def clear_draft_sent(
+    draft_id: int,
+    _auth: None = Depends(require_auth),
+) -> dict:
+    """FR-7. Reverses POST /drafts/{id}/mark-sent. Only removes
+    APP-sourced sent events (gmail-poll-confirmed sends are
+    terminal and not reversible from the UI). Flips
+    approval_status back to 'approved_to_send' so the draft
+    re-appears in the queue.
+
+    Bypasses the state-machine transition table since STATE_SENT
+    has no outbound edges by design (sent-is-terminal invariant).
+    Still writes a draft_approvals audit row so the reverse
+    action shows up in the trail.
+    """
+    from core.db import draft_approvals, outreach_events
+    from core.approval.state_machine import (
+        STATE_APPROVED_TO_SEND, STATE_SENT,
+    )
+    engine, _ = _engine_and_ws()
+    with engine.begin() as conn:
+        draft_row = conn.execute(
+            select(
+                email_drafts.c.draft_id,
+                email_drafts.c.partner_id,
+                email_drafts.c.approval_status,
+                email_drafts.c.draft_hash,
+            ).where(email_drafts.c.draft_id == draft_id)
+        ).first()
+        if draft_row is None:
+            raise HTTPException(
+                404, f"unknown draft_id: {draft_id}",
+            )
+        event = conn.execute(
+            select(outreach_events.c.event_id).where(
+                outreach_events.c.source == "app",
+                outreach_events.c.event_type == "sent",
+                outreach_events.c.draft_id == draft_id,
+            ).order_by(desc(outreach_events.c.occurred_at))
+        ).first()
+        if event is None:
+            raise HTTPException(
+                404,
+                f"no manual mark-sent event on file for "
+                f"draft_id={draft_id} (gmail-poll-confirmed sends "
+                f"are not reversible from this endpoint)",
+            )
+        conn.execute(
+            outreach_events.delete().where(
+                outreach_events.c.event_id == event.event_id,
+            )
+        )
+        if draft_row.approval_status == STATE_SENT:
+            conn.execute(draft_approvals.insert().values(
+                draft_id=draft_id,
+                partner_id=draft_row.partner_id,
+                event_type=STATE_APPROVED_TO_SEND,
+                actor="ui:clear_sent",
+                at=_dt.datetime.now(_dt.timezone.utc),
+                draft_hash=draft_row.draft_hash,
+                notes="operator reverted manual mark-sent (FR-7)",
+                overridden_blockers=None,
+            ))
+            conn.execute(
+                email_drafts.update()
+                .where(email_drafts.c.draft_id == draft_id)
+                .values(approval_status=STATE_APPROVED_TO_SEND)
+            )
+    return {
+        "draft_id": draft_id,
+        "reverted_event_id": int(event.event_id),
+    }

@@ -1057,6 +1057,12 @@ outreach_events = Table(
     # B3: unread = "operator hasn't seen this in the UI yet".
     # GET /replies filters on it.
     Column("unread", Boolean, default=False),
+    # FR-7: which channel the touch went out on. 'email' is the
+    # default and what the Gmail poller writes. 'linkedin' is set
+    # by the manual-paste mark-sent endpoint so the audit log
+    # distinguishes channels. Free-form text so adding new
+    # channels (slack, sms) doesn't require a migration.
+    Column("channel", Text, default="email"),
     Column("created_at", DateTime),
     Index("ix_outreach_events_partner_id", "partner_id"),
     Index(
