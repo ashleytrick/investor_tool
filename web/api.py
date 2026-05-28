@@ -1435,6 +1435,12 @@ def pipeline_ingest(
     response_model=CommandResult,
     summary="Run Stage 1 (aggregate_sources) for the wizard",
     tags=["onboarding"],
+    # Batch I: dev/granular re-run surface. Hidden from public
+    # OpenAPI so Lovable doesn't expose per-stage triggers as
+    # operator features -- the operator-facing call is the
+    # /pipeline/ingest umbrella. Endpoint still works for direct
+    # calls + ops debugging.
+    include_in_schema=False,
 )
 def pipeline_aggregate(
     _auth: None = Depends(require_auth),
@@ -1449,6 +1455,7 @@ def pipeline_aggregate(
     response_model=CommandResult,
     summary="Run Stage 2 (enrich_funds) for the wizard",
     tags=["onboarding"],
+    include_in_schema=False,  # batch I: dev-only per-stage trigger
 )
 def pipeline_enrich(
     _auth: None = Depends(require_auth),
@@ -1463,6 +1470,7 @@ def pipeline_enrich(
     response_model=CommandResult,
     summary="Run Stage 3 (mine_activity) for the wizard",
     tags=["onboarding"],
+    include_in_schema=False,  # batch I: dev-only per-stage trigger
 )
 def pipeline_activity(
     _auth: None = Depends(require_auth),
@@ -1477,6 +1485,7 @@ def pipeline_activity(
     response_model=CommandResult,
     summary="Run Stage 4 (mine_partner_signals) for the wizard",
     tags=["onboarding"],
+    include_in_schema=False,  # batch I: dev-only per-stage trigger
 )
 def pipeline_partner_signals(
     _auth: None = Depends(require_auth),
@@ -1491,6 +1500,7 @@ def pipeline_partner_signals(
     response_model=CommandResult,
     summary="Run Stage 5 (verify_and_quality) for the wizard",
     tags=["onboarding"],
+    include_in_schema=False,  # batch I: dev-only per-stage trigger
 )
 def pipeline_verify(
     _auth: None = Depends(require_auth),
@@ -1505,6 +1515,7 @@ def pipeline_verify(
     response_model=CommandResult,
     summary="Run Stage 6 (score_candidates) for the wizard",
     tags=["onboarding"],
+    include_in_schema=False,  # batch I: dev-only per-stage trigger
 )
 def pipeline_score(_auth: None = Depends(require_auth)) -> CommandResult:
     return _shell_pipeline_stage(
@@ -1517,6 +1528,7 @@ def pipeline_score(_auth: None = Depends(require_auth)) -> CommandResult:
     response_model=CommandResult,
     summary="Run Stage 7 (generate_emails) for the wizard",
     tags=["onboarding"],
+    include_in_schema=False,  # batch I: dev-only per-stage trigger
 )
 def pipeline_generate(_auth: None = Depends(require_auth)) -> CommandResult:
     # Cap at TOP_BEFORE_CALIBRATION_REQUIRED (=10 in scripts/07) so the

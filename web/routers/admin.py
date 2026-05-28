@@ -168,6 +168,10 @@ def _ws_email_from_company(company_yaml: dict) -> Optional[str]:
     "/admin/companies",
     response_model=AdminCompaniesResult,
     summary="List every tenant's company profile (admin only)",
+    # Batch I: hide from public OpenAPI so Lovable's auto-generated
+    # types don't expose admin surfaces as operator features.
+    # Endpoint still works for direct calls / ops debugging.
+    include_in_schema=False,
 )
 def admin_companies(
     _principal: dict = Depends(require_admin),
@@ -218,6 +222,7 @@ def admin_companies(
         "List investors across all tenants with global enrichment "
         "joined in (admin only)"
     ),
+    include_in_schema=False,  # batch I: dev-only surface
 )
 def admin_investors(
     tenant: Optional[str] = Query(
@@ -387,6 +392,7 @@ def admin_investors(
     "/admin/tenants",
     response_model=AdminTenantsResult,
     summary="Per-tenant roster + activity counts (admin only)",
+    include_in_schema=False,  # batch I: dev-only surface
 )
 def admin_tenants(
     _principal: dict = Depends(require_admin),
