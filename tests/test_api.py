@@ -365,21 +365,18 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         "/config/mode",
         "/config/company",
         "/config/company/extract-from-deck",
-        "/pipeline/score",
-        "/pipeline/generate",
         "/pipeline/sources",
         "/gmail/status",
         "/gmail/connect",
         # ---- Per-scope Google OAuth + Phase 6 bootstrap ----
         "/google/status",
         "/gmail/bootstrap",
-        # ---- Review item #8: Stage 1-5 endpoints ----
+        # ---- Review item #8: umbrella ingest endpoint ----
+        # The per-stage triggers (aggregate/enrich/activity/
+        # partner-signals/verify/score/generate) are operator-only
+        # tools hidden from the public spec by batch I; see
+        # test_openapi_spec_hides_dev_only_endpoints below.
         "/pipeline/ingest",
-        "/pipeline/aggregate",
-        "/pipeline/enrich",
-        "/pipeline/activity",
-        "/pipeline/partner-signals",
-        "/pipeline/verify",
         # ---- B1: Today flow ----
         "/today",
         "/settings/send-pace",
@@ -392,10 +389,6 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         # ---- B4: Pipeline + snoozes (post-route-conflict-fix) ----
         "/partners/{partner_id}/pipeline",
         "/snoozes/{draft_id}",
-        # ---- Phase 5: admin endpoints ----
-        "/admin/companies",
-        "/admin/investors",
-        "/admin/tenants",
         # ---- Phase 4: discovery surface ----
         "/discovery/matches",
         "/discovery/claim",
@@ -417,6 +410,34 @@ def test_openapi_spec_lists_all_documented_endpoints(client: TestClient) -> None
         assert required in paths, (
             f"OpenAPI spec dropped {required}; "
             f"frontend regen will lose the endpoint"
+        )
+
+
+def test_openapi_spec_hides_dev_only_endpoints(client: TestClient) -> None:
+    """Batch I: per-stage pipeline triggers and /admin/* surfaces are
+    operator-only tooling. They MUST stay out of /openapi.json so the
+    Lovable frontend never generates client code that calls them and
+    so the public schema reads as a product surface, not a control
+    panel. Inclusion is enforced via include_in_schema=False on each
+    route definition; this test guards against a regression where
+    someone re-exposes them."""
+    spec = client.get("/openapi.json").json()
+    paths = spec.get("paths", {})
+    for hidden in (
+        "/pipeline/aggregate",
+        "/pipeline/enrich",
+        "/pipeline/activity",
+        "/pipeline/partner-signals",
+        "/pipeline/verify",
+        "/pipeline/score",
+        "/pipeline/generate",
+        "/admin/companies",
+        "/admin/investors",
+        "/admin/tenants",
+    ):
+        assert hidden not in paths, (
+            f"{hidden} is a dev-only surface and must not appear in "
+            f"the public OpenAPI spec (batch I)"
         )
 
 
@@ -474,19 +495,21 @@ def test_openapi_extraction_response_has_extraction_failed_flag(
     assert "extraction_failed" in extraction.get("properties", {})
 
 
-def test_openapi_admin_results_have_skipped_field(client: TestClient) -> None:
+def test_admin_results_have_skipped_field() -> None:
     """Review #22: AdminCompaniesResult / AdminInvestorsResult /
-    AdminTenantsResult all carry a `skipped` array."""
-    spec = client.get("/openapi.json").json()
-    schemas = spec.get("components", {}).get("schemas", {})
-    for name in (
-        "AdminCompaniesResult", "AdminInvestorsResult",
-        "AdminTenantsResult",
+    AdminTenantsResult all carry a `skipped` array. The admin
+    endpoints are hidden from the public OpenAPI spec (batch I), so
+    inspect the Pydantic models directly instead of /openapi.json."""
+    from web.routers.admin import (
+        AdminCompaniesResult,
+        AdminInvestorsResult,
+        AdminTenantsResult,
+    )
+    for model in (
+        AdminCompaniesResult, AdminInvestorsResult, AdminTenantsResult,
     ):
-        result_schema = schemas.get(name)
-        assert result_schema is not None, f"{name} schema missing"
-        assert "skipped" in result_schema.get("properties", {}), (
-            f"{name}.skipped (review #22) missing"
+        assert "skipped" in model.model_fields, (
+            f"{model.__name__}.skipped (review #22) missing"
         )
 
 
