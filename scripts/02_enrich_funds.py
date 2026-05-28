@@ -57,6 +57,38 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _seed_global_pool(*, fund_name: str, enrichment, run) -> None:
+    """Push this fund's enriched partners into the cross-tenant
+    ``investors_global`` pool so the discovery surface has data on day
+    one. Best-effort: any failure is logged via ``run.note`` and
+    swallowed so the tenant's Stage 2 run is unaffected.
+    """
+    from core.investors_global import (
+        get_global_engine, is_disabled, seed_from_stage2_enrichment,
+        upsert_many,
+    )
+    if is_disabled():
+        return
+    try:
+        rows = seed_from_stage2_enrichment(
+            fund_name=fund_name,
+            fund_enrichment=enrichment.model_dump(),
+            partners_for_fund=[
+                {"name": p.name, "email": None}
+                for p in enrichment.current_partners
+            ],
+        )
+        if not rows:
+            return
+        engine = get_global_engine()
+        upsert_many(engine, rows)
+    except Exception as exc:  # noqa: BLE001 - never block tenant Stage 2
+        run.note(
+            f"investors_global seed skipped for {fund_name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 2 fund enrichment.")
     add_workspace_arg(parser)
@@ -225,6 +257,17 @@ def main() -> int:
                                 f"staled {staled} approved draft(s) for "
                                 f"{pid} after Stage 2 demotion"
                             )
+                    # Batch K: seed the cross-tenant investors_global
+                    # pool from this enrichment so /discovery/matches
+                    # has anything to return on day 1. Best-effort: a
+                    # failure to write the shared pool must never fail
+                    # the tenant's Stage 2 run.
+                    _seed_global_pool(
+                        fund_name=fund["name"],
+                        enrichment=enrichment,
+                        run=run,
+                    )
+
                     print(
                         f"[stage 2] {fund['name']}: {len(pages)} pages "
                         f"({snaps} new snapshots), "

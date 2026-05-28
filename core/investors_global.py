@@ -330,6 +330,100 @@ def upsert_many(
     return count
 
 
+def is_disabled() -> bool:
+    """True when the operator has set ``INVESTORS_GLOBAL_DISABLED``.
+
+    Lets Stage 2 (and the CSV bulk-import sync) skip the cross-tenant
+    seed in environments that explicitly opt out -- typically local
+    dev or single-tenant deployments where the discovery surface is
+    not in use.
+    """
+    return os.environ.get("INVESTORS_GLOBAL_DISABLED", "").lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def seed_from_stage2_enrichment(
+    *,
+    fund_name: str,
+    fund_enrichment: dict,
+    partners_for_fund: Iterable[dict],
+) -> list[InvestorRow]:
+    """Build the cross-tenant rows Stage 2 should push to the shared
+    pool after enriching one fund.
+
+    What gets seeded:
+      - One row per (fund_name, partner_name) for every partner the
+        Stage 2 LLM (or fixture extractor) discovered on the team
+        page. Each carries the fund's stated stage / sectors, plus
+        the partner's email when Stage 2 happens to know it.
+      - A fund-only placeholder row (partner='(unknown)') when the
+        team page yielded zero partners. Without this, a fund a
+        tenant enriches but whose team page is broken or behind
+        auth would never enter the discovery pool at all.
+
+    What does NOT get seeded:
+      - Any tenant-derived scoring (composite / round_fit / lead
+        likelihood). Those are tenant-specific and would leak
+        signal across users.
+      - Partner notes, outreach status, draft state, do_not_contact
+        flags. All tenant-specific.
+
+    Pure function (no DB) so it's trivially testable. The Stage 2
+    caller pipes the result into ``upsert_many``.
+    """
+    fund_name = (fund_name or "").strip()
+    if not fund_name:
+        return []
+    stages_raw = (fund_enrichment or {}).get("stated_stage_focus")
+    sectors_raw = (fund_enrichment or {}).get("stated_sectors") or []
+    stages = tuple(s for s in [stages_raw] if s)
+    sectors = tuple(s for s in sectors_raw if s)
+    # Objective enriched fields the discovery ranker can use without
+    # leaking tenant signal. Thesis + check size + portfolio are the
+    # fund's public marketing material.
+    enriched = {
+        k: v for k, v in {
+            "thesis_summary": (fund_enrichment or {}).get("thesis_summary"),
+            "check_size_range": (
+                fund_enrichment or {}
+            ).get("check_size_range"),
+            "portfolio_companies": (
+                fund_enrichment or {}
+            ).get("portfolio_companies") or None,
+            "recent_focus_signals": (
+                fund_enrichment or {}
+            ).get("recent_focus_signals"),
+        }.items() if v
+    }
+
+    out: list[InvestorRow] = []
+    partner_list = list(partners_for_fund)
+    if not partner_list:
+        out.append(InvestorRow(
+            firm=fund_name,
+            partner="(unknown)",
+            email=None,
+            stages=stages,
+            sectors=sectors,
+            enriched_fields=enriched or None,
+        ))
+        return out
+    for p in partner_list:
+        name = (p.get("name") or "").strip()
+        if not name:
+            continue
+        out.append(InvestorRow(
+            firm=fund_name,
+            partner=name,
+            email=p.get("email") or None,
+            stages=stages,
+            sectors=sectors,
+            enriched_fields=enriched or None,
+        ))
+    return out
+
+
 def count_investors(engine: Engine) -> int:
     """Operational helper -- used by tests + by status/admin
     surfaces (Phase 5) to size the discovery pool."""
