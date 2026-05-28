@@ -51,6 +51,7 @@ from core.stage2.extract import (  # noqa: F401
     deterministic_enrichment,
     enrich,
 )
+from core.stage2.partner_links import harvest_partner_links
 
 
 def _now() -> datetime:
@@ -167,6 +168,7 @@ def main() -> int:
                             .where(funds.c.fund_id == fund["fund_id"])
                             .values(**update_values)
                         )
+                        partner_name_to_id: dict[str, str] = {}
                         for p in enrichment.current_partners:
                             row = partner_upsert_values(
                                 fund_id=fund["fund_id"],
@@ -175,7 +177,37 @@ def main() -> int:
                                 now=now,
                             )
                             discovered_pids.add(row["partner_id"])
+                            partner_name_to_id[p.name] = row["partner_id"]
                             upsert(conn, partners, ["partner_id"], row)
+
+                        # Batch J: deterministically harvest LinkedIn +
+                        # Twitter URLs for these partners from the same
+                        # team-page HTML. Removes the operator's CSV
+                        # work for the common case where the team page
+                        # already links to each partner's profile.
+                        link_map = harvest_partner_links(
+                            pages, list(partner_name_to_id),
+                        )
+                        for pname, links in link_map.items():
+                            pid = partner_name_to_id.get(pname)
+                            if not pid:
+                                continue
+                            update_vals: dict = {}
+                            if links.get("linkedin_url"):
+                                update_vals["linkedin_url"] = (
+                                    links["linkedin_url"]
+                                )
+                            if links.get("twitter_handle"):
+                                update_vals["twitter_handle"] = (
+                                    links["twitter_handle"]
+                                )
+                            if not update_vals:
+                                continue
+                            conn.execute(
+                                partners.update()
+                                .where(partners.c.partner_id == pid)
+                                .values(**update_vals, last_updated=now)
+                            )
 
                         # Demote previously-seen partners no longer on the
                         # team page. Without this, a partner who left a
